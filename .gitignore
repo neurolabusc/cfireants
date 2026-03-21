@@ -53,3 +53,13 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build directory
+build/
+
+# Third-party binaries (download separately)
+third_party/wgpu/
+
+# Python
+__pycache__/
+*.pyc

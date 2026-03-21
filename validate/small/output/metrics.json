@@ -1,0 +1,14 @@
+{
+  "dataset": "small",
+  "description": "2mm full-head MNI to subject (includes scalp)",
+  "ncc_before": 0.5953,
+  "ncc_after": 0.945,
+  "local_ncc_loss": -0.5838,
+  "time_seconds": 3.9,
+  "time_moments_s": 0.2,
+  "time_rigid_s": 2.0,
+  "time_affine_s": 1.0,
+  "time_syn_s": 0.7,
+  "peak_gpu_memory_mb": 804.0,
+  "warped_path": "/home/roger/src/FireANTs/validate/small/output/warped.nii.gz"
+}

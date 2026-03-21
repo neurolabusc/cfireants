@@ -1,0 +1,13 @@
+{
+  "dataset": "medium",
+  "description": "1mm brain-extracted MNI to subject",
+  "ncc_before": 0.5753,
+  "ncc_after": 0.9443,
+  "local_ncc_loss": -0.8127,
+  "time_seconds": 4.9,
+  "time_moments_s": 0.3,
+  "time_rigid_s": 1.2,
+  "time_affine_s": 1.3,
+  "time_syn_s": 2.2,
+  "peak_gpu_memory_mb": 1409.0
+}

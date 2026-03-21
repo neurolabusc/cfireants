@@ -1,0 +1,13 @@
+{
+  "dataset": "large",
+  "description": "1mm full-head MNI to subject (0.88mm, includes scalp)",
+  "ncc_before": 0.7254,
+  "ncc_after": 0.8961,
+  "local_ncc_loss": -0.3051,
+  "time_seconds": 17.1,
+  "time_moments_s": 0.3,
+  "time_rigid_s": 7.9,
+  "time_affine_s": 6.6,
+  "time_syn_s": 2.4,
+  "peak_gpu_memory_mb": 6337.0
+}
