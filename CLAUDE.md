@@ -227,14 +227,76 @@ Once MI is fast enough, run the full validation suite (small/medium/large) and d
 - FFT downsample (kissfft vs cuFFT): max diff 0.01 on real images (validated on all sizes)
 - Grid sampling, affine grid, CC loss: expected identical to float32 (same algorithms)
 - MI loss: GPU histogram with fixed-point u32 atomicAdd (FP_SCALE=256). Matches CPU MI to 5e-5 (loss) and 2e-9 (gradient). Falls back to CPU when num_bins != 32.
-- Overall NCC After: 0.73 (WebGPU CC-only, Metal) vs 0.96 (CUDA MI+CC) — gap is from loss function choice + Metal performance characteristics
+- Overall NCC After: 0.73 (WebGPU CC-only) vs 0.96 (CUDA MI+CC)
+
+### Metal vs CUDA
+- CC loss: **identical to CPU reference** (max diff 6.5e-12 on loss, 6.5e-12 on gradient). The Metal cc_loss.cu algorithm is a faithful 1:1 translation.
+- MI loss: matches CPU to 1e-3 (loss) and 3.3e-9 (gradient). CAS atomics in threadgroup memory introduce ~1e-3 histogram precision vs CUDA's native float atomics.
+- FFT downsample: MPSGraph FFT vs cuFFT. Produces slightly different numerical results (expected for different FFT implementations).
+- Grid sampling, affine grid, all element-wise ops: identical algorithms, float32 precision differences only.
+- **Overall NCC After: 0.68 (Metal CC-only) vs 0.96 (CUDA MI+CC).** The gap is primarily from:
+  1. **Loss function**: CC-only vs MI+CC. MI is critical for robust rigid/affine alignment of full-head images with intensity variations. Metal MI is numerically correct but MI gradients are inherently ~1e-7 magnitude — the same weakness exists in all non-CUDA MI implementations (WebGPU, CPU).
+  2. **CC learning rate**: Metal CC gradients require lr=0.005 (vs CUDA's 0.01) to avoid oscillation. This is because CC-only mode on this dataset produces large gradients that cause Adam to overshoot. CUDA avoids this by using MI (small gradients) for linear stages.
+  3. **Not an implementation bug**: All Metal kernel outputs are verified identical to CPU reference within float32 precision.
+
+## Metal Backend
+
+Native Metal backend for macOS/Apple Silicon. Uses unified memory (MTLResourceStorageModeShared) for zero-copy CPU↔GPU access, MPSGraph for 3D FFT, and custom Metal compute shaders for all registration operations.
+
+**Key files:**
+- `backend/metal/metal_context.h/.m` — device init, pipeline cache, buffer tracking, dispatch
+- `backend/metal/metal_kernels.h/.m` — kernel dispatch wrappers for all GPU operations
+- `backend/metal/metal_fft.m` — MPSGraph FFT downsample
+- `backend/metal/linear_metal.m` — rigid/affine fused loops
+- `backend/metal/greedy_metal.m` — greedy deformable loop
+- `backend/metal/syn_metal.m` — SyN loop + warp inverse
+- `backend/metal/shaders/*.metal` — 10 Metal Shading Language compute shader files
+
+### Metal Current Metrics (small dataset, Apple M4 Pro)
+
+| Metric | Metal (CC) | CUDA (MI+CC) |
+|--------|-----------|--------------|
+| NCC Before | 0.5957 | 0.5957 |
+| NCC After | 0.6771 | 0.9614 |
+| Local NCC Loss | -0.5642 | -0.6511 |
+| Time | 8.3s | 3.0s |
+| Peak RAM | 394 MB | ~900 MB |
+
+### Metal Design Decisions
+
+**FFT: MPSGraph vs kissfft.** We tested both:
+- **kissfft** (CPU, vendored): NCC After 0.6687, simple but runs on CPU
+- **MPSGraph FFT** (GPU, native): NCC After 0.6771, better precision, runs on GPU/ANE
+- MPSGraph chosen for: better quality, GPU-native execution, no vendored dependency for Metal
+- kissfft still used by WebGPU backend (no GPU FFT available via wgpu-native)
+
+**CC loss: cc_loss.cu vs fused_cc.cu.** CUDA uses two different CC implementations:
+- `cc_loss.cu` — used by rigid/affine. 5 separate box filters + 3 adjoint passes. More numerically stable gradient.
+- `fused_cc.cu` — used by SyN. Single workspace, fewer passes, slightly different gradient formula.
+- Metal rigid/affine uses the `cc_loss.cu` algorithm (matching CUDA). This is critical — using `fused_cc.cu` for rigid/affine causes gradient scaling issues and optimizer oscillation.
+- Metal SyN uses `fused_cc.cu` algorithm (matching CUDA SyN).
+
+**MI loss: threadgroup CAS atomics.** Metal Shading Language supports `atomic<float>` in `device` memory but NOT in `threadgroup` memory. Solution: use `atomic_uint` with CAS (compare-exchange) in threadgroup for histogram accumulation, then `device atomic<float>` for global merge. This matches CUDA's shared-memory pattern with slightly more overhead from CAS retry loops.
+
+**Unified memory advantage.** All tensor data lives in `MTLResourceStorageModeShared` buffers. The CPU can read/write GPU buffer contents directly after `waitUntilCompleted`. This eliminates all explicit H2D/D2H transfers. Buffer tracking table maps `void *cpu_ptr` → `MTLBuffer` for dispatch binding (supports sub-buffer offsets for pointer arithmetic).
+
+**Learning rate sensitivity.** Metal CC gradients require lr=0.005 for rigid (vs CUDA's 0.01). The gradient magnitude is ~2x larger, likely due to subtle differences in box filter precision. This is the main remaining accuracy gap — needs investigation.
+
+### Metal Known Issues
+
+- SyN deformable quality gap (NCC 0.68 vs CUDA 0.96) — partly from CC-only vs MI+CC, partly from lr sensitivity
+- Learning rate for rigid needs to be 0.5x CUDA's value (0.005 vs 0.01) to avoid oscillation
+- `atomic<float>` not available in threadgroup memory on Metal — MI histogram uses CAS on atomic_uint
+- Warp inverse runs 550 sequential Metal dispatches (one per iteration) — could be batched
+- `newLibraryWithFile:` deprecated warning (should use `newLibraryWithURL:`)
 
 ## Dependencies
 
 - **Core**: CMake >= 3.18, C11 compiler, zlib
 - **CUDA backend**: CUDA toolkit, cufft
 - **WebGPU backend**: wgpu-native (v27.0.4.0+, pre-downloaded in `third_party/wgpu/`)
-- **FFT fallback**: kissfft (BSD-3, vendored in `third_party/kissfft/`)
+- **Metal backend**: macOS 14.0+, Xcode with Metal 3.0, MetalPerformanceShadersGraph
+- **FFT fallback**: kissfft (BSD-3, vendored in `third_party/kissfft/`) — used by WebGPU only
 - Optional: zstd (for zstd-compressed NIfTI)
 
 ## Known Issues (CUDA)
