@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "metal_context.h"
 #include "metal_kernels.h"
@@ -511,5 +512,375 @@ void metal_cc_loss_3d(const float *pred, const float *target,
 
         metal_unregister_buffer(scratch);
         metal_unregister_buffer(interm);
+    }
+}
+
+/* ================================================================== */
+/* Phase 6: MI Loss — faithful translation of cuda_mi_loss_3d         */
+/* ================================================================== */
+
+/* Param structs matching mi_loss.metal shader layouts */
+typedef struct {
+    int32_t N;
+    int32_t num_bins;
+    float preterm;
+    float inv_maxval_p;
+    float inv_maxval_t;
+    float _pad0;
+    int32_t _pad1, _pad2;
+} mi_hist_params_t;
+
+typedef struct {
+    int32_t num_bins;
+    float nr, dr;
+    int32_t _pad;
+} mi_compute_params_t;
+
+typedef struct {
+    int32_t N;
+    int32_t num_bins;
+    float preterm;
+    float inv_maxval_p;
+    float inv_maxval_t;
+    float nr, dr;
+    int32_t _pad;
+} mi_grad_params_t;
+
+void metal_mi_loss_3d(const float *pred, const float *target,
+                       float *grad_pred,
+                       int D, int H, int W,
+                       int num_bins, float *h_loss_out)
+{
+    @autoreleasepool {
+        int N = D * H * W;
+        int nb = num_bins;
+        float nr = 1e-7f, dr = 1e-7f;
+
+        if (nb > 64) {
+            fprintf(stderr, "metal_mi_loss: num_bins=%d exceeds MAX_BINS=64\n", nb);
+            if (h_loss_out) *h_loss_out = 0;
+            return;
+        }
+
+        /* Find max values for normalization.
+         * With unified memory, just sync and read directly — no download needed. */
+        metal_sync();
+        float pmax = pred[0], tmax = target[0];
+        for (int i = 1; i < N; i++) {
+            if (pred[i] > pmax) pmax = pred[i];
+            if (target[i] > tmax) tmax = target[i];
+        }
+
+        float maxval = (pmax > tmax) ? pmax : tmax;
+        float inv_maxval_p = (maxval > 1.0f) ? 1.0f / maxval : 1.0f;
+        float inv_maxval_t = inv_maxval_p;
+
+        /* Build bin centers (matching Python/CUDA) */
+        float h_bins[64];
+        for (int i = 0; i < nb; i++)
+            h_bins[i] = (float)i / nb + 0.5f / nb;
+
+        float bin_spacing = 1.0f / nb;
+        float sigma = bin_spacing * 0.5f;
+        float preterm = 1.0f / (2.0f * sigma * sigma);
+
+        /* Allocate shared-memory GPU buffers for histogram and bin centers */
+        size_t pab_sz = (size_t)nb * nb * sizeof(float);
+        size_t marg_sz = (size_t)nb * sizeof(float);
+        id<MTLBuffer> pab_buf = [g_metal.device newBufferWithLength:pab_sz
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pa_buf  = [g_metal.device newBufferWithLength:marg_sz
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pb_buf  = [g_metal.device newBufferWithLength:marg_sz
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bins_buf = [g_metal.device newBufferWithLength:marg_sz
+                                                             options:MTLResourceStorageModeShared];
+        if (!pab_buf || !pa_buf || !pb_buf || !bins_buf) {
+            fprintf(stderr, "metal_mi_loss: buffer allocation failed\n");
+            if (h_loss_out) *h_loss_out = 0;
+            return;
+        }
+        float *d_pab  = (float *)pab_buf.contents;
+        float *d_pa   = (float *)pa_buf.contents;
+        float *d_pb   = (float *)pb_buf.contents;
+        float *d_bins = (float *)bins_buf.contents;
+        metal_register_buffer(d_pab, (__bridge void *)pab_buf, pab_sz);
+        metal_register_buffer(d_pa, (__bridge void *)pa_buf, marg_sz);
+        metal_register_buffer(d_pb, (__bridge void *)pb_buf, marg_sz);
+        metal_register_buffer(d_bins, (__bridge void *)bins_buf, marg_sz);
+
+        /* Initialize: zero histograms, copy bin centers */
+        memset(d_pab, 0, (size_t)nb * nb * sizeof(float));
+        memset(d_pa, 0, (size_t)nb * sizeof(float));
+        memset(d_pb, 0, (size_t)nb * sizeof(float));
+        memcpy(d_bins, h_bins, (size_t)nb * sizeof(float));
+
+        /* Step 1: Accumulate histogram on GPU */
+        {
+            void *pso = metal_get_pipeline("mi_histogram");
+            if (!pso) {
+                fprintf(stderr, "metal_mi_loss: mi_histogram pipeline not found\n");
+                if (h_loss_out) *h_loss_out = 0;
+                goto cleanup;
+            }
+
+            mi_hist_params_t params = {
+                .N = N, .num_bins = nb, .preterm = preterm,
+                .inv_maxval_p = inv_maxval_p, .inv_maxval_t = inv_maxval_t,
+                ._pad0 = 0, ._pad1 = 0, ._pad2 = 0
+            };
+
+            const void *bufs[] = { pred, target, d_pab, d_pa, d_pb, d_bins };
+            size_t sizes[] = {
+                (size_t)N * sizeof(float),
+                (size_t)N * sizeof(float),
+                (size_t)nb * nb * sizeof(float),
+                (size_t)nb * sizeof(float),
+                (size_t)nb * sizeof(float),
+                (size_t)nb * sizeof(float)
+            };
+            metal_dispatch(pso, bufs, sizes, 6, &params, sizeof(params), (uint32_t)N);
+        }
+
+        /* Step 2: Compute MI on CPU from histogram (fast — only nb² iterations).
+         * With unified memory, just sync and read the histogram directly. */
+        if (h_loss_out) {
+            metal_sync();
+            double mi = 0.0;
+            for (int a = 0; a < nb; a++) {
+                for (int b = 0; b < nb; b++) {
+                    float p = d_pab[a * nb + b];
+                    float pp = d_pa[a] * d_pb[b];
+                    mi += p * logf((p + nr) / (pp + dr) + dr);
+                }
+            }
+            *h_loss_out = -(float)mi;
+        }
+
+        /* Step 3: Gradient on GPU */
+        if (grad_pred) {
+            void *pso = metal_get_pipeline("mi_gradient");
+            if (!pso) {
+                fprintf(stderr, "metal_mi_loss: mi_gradient pipeline not found\n");
+                goto cleanup;
+            }
+
+            mi_grad_params_t params = {
+                .N = N, .num_bins = nb, .preterm = preterm,
+                .inv_maxval_p = inv_maxval_p, .inv_maxval_t = inv_maxval_t,
+                .nr = nr, .dr = dr, ._pad = 0
+            };
+
+            const void *bufs[] = { pred, target, d_pab, d_pa, d_pb, grad_pred, d_bins };
+            size_t sizes[] = {
+                (size_t)N * sizeof(float),
+                (size_t)N * sizeof(float),
+                (size_t)nb * nb * sizeof(float),
+                (size_t)nb * sizeof(float),
+                (size_t)nb * sizeof(float),
+                (size_t)N * sizeof(float),
+                (size_t)nb * sizeof(float)
+            };
+            metal_dispatch(pso, bufs, sizes, 7, &params, sizeof(params), (uint32_t)N);
+        }
+
+    cleanup:
+        metal_unregister_buffer(d_bins);
+        metal_unregister_buffer(d_pb);
+        metal_unregister_buffer(d_pa);
+        metal_unregister_buffer(d_pab);
+        /* ARC releases the MTLBuffers when they go out of scope */
+    }
+}
+
+/* ================================================================== */
+/* Phase 7: Deformable registration ops                                */
+/* ================================================================== */
+
+/* --- Vector add: out[i] = a[i] + b[i] --- */
+void metal_vec_add(float *out, const float *a, const float *b, int n) {
+    /* Use tensor_axpy pattern: copy a to out, then axpy with b */
+    /* For simplicity and to avoid needing a new shader, do on CPU
+       since unified memory makes this fast. */
+    metal_sync();
+    for (int i = 0; i < n; i++)
+        out[i] = a[i] + b[i];
+}
+
+/* --- Permute dispatches --- */
+
+typedef struct { uint32_t D, H, W, _pad; } permute_params_t;
+
+void metal_permute_3dhw_dhw3(const float *in, float *out, int D, int H, int W) {
+    void *pso = metal_get_pipeline("permute_3dhw_dhw3");
+    if (!pso) {
+        fprintf(stderr, "metal_permute_3dhw_dhw3: pipeline not found\n");
+        return;
+    }
+    permute_params_t params = { .D = (uint32_t)D, .H = (uint32_t)H, .W = (uint32_t)W, ._pad = 0 };
+    uint32_t spatial = (uint32_t)D * H * W;
+    const void *bufs[] = { in, out };
+    size_t sizes[] = { (size_t)spatial * 3 * sizeof(float), (size_t)spatial * 3 * sizeof(float) };
+    metal_dispatch(pso, bufs, sizes, 2, &params, sizeof(params), spatial);
+}
+
+void metal_permute_dhw3_3dhw(const float *in, float *out, int D, int H, int W) {
+    void *pso = metal_get_pipeline("permute_dhw3_3dhw");
+    if (!pso) {
+        fprintf(stderr, "metal_permute_dhw3_3dhw: pipeline not found\n");
+        return;
+    }
+    permute_params_t params = { .D = (uint32_t)D, .H = (uint32_t)H, .W = (uint32_t)W, ._pad = 0 };
+    uint32_t spatial = (uint32_t)D * H * W;
+    const void *bufs[] = { in, out };
+    size_t sizes[] = { (size_t)spatial * 3 * sizeof(float), (size_t)spatial * 3 * sizeof(float) };
+    metal_dispatch(pso, bufs, sizes, 2, &params, sizeof(params), spatial);
+}
+
+/* --- Fused compositive warp update --- */
+
+typedef struct { uint32_t D, H, W, _pad; } compose_params_t;
+
+void metal_fused_compositive_update(const float *warp, const float *update,
+                                     float *output, int D, int H, int W) {
+    void *pso = metal_get_pipeline("fused_compositive_update");
+    if (!pso) {
+        fprintf(stderr, "metal_fused_compositive_update: pipeline not found\n");
+        return;
+    }
+    compose_params_t params = { .D = (uint32_t)D, .H = (uint32_t)H, .W = (uint32_t)W, ._pad = 0 };
+    uint32_t spatial = (uint32_t)D * H * W;
+    const void *bufs[] = { warp, update, output };
+    size_t sizes[] = {
+        (size_t)spatial * 3 * sizeof(float),
+        (size_t)spatial * 3 * sizeof(float),
+        (size_t)spatial * 3 * sizeof(float)
+    };
+    metal_dispatch(pso, bufs, sizes, 3, &params, sizeof(params), spatial);
+}
+
+/* --- Max L2 norm reduction --- */
+
+float metal_max_l2_norm(const float *data, int spatial) {
+    float eps = 1e-8f;
+    void *pso = metal_get_pipeline("max_l2_norm");
+    if (!pso) {
+        /* CPU fallback */
+        metal_sync();
+        float maxval = 0;
+        for (int i = 0; i < spatial; i++) {
+            float dx = data[i*3], dy = data[i*3+1], dz = data[i*3+2];
+            float v = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (v > maxval) maxval = v;
+        }
+        return eps + maxval;
+    }
+
+    @autoreleasepool {
+        uint32_t n_groups = metal_div_ceil((uint32_t)spatial, MTL_THREADGROUP_SIZE);
+
+        id<MTLBuffer> partial_buf = [g_metal.device newBufferWithLength:(NSUInteger)(n_groups * sizeof(float))
+                                                                options:MTLResourceStorageModeShared];
+        if (!partial_buf) {
+            /* CPU fallback */
+            metal_sync();
+            float maxval = 0;
+            for (int i = 0; i < spatial; i++) {
+                float dx = data[i*3], dy = data[i*3+1], dz = data[i*3+2];
+                float v = sqrtf(dx*dx + dy*dy + dz*dz);
+                if (v > maxval) maxval = v;
+            }
+            return eps + maxval;
+        }
+
+        float *d_partial = (float *)partial_buf.contents;
+        metal_register_buffer(d_partial, (__bridge void *)partial_buf, (size_t)(n_groups * sizeof(float)));
+
+        struct { uint32_t spatial, _pad; float eps, _pad1; } params = {
+            .spatial = (uint32_t)spatial, ._pad = 0, .eps = eps, ._pad1 = 0
+        };
+        const void *bufs[] = { data, d_partial };
+        size_t sizes[] = {
+            (size_t)spatial * 3 * sizeof(float),
+            (size_t)n_groups * sizeof(float)
+        };
+        metal_dispatch(pso, bufs, sizes, 2, &params, sizeof(params), (uint32_t)spatial);
+
+        /* CPU final max of partial results */
+        metal_sync();
+        float maxval = 0;
+        for (uint32_t i = 0; i < n_groups; i++)
+            if (d_partial[i] > maxval) maxval = d_partial[i];
+
+        metal_unregister_buffer(d_partial);
+        return eps + maxval;
+    }
+}
+
+/* --- Warp inversion via iterative fixed-point --- */
+
+typedef struct { uint32_t D, H, W, _pad; } warp_params_t;
+
+void metal_warp_inverse(const float *u, float *inv_u, int D, int H, int W, int n_iters) {
+    if (n_iters <= 0) n_iters = 550;  /* default matching Python/CUDA */
+
+    uint32_t spatial = (uint32_t)D * H * W;
+    uint32_t n3 = spatial * 3;
+
+    /* Initialize inv_u = -u */
+    void *negate_pso = metal_get_pipeline("negate_field");
+    if (!negate_pso) {
+        /* CPU fallback */
+        metal_sync();
+        for (uint32_t i = 0; i < n3; i++)
+            inv_u[i] = -u[i];
+    } else {
+        warp_params_t params = { .D = (uint32_t)D, .H = (uint32_t)H, .W = (uint32_t)W, ._pad = 0 };
+        const void *bufs[] = { u, inv_u };
+        size_t sizes[] = { (size_t)n3 * sizeof(float), (size_t)n3 * sizeof(float) };
+        metal_dispatch(negate_pso, bufs, sizes, 2, &params, sizeof(params), n3);
+    }
+
+    void *iter_pso = metal_get_pipeline("warp_inverse_iter");
+    if (!iter_pso) {
+        fprintf(stderr, "metal_warp_inverse: warp_inverse_iter pipeline not found, using negate only\n");
+        return;
+    }
+
+    @autoreleasepool {
+        /* Need a temporary buffer for ping-pong iteration */
+        id<MTLBuffer> tmp_buf = [g_metal.device newBufferWithLength:(NSUInteger)(n3 * sizeof(float))
+                                                             options:MTLResourceStorageModeShared];
+        if (!tmp_buf) {
+            fprintf(stderr, "metal_warp_inverse: failed to allocate temp buffer\n");
+            return;
+        }
+        float *d_tmp = (float *)tmp_buf.contents;
+        metal_register_buffer(d_tmp, (__bridge void *)tmp_buf, (size_t)(n3 * sizeof(float)));
+
+        warp_params_t params = { .D = (uint32_t)D, .H = (uint32_t)H, .W = (uint32_t)W, ._pad = 0 };
+
+        for (int iter = 0; iter < n_iters; iter++) {
+            /* out = -interp(u, identity + inv_u)
+             * Alternate between inv_u->tmp and tmp->inv_u */
+            float *src = (iter % 2 == 0) ? inv_u : d_tmp;
+            float *dst = (iter % 2 == 0) ? d_tmp : inv_u;
+
+            const void *bufs[] = { u, src, dst };
+            size_t sizes[] = {
+                (size_t)n3 * sizeof(float),
+                (size_t)n3 * sizeof(float),
+                (size_t)n3 * sizeof(float)
+            };
+            metal_dispatch(iter_pso, bufs, sizes, 3, &params, sizeof(params), spatial);
+        }
+
+        /* If n_iters is odd, result is in d_tmp; copy back to inv_u */
+        if (n_iters % 2 != 0) {
+            metal_sync();
+            memcpy(inv_u, d_tmp, (size_t)n3 * sizeof(float));
+        }
+
+        metal_unregister_buffer(d_tmp);
     }
 }

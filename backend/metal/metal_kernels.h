@@ -80,14 +80,38 @@ void metal_downsample_fft(const float *input, float *output,
                            int B, int C, int iD, int iH, int iW,
                            int oD, int oH, int oW);
 
-/* --- Future phases (declarations for reference) --- */
+/* --- Phase 6: MI loss --- */
 
-/* void metal_tensor_add(float *y, const float *x, int n); */
-/* void metal_mi_loss_3d(...); */
-/* void metal_adam_step(...); */
-/* void metal_affine_grid_bwd(...); */
-/* void metal_compose_displacement(...); */
-/* void metal_warp_inverse(...); */
+/* MI loss matching cuda_mi_loss_3d exactly:
+ * threadgroup atomic<float> histogram, softmax Parzen weights, proper gradient */
+void metal_mi_loss_3d(const float *pred, const float *target,
+                       float *grad_pred,
+                       int D, int H, int W,
+                       int num_bins, float *h_loss_out);
+
+/* --- Phase 7: Deformable registration ops --- */
+
+/* Vector add: out[i] = a[i] + b[i] */
+void metal_vec_add(float *out, const float *a, const float *b, int n);
+
+/* Fused compositive warp update:
+ * output[x] = update[x] + interp(warp, identity + update[x])
+ * warp, update, output are [D,H,W,3] displacement fields */
+void metal_fused_compositive_update(const float *warp, const float *update,
+                                     float *output, int D, int H, int W);
+
+/* Iterative warp inversion via fixed-point iteration.
+ * Computes inv_u such that compose(u, inv_u) ~ identity.
+ * n_iters: number of iterations (0 = default 550) */
+void metal_warp_inverse(const float *u, float *inv_u, int D, int H, int W, int n_iters);
+
+/* Max L2 norm across [D,H,W,3] displacement field.
+ * Returns eps + max(sqrt(dx^2+dy^2+dz^2)) with eps=1e-8 */
+float metal_max_l2_norm(const float *data, int spatial);
+
+/* Permute [D,H,W,3] <-> [3,D,H,W] */
+void metal_permute_3dhw_dhw3(const float *in, float *out, int D, int H, int W);
+void metal_permute_dhw3_3dhw(const float *in, float *out, int D, int H, int W);
 
 #ifdef __cplusplus
 }

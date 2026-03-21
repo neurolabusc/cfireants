@@ -207,6 +207,9 @@ if(CFIREANTS_METAL)
         ${METAL_SHADER_DIR}/cc_loss.metal
         ${METAL_SHADER_DIR}/blur.metal
         ${METAL_SHADER_DIR}/affine_grid_bwd.metal
+        ${METAL_SHADER_DIR}/mi_loss.metal
+        ${METAL_SHADER_DIR}/compose.metal
+        ${METAL_SHADER_DIR}/warp_inverse.metal
     )
 
     set(METAL_AIR_FILES "")
@@ -215,7 +218,7 @@ if(CFIREANTS_METAL)
         set(AIR_FILE "${METAL_AIR_DIR}/${SHADER_NAME}.air")
         add_custom_command(
             OUTPUT ${AIR_FILE}
-            COMMAND xcrun -sdk macosx metal -c ${SHADER} -o ${AIR_FILE}
+            COMMAND xcrun -sdk macosx metal -std=metal3.0 -c ${SHADER} -o ${AIR_FILE}
             DEPENDS ${SHADER}
             COMMENT "Compiling Metal shader ${SHADER_NAME}.metal -> ${SHADER_NAME}.air"
         )
@@ -238,6 +241,8 @@ if(CFIREANTS_METAL)
         backend/metal/metal_kernels.m
         backend/metal/metal_fft.m
         backend/metal/linear_metal.m
+        backend/metal/greedy_metal.m
+        backend/metal/syn_metal.m
         third_party/kissfft/kiss_fft.c
         third_party/kissfft/kiss_fftnd.c
     )
@@ -305,4 +310,8 @@ if(CFIREANTS_METAL)
     add_executable(test_metal_linear tests/test_metal_linear.c
         src/registration/moments.c)
     target_link_libraries(test_metal_linear cfireants cfireants_gpu)
+
+    add_executable(test_validate_metal tests/test_validate_metal.c
+        src/registration/moments.c)
+    target_link_libraries(test_validate_metal cfireants cfireants_gpu)
 endif()

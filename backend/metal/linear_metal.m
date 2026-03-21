@@ -333,10 +333,9 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
 
             float loss;
             if (opts.loss_type == LOSS_MI) {
-                /* MI not yet implemented for Metal — fall back to CC with warning */
-                fprintf(stderr, "    WARNING: MI loss not implemented for Metal, using CC\n");
-                metal_cc_loss_3d(d_moved, d_fdown, d_grad_moved, dD, dH, dW,
-                                  opts.cc_kernel_size, &loss);
+                int nbins = opts.mi_num_bins > 0 ? opts.mi_num_bins : 32;
+                metal_mi_loss_3d(d_moved, d_fdown, d_grad_moved,
+                                  dD, dH, dW, nbins, &loss);
             } else {
                 metal_cc_loss_3d(d_moved, d_fdown, d_grad_moved, dD, dH, dW,
                                   opts.cc_kernel_size, &loss);
@@ -603,11 +602,9 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
 
             float loss;
             if (opts.loss_type == LOSS_MI) {
-                /* MI not yet implemented for Metal — fall back to CC with warning */
-                if (it == 0 && si == 0)
-                    fprintf(stderr, "    WARNING: MI loss not implemented for Metal, using CC\n");
-                metal_cc_loss_3d(d_moved, d_fdown, d_grad_moved, dD, dH, dW,
-                                  opts.cc_kernel_size, &loss);
+                int nbins = opts.mi_num_bins > 0 ? opts.mi_num_bins : 32;
+                metal_mi_loss_3d(d_moved, d_fdown, d_grad_moved,
+                                  dD, dH, dW, nbins, &loss);
             } else {
                 metal_cc_loss_3d(d_moved, d_fdown, d_grad_moved, dD, dH, dW,
                                   opts.cc_kernel_size, &loss);

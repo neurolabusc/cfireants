@@ -129,8 +129,14 @@ static int mtl_cc_loss_3d(
                       gp, D, H, W, ks, loss_out);
     return 0;
 }
-MTL_STUB(mtl_mi_loss_3d,
-    const tensor_t *pred, const tensor_t *target, int bins, float *loss_out, tensor_t *grad_pred)
+static int mtl_mi_loss_3d(const tensor_t *pred, const tensor_t *target,
+                           int bins, float *loss_out, tensor_t *grad_pred) {
+    int D = pred->shape[2], H = pred->shape[3], W = pred->shape[4];
+    float *gp = grad_pred ? (float *)grad_pred->data : NULL;
+    metal_mi_loss_3d((const float *)pred->data, (const float *)target->data,
+                      gp, D, H, W, bins, loss_out);
+    return 0;
+}
 MTL_STUB(mtl_gaussian_blur_3d,
     tensor_t *inout, const float *sigmas, int truncated)
 
