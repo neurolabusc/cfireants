@@ -243,8 +243,6 @@ if(CFIREANTS_METAL)
         backend/metal/linear_metal.m
         backend/metal/greedy_metal.m
         backend/metal/syn_metal.m
-        third_party/kissfft/kiss_fft.c
-        third_party/kissfft/kiss_fftnd.c
     )
 
     add_dependencies(cfireants_metal metal_shaders)
@@ -253,7 +251,6 @@ if(CFIREANTS_METAL)
 
     target_include_directories(cfireants_metal PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft
     )
     target_include_directories(cfireants_metal PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include

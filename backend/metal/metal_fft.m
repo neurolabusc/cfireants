@@ -1,43 +1,107 @@
 /*
- * metal_fft.m - FFT-based downsampling for Metal backend
+ * metal_fft.m - FFT-based downsampling via MPSGraph
  *
- * On Metal with unified memory, the FFT runs on CPU directly on
- * shared-memory buffers (zero-copy). Uses kissfft (vendored in
- * third_party/kissfft/) — the same implementation as the WebGPU backend.
+ * Uses MPSGraph's fastFourierTransform for GPU-native 3D FFT on Apple Silicon.
+ * Supports non-power-of-2 sizes natively. The intermediate operations (fftshift,
+ * crop, Gaussian window) run on CPU via unified memory — these are O(N) and
+ * negligible compared to the FFT itself.
  *
- * The FFT only runs 2-3 times per registration stage (at scale transitions)
- * and takes ~30ms for a 91×109×91 volume. Not a performance bottleneck.
- *
- * Future optimization: replace with MPSGraph FFT for GPU-native transforms.
+ * Flow matching Python downsample_fft() / CUDA downsample_fft.cu:
+ *   1. Forward 3D FFT (MPSGraph, GPU)
+ *   2. fftshift (CPU, unified memory)
+ *   3. Crop to [target_size + 2*padding] centered region (CPU)
+ *   4. Apply Gaussian window (CPU)
+ *   5. Scale by prod(target/source)
+ *   6. Remove padding (CPU)
+ *   7. ifftshift (CPU)
+ *   8. Inverse 3D FFT (MPSGraph, GPU), normalize by 1/N
+ *   9. Clamp to original range (CPU)
  */
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "metal_context.h"
 #include "metal_kernels.h"
 
-/* kissfft (vendored in third_party/kissfft/) */
-#include "kiss_fft.h"
-#include "kiss_fftnd.h"
+/* Complex float type matching MPSDataTypeComplexFloat32 layout (real, imag) */
+typedef struct { float real, imag; } cfloat_t;
 
 /*
- * Faithful clone of Python downsample_fft() via kissfft.
- * Same implementation as webgpu_downsample_fft in fft_cpu_fallback.c.
+ * Run a 3D FFT via MPSGraph using MTLBuffer for zero-copy I/O.
  *
- * Flow:
- *   1. Forward 3D FFT
- *   2. fftshift
- *   3. Crop to [target_size + 2*padding] centered region
- *   4. Apply Gaussian window: exp(-0.5 * (freq/sigma)^2), sigma = dim/4
- *   5. Scale by prod(target/source)
- *   6. Remove padding
- *   7. ifftshift
- *   8. Inverse 3D FFT, normalize by 1/N
- *   9. Clamp to original range
+ * For forward (inverse=0): real float [D*H*W] → complex [D*H*W*2 floats]
+ * For inverse (inverse=1): complex [D*H*W*2 floats] → complex [D*H*W*2 floats]
+ *   (caller takes real part)
  */
+static void mpsgraph_fft_3d(const void *input_data, size_t input_bytes,
+                             void *output_data, size_t output_bytes,
+                             int D, int H, int W,
+                             int inverse, int is_complex_input)
+{
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+
+        NSArray<NSNumber *> *shape = @[@(D), @(H), @(W)];
+        MPSDataType inType = is_complex_input ? MPSDataTypeComplexFloat32 : MPSDataTypeFloat32;
+
+        MPSGraphTensor *inputTensor = [graph placeholderWithShape:shape
+                                                         dataType:inType
+                                                             name:@"input"];
+
+        MPSGraphFFTDescriptor *desc = [MPSGraphFFTDescriptor descriptor];
+        desc.inverse = inverse ? YES : NO;
+        desc.scalingMode = inverse ? MPSGraphFFTScalingModeSize : MPSGraphFFTScalingModeNone;
+
+        NSArray<NSNumber *> *axes = @[@0, @1, @2];
+        MPSGraphTensor *fftResult = [graph fastFourierTransformWithTensor:inputTensor
+                                                                     axes:axes
+                                                               descriptor:desc
+                                                                     name:@"fft3d"];
+
+        /* Create input MTLBuffer (shared memory — wraps existing data) */
+        id<MTLBuffer> inBuf = [g_metal.device newBufferWithBytes:input_data
+                                                          length:input_bytes
+                                                         options:MTLResourceStorageModeShared];
+
+        /* Create output MTLBuffer (shared memory) */
+        size_t complex_bytes = (size_t)D * H * W * sizeof(cfloat_t);
+        id<MTLBuffer> outBuf = [g_metal.device newBufferWithLength:complex_bytes
+                                                           options:MTLResourceStorageModeShared];
+
+        MPSGraphTensorData *inputData = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:inBuf shape:shape dataType:inType];
+
+        /* For the output, we need to tell MPSGraph where to write.
+         * Use runWithMTLCommandQueue:feeds:targetTensors:targetOperations:
+         * and then read back from the result's underlying buffer. */
+        NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds =
+            @{ inputTensor : inputData };
+
+        /* Create output tensor data backed by our buffer */
+        MPSGraphTensorData *outputData = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:outBuf shape:shape dataType:MPSDataTypeComplexFloat32];
+
+        NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
+            [graph runWithMTLCommandQueue:g_metal.queue
+                                    feeds:feeds
+                            targetTensors:@[fftResult]
+                         targetOperations:nil];
+
+        /* Copy result to output buffer.
+         * The graph returns new MPSGraphTensorData; read via mpsndarray → readBytes. */
+        MPSGraphTensorData *resultData = results[fftResult];
+        MPSNDArray *ndarray = [resultData mpsndarray];
+
+        /* Read the ndarray into our output buffer */
+        [ndarray readBytes:output_data strideBytes:nil];
+    }
+}
+
 void metal_downsample_fft(
     const float *input, float *output,
     int B, int C,
@@ -58,17 +122,13 @@ void metal_downsample_fft(
 
     float multiplier = ((float)oD / iD) * ((float)oH / iH) * ((float)oW / iW);
 
-    /* kissfft setup: forward (iD,iH,iW), inverse (oD,oH,oW) */
-    int dims_fwd[3] = { iD, iH, iW };
-    int dims_inv[3] = { oD, oH, oW };
-    kiss_fftnd_cfg cfg_fwd = kiss_fftnd_alloc(dims_fwd, 3, 0, NULL, NULL);
-    kiss_fftnd_cfg cfg_inv = kiss_fftnd_alloc(dims_inv, 3, 1, NULL, NULL);
-
-    kiss_fft_cpx *fft_buf  = (kiss_fft_cpx *)malloc(spatial_in * sizeof(kiss_fft_cpx));
-    kiss_fft_cpx *shifted  = (kiss_fft_cpx *)malloc(spatial_in * sizeof(kiss_fft_cpx));
-    kiss_fft_cpx *cropped  = (kiss_fft_cpx *)malloc(spatial_crop * sizeof(kiss_fft_cpx));
-    kiss_fft_cpx *trimmed  = (kiss_fft_cpx *)malloc(spatial_out * sizeof(kiss_fft_cpx));
-    kiss_fft_cpx *unshift  = (kiss_fft_cpx *)malloc(spatial_out * sizeof(kiss_fft_cpx));
+    /* Allocate complex buffers */
+    cfloat_t *fft_out  = (cfloat_t *)malloc(spatial_in * sizeof(cfloat_t));
+    cfloat_t *shifted  = (cfloat_t *)malloc(spatial_in * sizeof(cfloat_t));
+    cfloat_t *cropped  = (cfloat_t *)malloc(spatial_crop * sizeof(cfloat_t));
+    cfloat_t *trimmed  = (cfloat_t *)malloc(spatial_out * sizeof(cfloat_t));
+    cfloat_t *unshift  = (cfloat_t *)malloc(spatial_out * sizeof(cfloat_t));
+    cfloat_t *ifft_out = (cfloat_t *)malloc(spatial_out * sizeof(cfloat_t));
 
     for (int bc = 0; bc < B * C; bc++) {
         const float *src = input + (long)bc * spatial_in;
@@ -81,14 +141,10 @@ void metal_downsample_fft(
             if (src[i] > vmax) vmax = src[i];
         }
 
-        /* Real to complex */
-        for (long i = 0; i < spatial_in; i++) {
-            fft_buf[i].r = src[i];
-            fft_buf[i].i = 0;
-        }
-
-        /* Forward 3D FFT */
-        kiss_fftnd(cfg_fwd, fft_buf, fft_buf);
+        /* Forward 3D FFT via MPSGraph (real → complex) */
+        mpsgraph_fft_3d(src, spatial_in * sizeof(float),
+                         fft_out, spatial_in * sizeof(cfloat_t),
+                         iD, iH, iW, 0, 0);
 
         /* fftshift: shift by ceil(N/2) along each dim */
         for (long i = 0; i < spatial_in; i++) {
@@ -99,7 +155,7 @@ void metal_downsample_fft(
             int sh = (h + (iH + 1) / 2) % iH;
             int sw = (w + (iW + 1) / 2) % iW;
             long src_idx = ((long)sd * iH + sh) * iW + sw;
-            shifted[i] = fft_buf[src_idx];
+            shifted[i] = fft_out[src_idx];
         }
 
         /* Crop centered region */
@@ -129,8 +185,8 @@ void metal_downsample_fft(
             float yf = (float)(ys + h) / sy;
             float xf = (float)(xs + w) / sx;
             float scale = expf(-0.5f * (zf*zf + yf*yf + xf*xf)) * multiplier;
-            cropped[i].r *= scale;
-            cropped[i].i *= scale;
+            cropped[i].real *= scale;
+            cropped[i].imag *= scale;
         }
 
         /* Remove padding: trim [padding:-padding] from each dim */
@@ -154,20 +210,20 @@ void metal_downsample_fft(
             unshift[i] = trimmed[src_idx];
         }
 
-        /* Inverse 3D FFT */
-        kiss_fftnd(cfg_inv, unshift, unshift);
+        /* Inverse 3D FFT via MPSGraph (complex → complex, with 1/N scaling) */
+        mpsgraph_fft_3d(unshift, spatial_out * sizeof(cfloat_t),
+                         ifft_out, spatial_out * sizeof(cfloat_t),
+                         oD, oH, oW, 1, 1);
 
-        /* Complex to real + 1/N normalization + clamp */
-        float inv_N = 1.0f / (float)spatial_out;
+        /* Take real part + clamp to original range */
         for (long i = 0; i < spatial_out; i++) {
-            float val = unshift[i].r * inv_N;
+            float val = ifft_out[i].real;
             if (val < vmin) val = vmin;
             if (val > vmax) val = vmax;
             dst[i] = val;
         }
     }
 
-    free(fft_buf); free(shifted); free(cropped);
-    free(trimmed); free(unshift);
-    free(cfg_fwd); free(cfg_inv);
+    free(fft_out); free(shifted); free(cropped);
+    free(trimmed); free(unshift); free(ifft_out);
 }
