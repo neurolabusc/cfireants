@@ -31,6 +31,7 @@ extern "C" {
 #define DEVICE_CPU    0
 #define DEVICE_CUDA   1
 #define DEVICE_WEBGPU 2
+#define DEVICE_METAL  3
 
 /* Tensor structure */
 typedef struct {

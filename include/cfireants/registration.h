@@ -109,6 +109,12 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
                            rigid_opts_t opts, rigid_result_t *result);
 #endif
 
+#ifdef CFIREANTS_HAS_METAL
+int rigid_register_metal(const image_t *fixed, const image_t *moving,
+                          const moments_result_t *moments_init,
+                          rigid_opts_t opts, rigid_result_t *result);
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Affine registration                                                 */
 /* ------------------------------------------------------------------ */
@@ -144,6 +150,12 @@ int affine_register_gpu(const image_t *fixed, const image_t *moving,
 int affine_register_webgpu(const image_t *fixed, const image_t *moving,
                             const float init_rigid_34[3][4],
                             affine_opts_t opts, affine_result_t *result);
+#endif
+
+#ifdef CFIREANTS_HAS_METAL
+int affine_register_metal(const image_t *fixed, const image_t *moving,
+                           const float init_rigid_34[3][4],
+                           affine_opts_t opts, affine_result_t *result);
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -186,6 +198,12 @@ int greedy_register_webgpu(const image_t *fixed, const image_t *moving,
                             greedy_opts_t opts, greedy_result_t *result);
 #endif
 
+#ifdef CFIREANTS_HAS_METAL
+int greedy_register_metal(const image_t *fixed, const image_t *moving,
+                           const float init_affine_44[4][4],
+                           greedy_opts_t opts, greedy_result_t *result);
+#endif
+
 /* ------------------------------------------------------------------ */
 /* SyN (symmetric) deformable registration                             */
 /* ------------------------------------------------------------------ */
@@ -224,6 +242,12 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
 int syn_register_webgpu(const image_t *fixed, const image_t *moving,
                          const float init_affine_44[4][4],
                          syn_opts_t opts, syn_result_t *result);
+#endif
+
+#ifdef CFIREANTS_HAS_METAL
+int syn_register_metal(const image_t *fixed, const image_t *moving,
+                        const float init_affine_44[4][4],
+                        syn_opts_t opts, syn_result_t *result);
 #endif
 
 /* Evaluate SyN result: warp moving into fixed space */

@@ -27,6 +27,16 @@ int  webgpu_memcpy_d2h(void *dst, WGPUBuffer src, size_t nbytes);
 int  webgpu_memcpy_d2d(WGPUBuffer dst, WGPUBuffer src, size_t nbytes);
 #endif
 
+#ifdef CFIREANTS_HAS_METAL
+/* Forward declarations for Metal memory ops (implemented in backend_metal.m) */
+int  metal_tensor_alloc(tensor_t *t, size_t nbytes);
+void metal_tensor_free(void *ptr);
+int  metal_memcpy_h2d(void *dst, const void *src, size_t nbytes);
+int  metal_memcpy_d2h(void *dst, const void *src, size_t nbytes);
+int  metal_memcpy_d2d(void *dst, const void *src, size_t nbytes);
+int  metal_memset(void *ptr, int value, size_t nbytes);
+#endif
+
 size_t dtype_size(int dtype) {
     switch (dtype) {
         case DTYPE_FLOAT32: return sizeof(float);
@@ -116,6 +126,14 @@ int tensor_alloc(tensor_t *t, int ndim, const int *shape, int dtype, int device)
         }
     }
 #endif
+#ifdef CFIREANTS_HAS_METAL
+    else if (device == DEVICE_METAL) {
+        if (metal_tensor_alloc(t, nbytes) != 0) {
+            fprintf(stderr, "tensor_alloc: Metal alloc failed for %zu bytes\n", nbytes);
+            return -1;
+        }
+    }
+#endif
     else {
         fprintf(stderr, "tensor_alloc: unsupported device=%d\n", device);
         return -1;
@@ -141,6 +159,11 @@ void tensor_free(tensor_t *t) {
 #ifdef CFIREANTS_HAS_WEBGPU
         else if (t->device == DEVICE_WEBGPU) {
             webgpu_tensor_free((WGPUBuffer)t->data);
+        }
+#endif
+#ifdef CFIREANTS_HAS_METAL
+        else if (t->device == DEVICE_METAL) {
+            metal_tensor_free(t->data);
         }
 #endif
     }
@@ -187,6 +210,17 @@ int tensor_copy(tensor_t *dst, const tensor_t *src) {
         return webgpu_memcpy_d2d((WGPUBuffer)dst->data, (WGPUBuffer)src->data, nbytes);
     }
 #endif
+#ifdef CFIREANTS_HAS_METAL
+    if (src->device == DEVICE_CPU && dst->device == DEVICE_METAL) {
+        return metal_memcpy_h2d(dst->data, src->data, nbytes);
+    }
+    if (src->device == DEVICE_METAL && dst->device == DEVICE_CPU) {
+        return metal_memcpy_d2h(dst->data, src->data, nbytes);
+    }
+    if (src->device == DEVICE_METAL && dst->device == DEVICE_METAL) {
+        return metal_memcpy_d2d(dst->data, src->data, nbytes);
+    }
+#endif
     fprintf(stderr, "tensor_copy: unsupported device combination\n");
     return -1;
 }
@@ -221,6 +255,7 @@ void tensor_info(const tensor_t *t, const char *name) {
     if (t->device == DEVICE_CPU) dev_name = "cpu";
     else if (t->device == DEVICE_CUDA) dev_name = "cuda";
     else if (t->device == DEVICE_WEBGPU) dev_name = "webgpu";
+    else if (t->device == DEVICE_METAL) dev_name = "metal";
     fprintf(stderr, "tensor '%s': dtype=%s device=%s shape=[",
             name ? name : "?",
             dtype_name(t->dtype),

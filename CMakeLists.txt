@@ -6,6 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(CFIREANTS_CUDA "Build with CUDA backend" ON)
 option(CFIREANTS_WEBGPU "Build with WebGPU backend (future)" OFF)
+option(CFIREANTS_METAL "Build with Metal backend (macOS/Apple Silicon)" OFF)
 
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter")
@@ -94,6 +95,9 @@ endif()
 if(CFIREANTS_WEBGPU)
     target_link_libraries(cfireants_gpu INTERFACE cfireants_webgpu)
 endif()
+if(CFIREANTS_METAL)
+    target_link_libraries(cfireants_gpu INTERFACE cfireants_metal)
+endif()
 
 # Test programs
 
@@ -181,9 +185,95 @@ if(CFIREANTS_WEBGPU)
     message(STATUS "WebGPU backend enabled (wgpu-native)")
 endif()
 
+# Metal backend (macOS only)
+if(CFIREANTS_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "Metal backend requires macOS (APPLE platform)")
+    endif()
+
+    enable_language(OBJC)
+
+    # Compile .metal shaders to .air, then link into a .metallib
+    set(METAL_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/backend/metal/shaders")
+    set(METAL_AIR_DIR "${CMAKE_CURRENT_BINARY_DIR}/metal_air")
+    set(METAL_LIB_PATH "${CMAKE_CURRENT_BINARY_DIR}/cfireants.metallib")
+    file(MAKE_DIRECTORY ${METAL_AIR_DIR})
+
+    set(METAL_SHADER_SOURCES
+        ${METAL_SHADER_DIR}/elementwise.metal
+        ${METAL_SHADER_DIR}/reduction.metal
+        ${METAL_SHADER_DIR}/permute.metal
+        ${METAL_SHADER_DIR}/grid_sample.metal
+        ${METAL_SHADER_DIR}/cc_loss.metal
+        ${METAL_SHADER_DIR}/blur.metal
+        ${METAL_SHADER_DIR}/affine_grid_bwd.metal
+    )
+
+    set(METAL_AIR_FILES "")
+    foreach(SHADER ${METAL_SHADER_SOURCES})
+        get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+        set(AIR_FILE "${METAL_AIR_DIR}/${SHADER_NAME}.air")
+        add_custom_command(
+            OUTPUT ${AIR_FILE}
+            COMMAND xcrun -sdk macosx metal -c ${SHADER} -o ${AIR_FILE}
+            DEPENDS ${SHADER}
+            COMMENT "Compiling Metal shader ${SHADER_NAME}.metal -> ${SHADER_NAME}.air"
+        )
+        list(APPEND METAL_AIR_FILES ${AIR_FILE})
+    endforeach()
+
+    add_custom_command(
+        OUTPUT ${METAL_LIB_PATH}
+        COMMAND xcrun -sdk macosx metallib ${METAL_AIR_FILES} -o ${METAL_LIB_PATH}
+        DEPENDS ${METAL_AIR_FILES}
+        COMMENT "Linking Metal shaders into cfireants.metallib"
+    )
+
+    add_custom_target(metal_shaders DEPENDS ${METAL_LIB_PATH})
+
+    add_library(cfireants_metal STATIC
+        backend/metal/metal_context.m
+        backend/metal/backend_metal.m
+        backend/metal/backend_metal_ops.m
+        backend/metal/metal_kernels.m
+        backend/metal/metal_fft.m
+        backend/metal/linear_metal.m
+        third_party/kissfft/kiss_fft.c
+        third_party/kissfft/kiss_fftnd.c
+    )
+
+    add_dependencies(cfireants_metal metal_shaders)
+
+    target_compile_options(cfireants_metal PRIVATE -fobjc-arc)
+
+    target_include_directories(cfireants_metal PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft
+    )
+    target_include_directories(cfireants_metal PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    target_compile_definitions(cfireants PUBLIC CFIREANTS_HAS_METAL)
+    target_compile_definitions(cfireants_metal PRIVATE
+        METAL_LIBRARY_PATH="${METAL_LIB_PATH}"
+    )
+
+    target_link_libraries(cfireants_metal PUBLIC
+        cfireants
+        "-framework Metal"
+        "-framework MetalPerformanceShaders"
+        "-framework MetalPerformanceShadersGraph"
+        "-framework Foundation"
+    )
+
+    message(STATUS "Metal backend enabled (macOS/Apple Silicon)")
+endif()
+
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "CUDA backend: ${CFIREANTS_CUDA}")
 message(STATUS "WebGPU backend: ${CFIREANTS_WEBGPU}")
+message(STATUS "Metal backend: ${CFIREANTS_METAL}")
 
 add_executable(test_validate_greedy tests/test_validate_all.c
     src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
@@ -205,4 +295,14 @@ if(CFIREANTS_WEBGPU)
     add_executable(test_validate_webgpu tests/test_validate_webgpu.c
         src/registration/moments.c)
     target_link_libraries(test_validate_webgpu cfireants cfireants_gpu)
+endif()
+
+# Metal tests
+if(CFIREANTS_METAL)
+    add_executable(test_metal_backend tests/test_metal_backend.c)
+    target_link_libraries(test_metal_backend cfireants cfireants_gpu)
+
+    add_executable(test_metal_linear tests/test_metal_linear.c
+        src/registration/moments.c)
+    target_link_libraries(test_metal_linear cfireants cfireants_gpu)
 endif()

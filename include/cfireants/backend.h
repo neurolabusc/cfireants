@@ -122,6 +122,10 @@ int cfireants_init_cuda(void);
 int cfireants_init_webgpu(void);
 #endif
 
+#ifdef CFIREANTS_HAS_METAL
+int cfireants_init_metal(void);
+#endif
+
 /* Cleanup */
 void cfireants_cleanup(void);
 
