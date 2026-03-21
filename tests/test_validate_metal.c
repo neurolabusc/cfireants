@@ -14,6 +14,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <mach/mach.h>  /* for peak RAM on macOS */
 
 #ifdef CFIREANTS_HAS_METAL
 extern int cfireants_init_metal(void);
@@ -93,7 +94,13 @@ int main(int argc, char **argv) {
             .smooth_grad_sigma = 1.0f, .smooth_warp_sigma = 1.0f,
             .tolerance = 1e-6f, .max_tolerance_iters = 10 };
         syn_result_t syn;
-        syn_register_metal(&fixed, &moving, affine.affine_mat, sopts, &syn);
+        /* Build 4x4 from 3x4 affine matrix */
+        float aff44[4][4] = {{0}};
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 4; j++)
+                aff44[i][j] = affine.affine_mat[i][j];
+        aff44[3][3] = 1.0f;
+        syn_register_metal(&fixed, &moving, aff44, sopts, &syn);
         double t_syn = get_time() - t1;
 
         double t_total = get_time() - t0;
@@ -114,7 +121,14 @@ int main(int argc, char **argv) {
         printf("    NCC Before:     %.4f\n", ncc_before);
         printf("    NCC After:      %.4f\n", ncc_after);
         printf("    Local NCC Loss: %.4f\n", local_ncc);
+        /* Peak RAM */
+        struct mach_task_basic_info info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count);
+        double peak_mb = info.resident_size_max / (1024.0 * 1024.0);
+
         printf("    Time:           %.1fs\n", t_total);
+        printf("    Peak RAM:       %.0f MB\n", peak_mb);
         printf("    Moments:        %.1fs\n", t_mom);
         printf("    Rigid:          %.1fs\n", t_rigid);
         printf("    Affine:         %.1fs\n", t_affine);
