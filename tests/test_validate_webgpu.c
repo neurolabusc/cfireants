@@ -70,9 +70,13 @@ int main(int argc, char **argv) {
         { "small", "2mm full-head MNI to subject (includes scalp)",
           "validate/small/MNI152_T1_2mm.nii.gz", "validate/small/T1_head_2mm.nii.gz",
           {4,2,1},{4,2,1},{4,2,1}, {200,100,50},{200,100,50},{200,100,50},
-          3,3,3, LOSS_CC, LOSS_CC },  /* CC for fast validation */
+          3,3,3, LOSS_CC, LOSS_CC },  /* CC for all stages */
+        { "medium", "1mm brain-extracted MNI to subject",
+          "validate/medium/MNI152_T1_1mm_brain.nii.gz", "validate/medium/t1_brain.nii.gz",
+          {4,2,1},{4,2,1},{4,2,1}, {200,100,50},{200,100,50},{200,100,50},
+          3,3,3, LOSS_CC, LOSS_CC },
     };
-    int n_ds = 1;
+    int n_ds = 2;
 
     for(int di=0; di<n_ds; di++){
         dataset_t *ds = &datasets[di];

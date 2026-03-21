@@ -1,8 +1,10 @@
 /*
  * webgpu_context.c - WebGPU device initialization and helpers
  *
- * Headless compute setup using wgpu-native (Vulkan backend on Linux).
+ * Headless compute setup using wgpu-native.
  * All operations are synchronous via wgpuDevicePoll(device, 1).
+ *
+ * Compatible with wgpu-native v27.0.4.0 (webgpu.h pre-StringView API).
  */
 
 #include "webgpu_context.h"
@@ -13,57 +15,57 @@
 /* Global context */
 wgpu_context_t g_wgpu = {0};
 
-/* --- Callbacks --- */
+/* --- Callbacks (v27 API: const char* message, single void* userdata) --- */
 
 static void on_adapter_request(WGPURequestAdapterStatus status,
                                WGPUAdapter adapter,
-                               WGPUStringView message,
-                               void *userdata1, void *userdata2)
+                               char const *message,
+                               void *userdata)
 {
-    (void)message; (void)userdata2;
+    (void)message;
     if (status == WGPURequestAdapterStatus_Success) {
-        *(WGPUAdapter *)userdata1 = adapter;
+        *(WGPUAdapter *)userdata = adapter;
     } else {
-        fprintf(stderr, "wgpu: adapter request failed (status=%d)\n", status);
+        fprintf(stderr, "wgpu: adapter request failed (status=%d): %s\n",
+                status, message ? message : "");
     }
 }
 
 static void on_device_request(WGPURequestDeviceStatus status,
                               WGPUDevice device,
-                              WGPUStringView message,
-                              void *userdata1, void *userdata2)
+                              char const *message,
+                              void *userdata)
 {
-    (void)message; (void)userdata2;
+    (void)message;
     if (status == WGPURequestDeviceStatus_Success) {
-        *(WGPUDevice *)userdata1 = device;
+        *(WGPUDevice *)userdata = device;
     } else {
-        fprintf(stderr, "wgpu: device request failed (status=%d)\n", status);
+        fprintf(stderr, "wgpu: device request failed (status=%d): %s\n",
+                status, message ? message : "");
     }
 }
 
-static void on_device_error(WGPUDevice const *device, WGPUErrorType type,
-                            WGPUStringView message,
-                            void *userdata1, void *userdata2)
+static void on_device_error(WGPUErrorType type, char const *message,
+                            void *userdata)
 {
-    (void)device; (void)userdata1; (void)userdata2;
-    fprintf(stderr, "wgpu device error (type=%d): %.*s\n",
-            type, (int)message.length, message.data);
+    (void)userdata;
+    fprintf(stderr, "wgpu device error (type=%d): %s\n",
+            type, message ? message : "");
 }
 
-static void on_buffer_map(WGPUMapAsyncStatus status, WGPUStringView message,
-                          void *userdata1, void *userdata2)
+static void on_buffer_map(WGPUBufferMapAsyncStatus status, void *userdata)
 {
-    (void)message; (void)userdata2;
-    if (userdata1) *(int *)userdata1 = (status == WGPUMapAsyncStatus_Success) ? 0 : -1;
+    if (userdata)
+        *(int *)userdata = (status == WGPUBufferMapAsyncStatus_Success) ? 0 : -1;
 }
 
 /* --- Context lifecycle --- */
 
 int wgpu_context_init(void) {
-    /* Create instance (Vulkan preferred on Linux) */
+    /* Create instance */
     WGPUInstanceExtras extras = {
         .chain = { .sType = (WGPUSType)WGPUSType_InstanceExtras },
-        .backends = WGPUInstanceBackend_Vulkan,
+        .backends = WGPUInstanceBackend_Metal | WGPUInstanceBackend_Vulkan,
     };
     WGPUInstanceDescriptor inst_desc = {
         .nextInChain = (const WGPUChainedStruct *)&extras,
@@ -79,11 +81,7 @@ int wgpu_context_init(void) {
         .powerPreference = WGPUPowerPreference_HighPerformance,
     };
     wgpuInstanceRequestAdapter(g_wgpu.instance, &adapter_opts,
-        (WGPURequestAdapterCallbackInfo){
-            .mode = WGPUCallbackMode_AllowSpontaneous,
-            .callback = on_adapter_request,
-            .userdata1 = &g_wgpu.adapter,
-        });
+                               on_adapter_request, &g_wgpu.adapter);
     if (!g_wgpu.adapter) {
         fprintf(stderr, "wgpu: no adapter found\n");
         return -1;
@@ -92,33 +90,31 @@ int wgpu_context_init(void) {
     /* Print adapter info */
     WGPUAdapterInfo info = {0};
     wgpuAdapterGetInfo(g_wgpu.adapter, &info);
-    fprintf(stderr, "WebGPU backend: %.*s (%.*s)\n",
-            (int)info.device.length, info.device.data,
-            (int)info.description.length, info.description.data);
+    fprintf(stderr, "WebGPU backend: %s (%s)\n",
+            info.device ? info.device : "unknown",
+            info.description ? info.description : "");
     wgpuAdapterInfoFreeMembers(info);
 
     /* Request device — use adapter limits as base, then override what we need */
-    WGPULimits required_limits = {0};
-    wgpuAdapterGetLimits(g_wgpu.adapter, &required_limits);
+    WGPUSupportedLimits supported_limits = {0};
+    wgpuAdapterGetLimits(g_wgpu.adapter, &supported_limits);
 
+    WGPULimits required = supported_limits.limits;
     /* Ensure minimums for our compute workloads */
-    if (required_limits.maxStorageBufferBindingSize < 512ULL * 1024 * 1024)
-        required_limits.maxStorageBufferBindingSize = 512ULL * 1024 * 1024;
-    if (required_limits.maxBufferSize < 512ULL * 1024 * 1024)
-        required_limits.maxBufferSize = 512ULL * 1024 * 1024;
+    if (required.maxStorageBufferBindingSize < 512ULL * 1024 * 1024)
+        required.maxStorageBufferBindingSize = 512ULL * 1024 * 1024;
+    if (required.maxBufferSize < 512ULL * 1024 * 1024)
+        required.maxBufferSize = 512ULL * 1024 * 1024;
 
+    WGPURequiredLimits req_limits = { .limits = required };
     WGPUDeviceDescriptor device_desc = {
-        .requiredLimits = &required_limits,
+        .requiredLimits = &req_limits,
         .uncapturedErrorCallbackInfo = (WGPUUncapturedErrorCallbackInfo){
             .callback = on_device_error,
         },
     };
     wgpuAdapterRequestDevice(g_wgpu.adapter, &device_desc,
-        (WGPURequestDeviceCallbackInfo){
-            .mode = WGPUCallbackMode_AllowSpontaneous,
-            .callback = on_device_request,
-            .userdata1 = &g_wgpu.device,
-        });
+                             on_device_request, &g_wgpu.device);
     if (!g_wgpu.device) {
         fprintf(stderr, "wgpu: failed to create device\n");
         return -1;
@@ -150,13 +146,13 @@ void wgpu_context_cleanup(void) {
 /* --- Shader helpers --- */
 
 WGPUShaderModule wgpu_create_shader(const char *wgsl_source, const char *label) {
-    WGPUShaderSourceWGSL wgsl = {
-        .chain = { .sType = WGPUSType_ShaderSourceWGSL },
-        .code = { .data = wgsl_source, .length = WGPU_STRLEN },
+    WGPUShaderModuleWGSLDescriptor wgsl = {
+        .chain = { .sType = WGPUSType_ShaderModuleWGSLDescriptor },
+        .code = wgsl_source,
     };
     WGPUShaderModuleDescriptor desc = {
         .nextInChain = (const WGPUChainedStruct *)&wgsl,
-        .label = { .data = label, .length = WGPU_STRLEN },
+        .label = label,
     };
     return wgpuDeviceCreateShaderModule(g_wgpu.device, &desc);
 }
@@ -178,10 +174,10 @@ WGPUComputePipeline wgpu_get_pipeline(const char *name,
     }
 
     WGPUComputePipelineDescriptor desc = {
-        .label = { .data = name, .length = WGPU_STRLEN },
+        .label = name,
         .compute = {
             .module = shader,
-            .entryPoint = { .data = entry_point, .length = WGPU_STRLEN },
+            .entryPoint = entry_point,
         },
     };
     WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(g_wgpu.device, &desc);
@@ -217,7 +213,7 @@ WGPUBuffer wgpu_create_buffer(size_t size, WGPUBufferUsage usage, const char *la
     /* WebGPU requires buffer sizes to be multiples of 4 */
     size = (size + 3) & ~(size_t)3;
     WGPUBufferDescriptor desc = {
-        .label = { .data = label, .length = WGPU_STRLEN },
+        .label = label,
         .usage = usage,
         .size = size,
         .mappedAtCreation = 0,
@@ -229,7 +225,7 @@ WGPUBuffer wgpu_create_buffer_init(const void *data, size_t size,
                                     WGPUBufferUsage usage, const char *label) {
     size_t aligned = (size + 3) & ~(size_t)3;
     WGPUBufferDescriptor desc = {
-        .label = { .data = label, .length = WGPU_STRLEN },
+        .label = label,
         .usage = usage,
         .size = aligned,
         .mappedAtCreation = 1,
@@ -358,11 +354,7 @@ void wgpu_read_buffer(WGPUBuffer src, size_t offset, void *dst, size_t size) {
     /* Map staging for read */
     int map_status = -1;
     wgpuBufferMapAsync(g_wgpu.staging_buf, WGPUMapMode_Read, 0, aligned,
-        (WGPUBufferMapCallbackInfo){
-            .mode = WGPUCallbackMode_AllowSpontaneous,
-            .callback = on_buffer_map,
-            .userdata1 = &map_status,
-        });
+                       on_buffer_map, &map_status);
     wgpuDevicePoll(g_wgpu.device, 1, NULL);
 
     if (map_status == 0) {

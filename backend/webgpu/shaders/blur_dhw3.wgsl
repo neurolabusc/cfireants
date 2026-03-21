@@ -15,6 +15,25 @@ struct Params {
 @group(0) @binding(2) var<storage, read> kernel: array<f32>;     // [klen]
 @group(0) @binding(3) var<uniform> p: Params;
 
+// Helper: select coord/dim/stride by axis without variable array indexing
+fn get_coord(d: i32, h: i32, w: i32, axis: u32) -> i32 {
+    if (axis == 0u) { return d; }
+    if (axis == 1u) { return h; }
+    return w;
+}
+
+fn get_dim(D: u32, H: u32, W: u32, axis: u32) -> i32 {
+    if (axis == 0u) { return i32(D); }
+    if (axis == 1u) { return i32(H); }
+    return i32(W);
+}
+
+fn get_stride(H: u32, W: u32, axis: u32) -> i32 {
+    if (axis == 0u) { return i32(H * W); }
+    if (axis == 1u) { return i32(W); }
+    return 1;
+}
+
 @compute @workgroup_size(256)
 fn conv1d_dhw3(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -27,16 +46,16 @@ fn conv1d_dhw3(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = tmp / p.H;
 
     let r = i32(p.klen / 2u);
-    let dims = array<u32, 3>(p.D, p.H, p.W);
-    let strides = array<i32, 3>(i32(p.H * p.W), i32(p.W), 1);
-    let coords = array<i32, 3>(i32(d), i32(h), i32(w));
+    let coord = get_coord(i32(d), i32(h), i32(w), p.axis);
+    let dim = get_dim(p.D, p.H, p.W, p.axis);
+    let stride = get_stride(p.H, p.W, p.axis);
 
     for (var c = 0u; c < 3u; c = c + 1u) {
         var sum = 0.0f;
         for (var k = 0; k < i32(p.klen); k = k + 1) {
-            let ci = coords[p.axis] + k - r;
-            if (ci >= 0 && ci < i32(dims[p.axis])) {
-                let src_idx = u32(i32(idx) + (ci - coords[p.axis]) * strides[p.axis]);
+            let ci = coord + k - r;
+            if (ci >= 0 && ci < dim) {
+                let src_idx = u32(i32(idx) + (ci - coord) * stride);
                 sum += input[src_idx * 3u + c] * kernel[u32(k)];
             }
         }

@@ -22,14 +22,8 @@
 
 #include "wgsl_sources.h"
 
-/* ================================================================== */
-/* Helper: create uniform buffer                                       */
-/* ================================================================== */
-
-static WGPUBuffer make_params(const void *data, size_t size) {
-    return wgpu_create_buffer_init(data, size,
-        WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "params");
-}
+/* make_params is now wgpu_make_params in webgpu_context.h */
+#define make_params wgpu_make_params
 
 /* Helper: dispatch with auto bind group creation */
 static void dispatch_1buf(const char *name, const char *wgsl, const char *entry,
@@ -535,16 +529,30 @@ void wgpu_cc_loss_3d_raw(
 }
 
 /* ================================================================== */
-/* MI Loss — CPU fallback for now (complex histogram + CAS atomics)    */
+/* MI Loss — workgroup-local histogram + GPU gradient                  */
 /* ================================================================== */
 
-/* MI loss — GPU histogram + CPU loss + GPU gradient */
+/* MI loss — GPU histogram (workgroup-local) + CPU MI + GPU gradient
+ *
+ * Strategy matching CUDA mi_loss.cu:
+ *   1. Find max(pred, target) for normalization (CPU, like CUDA)
+ *   2. GPU histogram: workgroup-local accumulation with fixed-point u32
+ *      atomicAdd (fast), then integer atomicAdd merge to global (no CAS)
+ *   3. Read histogram to CPU, normalize, compute MI (fast: 1024 iters)
+ *   4. GPU gradient: correct softmax derivative matching CUDA/CPU
+ */
 #include "cfireants/losses.h"
 #include "shader_loader.h"
 
-static const char *get_mi_wgsl(void) {
+static const char *get_mi_hist_wgsl(void) {
     static const char *src = NULL;
-    if (!src) src = get_shader_source("mi_loss.wgsl", NULL);
+    if (!src) src = get_shader_source("mi_histogram.wgsl", NULL);
+    return src;
+}
+
+static const char *get_mi_grad_wgsl(void) {
+    static const char *src = NULL;
+    if (!src) src = get_shader_source("mi_gradient.wgsl", NULL);
     return src;
 }
 
@@ -554,33 +562,104 @@ void wgpu_mi_loss_3d_raw(
     int D, int H, int W,
     int num_bins, float *h_loss_out)
 {
-    const char *wgsl = get_mi_wgsl();
     int n = D * H * W;
     size_t sz = (size_t)n * sizeof(float);
     int nb = num_bins;
 
-    /* Use CPU MI fallback — GPU CAS atomics too slow for global memory.
-     * TODO: use shared memory histogram (requires workgroup-local accumulation). */
-    {
-        (void)wgsl;
+    /* GPU path requires num_bins=32 (workgroup arrays are compile-time sized).
+     * Fall back to CPU for other values. */
+    if (nb != 32) {
+        fprintf(stderr, "wgpu_mi_loss: GPU path requires num_bins=32 (got %d), "
+                "using CPU fallback\n", nb);
         int shape[5] = {1, 1, D, H, W};
         tensor_t tp, tt, tg;
         tensor_alloc(&tp, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
         tensor_alloc(&tt, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
         wgpu_read_buffer(pred, 0, tp.data, sz);
         wgpu_read_buffer(target, 0, tt.data, sz);
-        tensor_t *gp = NULL;
-        if (grad_pred) { tensor_alloc(&tg, 5, shape, DTYPE_FLOAT32, DEVICE_CPU); gp = &tg; }
-        cpu_mi_loss_3d(&tp, &tt, nb, h_loss_out, gp);
-        if (grad_pred && gp) wgpu_write_buffer(grad_pred, 0, tg.data, sz);
+        tensor_t *gptr = NULL;
+        if (grad_pred) { tensor_alloc(&tg, 5, shape, DTYPE_FLOAT32, DEVICE_CPU); gptr = &tg; }
+        cpu_mi_loss_3d(&tp, &tt, nb, h_loss_out, gptr);
+        if (grad_pred && gptr) wgpu_write_buffer(grad_pred, 0, tg.data, sz);
         tensor_free(&tp); tensor_free(&tt);
-        if (gp) tensor_free(&tg);
+        if (gptr) tensor_free(&tg);
         return;
     }
 
-    WGPUBufferUsage u = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+    /* Step 0: Find max(pred, target) on GPU via reduce_max shader.
+     * Only reads back partial maxima (~4KB), not the full volume. */
+    float pmax, tmax;
+    {
+        static const char *rmax_wgsl = NULL;
+        if (!rmax_wgsl) rmax_wgsl = get_shader_source("reduce_max.wgsl", NULL);
+        WGPUComputePipeline rmax_pl = rmax_wgsl ?
+            wgpu_get_pipeline("reduce_max", rmax_wgsl, "reduce_max") : NULL;
 
-    /* Allocate histogram buffers (atomic<u32>) — zero-initialized */
+        uint32_t n_groups = wgpu_div_ceil(n, 256);
+        WGPUBufferUsage pu = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
+        WGPUBuffer part_buf = wgpu_create_buffer(n_groups * 4, pu, "rmax_part");
+
+        typedef struct { uint32_t n, _p0, _p1, _p2; } rp_t;
+        rp_t rp = { (uint32_t)n, 0, 0, 0 };
+        WGPUBuffer rpb = wgpu_create_buffer_init(&rp, sizeof(rp),
+            WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "rmax_p");
+
+        /* Reduce pred max */
+        if (rmax_pl) {
+            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("reduce_max");
+            WGPUBindGroupEntry e[] = {
+                { .binding = 0, .buffer = pred, .size = sz },
+                { .binding = 1, .buffer = rpb, .size = sizeof(rp) },
+                { .binding = 2, .buffer = part_buf, .size = n_groups * 4 },
+            };
+            WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = e };
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+            wgpu_dispatch(rmax_pl, bg, n_groups, 1, 1);
+            wgpuBindGroupRelease(bg);
+        }
+        float *partials = (float *)malloc(n_groups * 4);
+        wgpu_read_buffer(part_buf, 0, partials, n_groups * 4);
+        pmax = partials[0];
+        for (uint32_t i = 1; i < n_groups; i++)
+            if (partials[i] > pmax) pmax = partials[i];
+
+        /* Reduce target max (reuse part_buf and params) */
+        if (rmax_pl) {
+            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("reduce_max");
+            WGPUBindGroupEntry e[] = {
+                { .binding = 0, .buffer = target, .size = sz },
+                { .binding = 1, .buffer = rpb, .size = sizeof(rp) },
+                { .binding = 2, .buffer = part_buf, .size = n_groups * 4 },
+            };
+            WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = e };
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+            wgpu_dispatch(rmax_pl, bg, n_groups, 1, 1);
+            wgpuBindGroupRelease(bg);
+        }
+        wgpu_read_buffer(part_buf, 0, partials, n_groups * 4);
+        tmax = partials[0];
+        for (uint32_t i = 1; i < n_groups; i++)
+            if (partials[i] > tmax) tmax = partials[i];
+
+        free(partials);
+        wgpuBufferRelease(part_buf);
+        wgpuBufferRelease(rpb);
+    }
+
+    float maxval = pmax > tmax ? pmax : tmax;
+    if (maxval <= 0) maxval = 1.0f;
+    float inv_maxval = (maxval > 1.0f) ? 1.0f / maxval : 1.0f;
+
+    /* Matching Python/CUDA: bin_centers[i] = i/nb + 0.5/nb, sigma = (1/nb)*0.5 */
+    float bin_spacing = 1.0f / nb;
+    float sigma = bin_spacing * 0.5f;
+    float preterm = 1.0f / (2.0f * sigma * sigma);
+    float nr = 1e-7f, dr = 1e-7f;
+
+    WGPUBufferUsage u = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc
+                       | WGPUBufferUsage_CopyDst;
+
+    /* Allocate histogram buffers (atomic<u32>, fixed-point integers) */
     size_t joint_sz = (size_t)nb * nb * 4;
     size_t marg_sz = (size_t)nb * 4;
     WGPUBuffer d_joint = wgpu_create_buffer(joint_sz, u, "mi_joint");
@@ -598,79 +677,36 @@ void wgpu_mi_loss_3d_raw(
         free(z);
     }
 
-    /* Pass 1: Histogram accumulation on GPU */
+    /* ---- Pass 1: Workgroup-local histogram accumulation on GPU ---- */
+    /* Each workgroup (256 threads) accumulates a local 32×32 histogram in
+     * var<workgroup> shared memory using native atomicAdd on atomic<u32>.
+     * Both local and global use fixed-point u32 with FP_SCALE=256.
+     * After barrier, local values are merged to global via atomicAdd (no CAS).
+     * This is Metal-compatible (no atomicCompareExchangeWeak needed).
+     * Overflow analysis: max per bin = N * 256 (worst case, all voxels in
+     * one bin). Safe for N ≤ 16M voxels (~256³). In practice, weight is
+     * distributed across bins, so safe for much larger volumes. */
     {
-        typedef struct { uint32_t n, num_bins, _p0, _p1; } p_t;
-        p_t p = { n, nb, 0, 0 };
-        WGPUBuffer pb = wgpu_create_buffer_init(&p, sizeof(p),
+        typedef struct { uint32_t n, num_bins; float inv_maxval, preterm; } hp_t;
+        hp_t hp = { (uint32_t)n, (uint32_t)nb, inv_maxval, preterm };
+        WGPUBuffer pb = wgpu_create_buffer_init(&hp, sizeof(hp),
             WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "mi_hp");
 
-        /* Extract just the histogram portion of the shader
-         * (up to the gradient section) to avoid bind group conflicts */
-        /* Windowed histogram: only iterate within 3 sigma of the voxel's
-         * bin position. Reduces from O(nb²) to O(w²) per voxel where w≈7. */
-        static const char mi_hist_wgsl[] =
-            "struct HistParams { n: u32, num_bins: u32, _p0: u32, _p1: u32, }\n"
-            "@group(0) @binding(0) var<storage, read> hist_pred: array<f32>;\n"
-            "@group(0) @binding(1) var<storage, read> hist_target: array<f32>;\n"
-            "@group(0) @binding(2) var<storage, read_write> joint_hist: array<atomic<u32>>;\n"
-            "@group(0) @binding(3) var<storage, read_write> pred_hist: array<atomic<u32>>;\n"
-            "@group(0) @binding(4) var<storage, read_write> target_hist: array<atomic<u32>>;\n"
-            "@group(0) @binding(5) var<uniform> hp: HistParams;\n"
-            "@compute @workgroup_size(256)\n"
-            "fn histogram(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
-            "    let i = gid.x; if (i >= hp.n) { return; }\n"
-            "    let nb = hp.num_bins;\n"
-            "    let pv = clamp(hist_pred[i], 0.0, 1.0);\n"
-            "    let tv = clamp(hist_target[i], 0.0, 1.0);\n"
-            "    let bw = 1.0 / f32(nb - 1u);\n"
-            "    let is2 = 1.0 / bw;\n"
-            "    let W = 3u;\n"  /* window radius in bins (3 sigma) */
-            "    let p_bin = u32(clamp(pv * f32(nb - 1u), 0.0, f32(nb - 1u)));\n"
-            "    let t_bin = u32(clamp(tv * f32(nb - 1u), 0.0, f32(nb - 1u)));\n"
-            "    let p_lo = select(p_bin - W, 0u, p_bin < W);\n"
-            "    let p_hi = min(p_bin + W + 1u, nb);\n"
-            "    let t_lo = select(t_bin - W, 0u, t_bin < W);\n"
-            "    let t_hi = min(t_bin + W + 1u, nb);\n"
-            "    for (var bi = p_lo; bi < p_hi; bi++) {\n"
-            "        let bc = f32(bi) * bw;\n"
-            "        let pd = (pv - bc) * is2; let pw = exp(-0.5 * pd * pd);\n"
-            "        var o = atomicLoad(&pred_hist[bi]);\n"
-            "        loop { let n2 = bitcast<u32>(bitcast<f32>(o) + pw);\n"
-            "               let r = atomicCompareExchangeWeak(&pred_hist[bi], o, n2);\n"
-            "               if (r.exchanged) { break; } o = r.old_value; }\n"
-            "        for (var bj = t_lo; bj < t_hi; bj++) {\n"
-            "            let bcj = f32(bj) * bw; let tdj = (tv - bcj) * is2;\n"
-            "            let twj = exp(-0.5 * tdj * tdj); let jw = pw * twj;\n"
-            "            if (jw > 1e-10) {\n"
-            "                var oj = atomicLoad(&joint_hist[bi * nb + bj]);\n"
-            "                loop { let n2 = bitcast<u32>(bitcast<f32>(oj) + jw);\n"
-            "                       let r = atomicCompareExchangeWeak(&joint_hist[bi * nb + bj], oj, n2);\n"
-            "                       if (r.exchanged) { break; } oj = r.old_value; }\n"
-            "            }\n"
-            "        }\n"
-            "    }\n"
-            "    for (var bj = t_lo; bj < t_hi; bj++) {\n"
-            "        let bcj = f32(bj) * bw; let tdj = (tv - bcj) * is2;\n"
-            "        let tw = exp(-0.5 * tdj * tdj);\n"
-            "        var o = atomicLoad(&target_hist[bj]);\n"
-            "        loop { let n2 = bitcast<u32>(bitcast<f32>(o) + tw);\n"
-            "               let r = atomicCompareExchangeWeak(&target_hist[bj], o, n2);\n"
-            "               if (r.exchanged) { break; } o = r.old_value; }\n"
-            "    }\n"
-            "}\n";
-        WGPUComputePipeline pl = wgpu_get_pipeline("mi_hist", mi_hist_wgsl, "histogram");
+        const char *hist_wgsl = get_mi_hist_wgsl();
+        WGPUComputePipeline pl = hist_wgsl ?
+            wgpu_get_pipeline("mi_hist_local", hist_wgsl, "histogram") : NULL;
         if (pl) {
-            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("mi_hist");
+            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("mi_hist_local");
             WGPUBindGroupEntry e[] = {
                 { .binding = 0, .buffer = pred, .size = sz },
                 { .binding = 1, .buffer = target, .size = sz },
                 { .binding = 2, .buffer = d_joint, .size = joint_sz },
                 { .binding = 3, .buffer = d_phist, .size = marg_sz },
                 { .binding = 4, .buffer = d_thist, .size = marg_sz },
-                { .binding = 5, .buffer = pb, .size = sizeof(p) },
+                { .binding = 5, .buffer = pb, .size = sizeof(hp) },
             };
-            WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 6, .entries = e };
+            WGPUBindGroupDescriptor desc = {
+                .layout = lay, .entryCount = 6, .entries = e };
             WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
             wgpu_dispatch(pl, bg, wgpu_div_ceil(n, 256), 1, 1);
             wgpuBindGroupRelease(bg);
@@ -678,34 +714,27 @@ void wgpu_mi_loss_3d_raw(
         wgpuBufferRelease(pb);
     }
 
-    /* Read histograms to CPU (small: ~4KB total) */
-    float *h_joint = (float*)malloc(joint_sz);
-    float *h_phist = (float*)malloc(marg_sz);
-    float *h_thist = (float*)malloc(marg_sz);
+    /* ---- Read histograms to CPU (small: ~4KB total) ---- */
+    float *h_joint = (float *)malloc(joint_sz);
+    float *h_phist = (float *)malloc(marg_sz);
+    float *h_thist = (float *)malloc(marg_sz);
 
-    /* The histograms are stored as bitcast'd floats in atomic<u32>.
-     * Reading them gives us the u32 bits; we bitcast to float. */
-    uint32_t *u_joint = (uint32_t*)h_joint;
-    uint32_t *u_phist = (uint32_t*)h_phist;
-    uint32_t *u_thist = (uint32_t*)h_thist;
+    /* Read u32 fixed-point values and convert to float */
+    {
+        uint32_t *u_buf = (uint32_t *)malloc(joint_sz);
+        wgpu_read_buffer(d_joint, 0, u_buf, joint_sz);
+        for (int i = 0; i < nb * nb; i++) h_joint[i] = (float)u_buf[i];
+        free(u_buf);
 
-    wgpu_read_buffer(d_joint, 0, u_joint, joint_sz);
-    wgpu_read_buffer(d_phist, 0, u_phist, marg_sz);
-    wgpu_read_buffer(d_thist, 0, u_thist, marg_sz);
-
-    /* Bitcast u32 → float (the CAS atomicAdd stores floats as bitcast u32) */
-    for (int i = 0; i < nb * nb; i++) {
-        union { uint32_t u; float f; } cv;
-        cv.u = u_joint[i]; h_joint[i] = cv.f;
-    }
-    for (int i = 0; i < nb; i++) {
-        union { uint32_t u; float f; } cv;
-        cv.u = u_phist[i]; h_phist[i] = cv.f;
-        cv.u = u_thist[i]; h_thist[i] = cv.f;
+        u_buf = (uint32_t *)malloc(marg_sz);
+        wgpu_read_buffer(d_phist, 0, u_buf, marg_sz);
+        for (int i = 0; i < nb; i++) h_phist[i] = (float)u_buf[i];
+        wgpu_read_buffer(d_thist, 0, u_buf, marg_sz);
+        for (int i = 0; i < nb; i++) h_thist[i] = (float)u_buf[i];
+        free(u_buf);
     }
 
-    /* Compute MI loss on CPU from histograms (fast — only nb² = 1024 iterations) */
-    /* Normalize histograms */
+    /* Normalize histograms to probabilities */
     float total_weight = 0;
     for (int i = 0; i < nb * nb; i++) total_weight += h_joint[i];
     if (total_weight > 0) {
@@ -714,75 +743,55 @@ void wgpu_mi_loss_3d_raw(
         for (int i = 0; i < nb; i++) { h_phist[i] *= inv; h_thist[i] *= inv; }
     }
 
-    /* MI = sum_ij p(i,j) * log(p(i,j) / (p(i)*p(j))) */
+    /* MI = sum_ij pab * log((pab + nr) / (pa*pb + dr) + dr) — matching CUDA */
     double mi = 0;
     for (int i = 0; i < nb; i++) {
         for (int j = 0; j < nb; j++) {
-            float pij = h_joint[i * nb + j];
-            float pi = h_phist[i], pj = h_thist[j];
-            if (pij > 1e-10f && pi > 1e-10f && pj > 1e-10f)
-                mi += pij * log(pij / (pi * pj));
+            float p = h_joint[i * nb + j];
+            float pp = h_phist[i] * h_thist[j];
+            mi += p * logf((p + nr) / (pp + dr) + dr);
         }
     }
     if (h_loss_out) *h_loss_out = -(float)mi;
 
-    /* Pass 2: Gradient on GPU using normalized histograms */
+    /* ---- Pass 2: Gradient on GPU ---- */
+    /* Correct gradient matching CUDA mi_gradient_kernel:
+     * - Softmax-normalized Parzen weights for both pred and target
+     * - Softmax derivative: dwa/dpn = wa*(du_a - sum wa'*du_a')
+     * - Chain rule through joint and marginal histograms
+     * - inv_maxval scaling for normalization chain rule */
     if (grad_pred) {
-        /* Upload normalized histograms as f32 buffers */
         WGPUBuffer d_jf = wgpu_create_buffer_init(h_joint, joint_sz, u, "mi_jf");
         WGPUBuffer d_pf = wgpu_create_buffer_init(h_phist, marg_sz, u, "mi_pf");
         WGPUBuffer d_tf = wgpu_create_buffer_init(h_thist, marg_sz, u, "mi_tf");
 
-        typedef struct { uint32_t n, num_bins, _p0, _p1; } gp_t;
-        gp_t gp = { n, nb, 0, 0 };
+        typedef struct {
+            uint32_t n, num_bins;
+            float inv_maxval, preterm;
+            float inv_n, nr, dr;
+            uint32_t _pad;
+        } gp_t;
+        gp_t gp = { (uint32_t)n, (uint32_t)nb, inv_maxval, preterm,
+                     1.0f / n, nr, dr, 0 };
         WGPUBuffer gpb = wgpu_create_buffer_init(&gp, sizeof(gp),
             WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "mi_gp");
 
-        static const char mi_grad_wgsl[] =
-            "struct GP { n: u32, n_bins: u32, _p0: u32, _p1: u32, }\n"
-            "@group(0) @binding(0) var<storage, read> gp2: array<f32>;\n"
-            "@group(0) @binding(1) var<storage, read> gj: array<f32>;\n"
-            "@group(0) @binding(2) var<storage, read> gph: array<f32>;\n"
-            "@group(0) @binding(3) var<storage, read> gth: array<f32>;\n"
-            "@group(0) @binding(4) var<storage, read_write> gg: array<f32>;\n"
-            "@group(0) @binding(5) var<uniform> gpp: GP;\n"
-            "@compute @workgroup_size(256)\n"
-            "fn mi_gradient(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
-            "    let i = gid.x; if (i >= gpp.n) { return; }\n"
-            "    let nb = gpp.n_bins;\n"
-            "    let pv = clamp(gp2[i], 0.0, 1.0);\n"
-            "    let bw = 1.0 / f32(nb - 1u); let is2 = 1.0 / bw;\n"
-            "    let W = 3u;\n"
-            "    let pb = u32(clamp(pv * f32(nb - 1u), 0.0, f32(nb - 1u)));\n"
-            "    let plo = select(pb - W, 0u, pb < W); let phi = min(pb + W + 1u, nb);\n"
-            "    var gv = 0.0f;\n"
-            "    for (var bi = plo; bi < phi; bi++) {\n"
-            "        let bc = f32(bi) * bw; let pd = pv - bc;\n"
-            "        let pw = exp(-0.5 * (pd * is2) * (pd * is2));\n"
-            "        let dpw = -pd * is2 * is2 * pw;\n"
-            "        let pm = gph[bi]; if (pm < 1e-10) { continue; }\n"
-            "        for (var bj = 0u; bj < nb; bj++) {\n"
-            "            let jv = gj[bi * nb + bj]; if (jv < 1e-10) { continue; }\n"
-            "            let tm = gth[bj]; if (tm < 1e-10) { continue; }\n"
-            "            let lt = log(jv) - log(pm);\n"
-            "            gv += dpw * (lt + 1.0);\n"
-            "            gv -= dpw * jv / pm;\n"
-            "        }\n"
-            "    }\n"
-            "    gg[i] = -gv;\n"
-            "}\n";
-        WGPUComputePipeline pl = wgpu_get_pipeline("mi_grad", mi_grad_wgsl, "mi_gradient");
+        const char *grad_wgsl = get_mi_grad_wgsl();
+        WGPUComputePipeline pl = grad_wgsl ?
+            wgpu_get_pipeline("mi_grad_v2", grad_wgsl, "mi_gradient") : NULL;
         if (pl) {
-            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("mi_grad");
+            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("mi_grad_v2");
             WGPUBindGroupEntry e[] = {
                 { .binding = 0, .buffer = pred, .size = sz },
-                { .binding = 1, .buffer = d_jf, .size = joint_sz },
-                { .binding = 2, .buffer = d_pf, .size = marg_sz },
-                { .binding = 3, .buffer = d_tf, .size = marg_sz },
-                { .binding = 4, .buffer = grad_pred, .size = sz },
-                { .binding = 5, .buffer = gpb, .size = sizeof(gp) },
+                { .binding = 1, .buffer = target, .size = sz },
+                { .binding = 2, .buffer = d_jf, .size = joint_sz },
+                { .binding = 3, .buffer = d_pf, .size = marg_sz },
+                { .binding = 4, .buffer = d_tf, .size = marg_sz },
+                { .binding = 5, .buffer = grad_pred, .size = sz },
+                { .binding = 6, .buffer = gpb, .size = sizeof(gp) },
             };
-            WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 6, .entries = e };
+            WGPUBindGroupDescriptor desc = {
+                .layout = lay, .entryCount = 7, .entries = e };
             WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
             wgpu_dispatch(pl, bg, wgpu_div_ceil(n, 256), 1, 1);
             wgpuBindGroupRelease(bg);

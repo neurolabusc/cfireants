@@ -118,6 +118,12 @@ static inline uint32_t wgpu_div_ceil(uint32_t n, uint32_t d) {
     return (n + d - 1) / d;
 }
 
+/* Create a uniform buffer initialized with data (convenience for params structs) */
+static inline WGPUBuffer wgpu_make_params(const void *data, size_t size) {
+    return wgpu_create_buffer_init(data, size,
+        WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "params");
+}
+
 #ifdef __cplusplus
 }
 #endif

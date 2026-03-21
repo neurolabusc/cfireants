@@ -33,15 +33,24 @@ fn affine_grid_bwd(@builtin(global_invocation_id) gid: vec3<u32>,
         if (p.H > 1u) { ny = 2.0 * f32(h) / f32(p.H - 1u) - 1.0; } else { ny = 0.0; }
         if (p.W > 1u) { nx = 2.0 * f32(w) / f32(p.W - 1u) - 1.0; } else { nx = 0.0; }
 
-        let coord = array<f32, 4>(nx, ny, nz, 1.0);
+        let coord = vec4<f32>(nx, ny, nz, 1.0);
         let gi = idx * 3u;
-        let gg = array<f32, 3>(grad_grid[gi], grad_grid[gi + 1u], grad_grid[gi + 2u]);
+        let gg = vec3<f32>(grad_grid[gi], grad_grid[gi + 1u], grad_grid[gi + 2u]);
 
-        for (var i = 0u; i < 3u; i = i + 1u) {
-            for (var j = 0u; j < 4u; j = j + 1u) {
-                sdata[tid * 12u + i * 4u + j] = gg[i] * coord[j];
-            }
-        }
+        // Unrolled: sdata[tid*12 + i*4 + j] = gg[i] * coord[j]
+        let base = tid * 12u;
+        sdata[base + 0u]  = gg[0] * coord[0];
+        sdata[base + 1u]  = gg[0] * coord[1];
+        sdata[base + 2u]  = gg[0] * coord[2];
+        sdata[base + 3u]  = gg[0] * coord[3];
+        sdata[base + 4u]  = gg[1] * coord[0];
+        sdata[base + 5u]  = gg[1] * coord[1];
+        sdata[base + 6u]  = gg[1] * coord[2];
+        sdata[base + 7u]  = gg[1] * coord[3];
+        sdata[base + 8u]  = gg[2] * coord[0];
+        sdata[base + 9u]  = gg[2] * coord[1];
+        sdata[base + 10u] = gg[2] * coord[2];
+        sdata[base + 11u] = gg[2] * coord[3];
     }
     workgroupBarrier();
 

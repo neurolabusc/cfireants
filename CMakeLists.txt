@@ -86,64 +86,47 @@ if(CFIREANTS_CUDA)
     message(STATUS "CUDA backend enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
 endif()
 
-# Test programs
-add_executable(test_nifti_load tests/test_nifti_load.c)
-target_link_libraries(test_nifti_load cfireants)
+# INTERFACE library aggregating all GPU backends — link this to every test target
+add_library(cfireants_gpu INTERFACE)
 if(CFIREANTS_CUDA)
-    target_link_libraries(test_nifti_load cfireants_cuda)
+    target_link_libraries(cfireants_gpu INTERFACE cfireants_cuda)
 endif()
+if(CFIREANTS_WEBGPU)
+    target_link_libraries(cfireants_gpu INTERFACE cfireants_webgpu)
+endif()
+
+# Test programs
+
+add_executable(test_nifti_load tests/test_nifti_load.c)
+target_link_libraries(test_nifti_load cfireants cfireants_gpu)
 
 add_executable(test_phase6 tests/test_phase6.c
     src/registration/moments.c src/registration/rigid.c
     src/registration/affine.c src/registration/greedy.c src/registration/syn.c)
-target_link_libraries(test_phase6 cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_phase6 cfireants_cuda)
-endif()
+target_link_libraries(test_phase6 cfireants cfireants_gpu)
 
 add_executable(test_phase5 tests/test_phase5.c src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
-target_link_libraries(test_phase5 cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_phase5 cfireants_cuda)
-endif()
+target_link_libraries(test_phase5 cfireants cfireants_gpu)
 
 add_executable(test_phase4 tests/test_phase4.c src/registration/moments.c src/registration/rigid.c)
-target_link_libraries(test_phase4 cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_phase4 cfireants_cuda)
-endif()
+target_link_libraries(test_phase4 cfireants cfireants_gpu)
 
 add_executable(test_phase3 tests/test_phase3.c src/registration/moments.c)
-target_link_libraries(test_phase3 cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_phase3 cfireants_cuda)
-endif()
+target_link_libraries(test_phase3 cfireants cfireants_gpu)
 
 add_executable(test_phase2 tests/test_phase2.c)
-target_link_libraries(test_phase2 cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_phase2 cfireants_cuda)
-endif()
+target_link_libraries(test_phase2 cfireants cfireants_gpu)
 
 add_executable(test_validate_all tests/test_validate_all.c
     src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
-target_link_libraries(test_validate_all cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_validate_all cfireants_cuda)
-endif()
+target_link_libraries(test_validate_all cfireants cfireants_gpu)
 
 add_executable(test_gpu_pipeline tests/test_gpu_pipeline.c
     src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
-target_link_libraries(test_gpu_pipeline cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_gpu_pipeline cfireants_cuda)
-endif()
+target_link_libraries(test_gpu_pipeline cfireants cfireants_gpu)
 
 add_executable(test_cuda_backend tests/test_cuda_backend.c)
-target_link_libraries(test_cuda_backend cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_cuda_backend cfireants_cuda)
-endif()
+target_link_libraries(test_cuda_backend cfireants cfireants_gpu)
 
 # WebGPU backend
 if(CFIREANTS_WEBGPU)
@@ -183,7 +166,17 @@ if(CFIREANTS_WEBGPU)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_compile_definitions(cfireants PUBLIC CFIREANTS_HAS_WEBGPU)
-    target_link_libraries(cfireants_webgpu PUBLIC cfireants wgpu_native dl pthread m)
+    target_link_libraries(cfireants_webgpu PUBLIC cfireants wgpu_native pthread m)
+    if(APPLE)
+        target_link_libraries(cfireants_webgpu PUBLIC
+            "-framework Metal"
+            "-framework QuartzCore"
+            "-framework CoreGraphics"
+            "-framework Foundation"
+            "-lobjc")
+    else()
+        target_link_libraries(cfireants_webgpu PUBLIC dl)
+    endif()
 
     message(STATUS "WebGPU backend enabled (wgpu-native)")
 endif()
@@ -195,36 +188,21 @@ message(STATUS "WebGPU backend: ${CFIREANTS_WEBGPU}")
 add_executable(test_validate_greedy tests/test_validate_all.c
     src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
 target_compile_definitions(test_validate_greedy PRIVATE USE_GREEDY)
-target_link_libraries(test_validate_greedy cfireants)
-if(CFIREANTS_CUDA)
-    target_link_libraries(test_validate_greedy cfireants_cuda)
-endif()
+target_link_libraries(test_validate_greedy cfireants cfireants_gpu)
 
 # WebGPU tests
 if(CFIREANTS_WEBGPU)
     add_executable(test_webgpu_basic tests/test_webgpu_basic.c)
-    target_link_libraries(test_webgpu_basic cfireants cfireants_webgpu)
-    if(CFIREANTS_CUDA)
-        target_link_libraries(test_webgpu_basic cfireants_cuda)
-    endif()
+    target_link_libraries(test_webgpu_basic cfireants cfireants_gpu)
 
     add_executable(test_fft_fallback tests/test_fft_fallback.c)
-    target_link_libraries(test_fft_fallback cfireants cfireants_webgpu)
-    if(CFIREANTS_CUDA)
-        target_link_libraries(test_fft_fallback cfireants_cuda)
-    endif()
+    target_link_libraries(test_fft_fallback cfireants cfireants_gpu)
 
     add_executable(test_webgpu_linear tests/test_webgpu_linear.c
         src/registration/moments.c)
-    target_link_libraries(test_webgpu_linear cfireants cfireants_webgpu)
-    if(CFIREANTS_CUDA)
-        target_link_libraries(test_webgpu_linear cfireants_cuda)
-    endif()
+    target_link_libraries(test_webgpu_linear cfireants cfireants_gpu)
 
     add_executable(test_validate_webgpu tests/test_validate_webgpu.c
         src/registration/moments.c)
-    target_link_libraries(test_validate_webgpu cfireants cfireants_webgpu)
-    if(CFIREANTS_CUDA)
-        target_link_libraries(test_validate_webgpu cfireants_cuda)
-    endif()
+    target_link_libraries(test_validate_webgpu cfireants cfireants_gpu)
 endif()

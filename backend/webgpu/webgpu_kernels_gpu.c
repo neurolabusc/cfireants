@@ -20,10 +20,8 @@
 #include <string.h>
 #include <math.h>
 
-static WGPUBuffer make_params(const void *data, size_t size) {
-    return wgpu_create_buffer_init(data, size,
-        WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "params");
-}
+/* make_params is now wgpu_make_params in webgpu_context.h */
+#define make_params wgpu_make_params
 
 /* ================================================================== */
 /* Compositive warp update                                             */

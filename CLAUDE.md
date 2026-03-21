@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cfireants is a pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) (commit `0d13a3f`), a GPU-accelerated medical image registration library using adaptive Riemannian optimization. It provides rigid, affine, and diffeomorphic deformable registration with two GPU backends:
 
 - **CUDA** — production quality, matches or exceeds Python on all validation datasets
-- **WebGPU** — functional, portable via wgpu-native/Vulkan. In active development.
+- **WebGPU** — functional, portable via wgpu-native (Vulkan on Linux, Metal on macOS). In active development.
 
 The goal is a faithful C reproduction of the Python data flow across both backends.
 
@@ -26,8 +26,13 @@ make -j$(nproc)
 cmake .. -DCFIREANTS_CUDA=ON -DCFIREANTS_WEBGPU=ON
 make -j$(nproc)
 
-# WebGPU requires wgpu-native in third_party/wgpu/
+# WebGPU only (macOS or Linux without CUDA)
+cmake .. -DCFIREANTS_CUDA=OFF -DCFIREANTS_WEBGPU=ON
+make -j$(nproc)
+
+# WebGPU requires wgpu-native v27.0.4.0+ in third_party/wgpu/
 # Download from https://github.com/gfx-rs/wgpu-native/releases
+# On macOS: uses Metal backend; on Linux: uses Vulkan backend
 ```
 
 Set `-DCMAKE_CUDA_ARCHITECTURES=89` (or your GPU arch) if auto-detection fails.
@@ -91,7 +96,7 @@ src/registration/      Registration algorithms (moments, rigid, affine, greedy, 
 backend/cuda/          CUDA kernels + fused registration loops
 backend/webgpu/        WebGPU shaders + dispatch + fused loops + FFT fallback
 third_party/kissfft/   BSD-3 FFT library for WebGPU CPU fallback
-third_party/wgpu/      wgpu-native static library (Vulkan backend)
+third_party/wgpu/      wgpu-native static library (Vulkan on Linux, Metal on macOS)
 tests/                 Test programs
 validate/              Validation datasets and benchmarks
 ```
@@ -117,7 +122,7 @@ See `validate/README.md` for benchmark tables. Summary: exceeds Python quality o
 
 ## WebGPU Backend
 
-Functional pipeline via wgpu-native (Vulkan backend on Linux). In active development.
+Functional pipeline via wgpu-native (Vulkan on Linux, Metal on macOS). Compatible with wgpu-native v27.0.4.0 (pre-StringView webgpu.h API). In active development.
 
 **Key files:**
 - `backend/webgpu/webgpu_context.h/.c` — device init, pipeline cache, batched dispatch
@@ -127,28 +132,26 @@ Functional pipeline via wgpu-native (Vulkan backend on Linux). In active develop
 - `backend/webgpu/greedy_webgpu.c` — greedy deformable loop
 - `backend/webgpu/syn_webgpu.c` — SyN loop + CPU warp inversion
 - `backend/webgpu/fft_cpu_fallback.c` — kissfft-based FFT downsample
-- `backend/webgpu/shaders/*.wgsl` — WGSL compute shaders
+- `backend/webgpu/shaders/*.wgsl` — WGSL compute shaders (MI histogram, MI gradient, affine_bwd, blur, compose, CC loss, warp_ops, reduction)
 
-### WebGPU Current Metrics (small dataset, RTX 4090 via Vulkan)
+### WebGPU Current Metrics (small dataset)
 
 **CC-only mode (all stages use CC loss):**
 
-| Stage | WebGPU | CUDA | Ratio |
-|-------|--------|------|-------|
-| Rigid | 1.1s | 1.0s | 1.1x |
-| Affine | 1.4s | 1.4s | 1.0x |
-| SyN | ~11s | 0.4s | ~28x |
-| Total | ~14s | 3.0s | ~4.7x |
+| Stage | WebGPU (M4 Pro, Metal) | CUDA (RTX 4090) | Ratio |
+|-------|------------------------|------------------|-------|
+| Rigid | 12.2s | 1.0s | 12x |
+| Affine | 21.1s | 1.4s | 15x |
+| SyN | 21.6s | 0.4s | ~54x |
+| Total | 55.2s | 3.0s | ~18x |
 
-| Metric | WebGPU (CC) | CUDA (MI+CC) |
-|--------|-------------|--------------|
+| Metric | WebGPU (CC, Metal) | CUDA (MI+CC) |
+|--------|-------------------|--------------|
 | NCC Before | 0.5957 | 0.5957 |
-| NCC After | 0.8139 | 0.9614 |
-| Local NCC Loss | -0.3275 | -0.6511 |
+| NCC After | 0.7292 | 0.9614 |
+| Local NCC Loss | -0.2218 | -0.6511 |
 
-**MI mode (MI for rigid/affine, CC for deformable):**
-- Rigid+Affine: ~80-500s (MI uses CPU fallback — GPU CAS atomics too slow)
-- Quality: expected to match CUDA more closely, but not yet validated at speed
+**MI loss:** GPU histogram is fast (workgroup-local accumulation with fixed-point u32 atomicAdd, no CAS). MI loss and gradient match CPU to 5e-5 and 2e-9 respectively. However, MI gradients are too weak to drive effective rigid/affine convergence on the small (full-head) dataset — this requires investigation against the CUDA reference optimizer configuration.
 
 ### WebGPU Performance Analysis
 
@@ -156,35 +159,37 @@ Functional pipeline via wgpu-native (Vulkan backend on Linux). In active develop
 - Grid sampling fwd/bwd — WGSL compute shaders
 - Affine grid generation — WGSL
 - CC loss (box filter + NCC + gradient) — GPU-native with batched dispatch
+- MI loss histogram — GPU workgroup-local with fixed-point atomicAdd (Metal-compatible)
+- MI loss gradient — GPU with correct softmax derivative
 - Adam optimizer — WGSL
 - Affine grid backward (reduction to 12 values) — WGSL with CPU final sum
 - Compositive warp update — WGSL
 - Displacement field blur — WGSL (3-pass separable conv1d)
 
 **What's slow:**
-- **MI loss** — CPU fallback. GPU CAS atomics on global memory are ~100x slower than CUDA's shared-memory atomics. See "MI Loss Optimization" below.
 - **SyN per-iteration overhead** — CC loss reads scalar loss value back to CPU every 10 iterations + max_l2_norm readback every 5 calls. Each readback forces a pipeline flush.
 - **FFT downsampling** — CPU fallback via kissfft. Only runs at scale transitions (2-3 per stage), ~30ms total for small dataset. Not a bottleneck.
 - **Warp inversion** — CPU fallback (550 iterations of fixed-point). Runs once for SyN evaluation.
 
 ### WebGPU Known Issues
 
+- **Dispatch limit >65535** — WebGPU limits dispatch dimensions to 65535 workgroups. Volumes with >16M voxels (e.g., 256³) exceed this at full resolution, causing SyN errors. Affects medium/large datasets at scale 1.
+- **Metal shader restrictions** — naga (wgpu's shader compiler) rejects variable indexing of local `array<T, N>` on Metal. Workaround: use `vec3/vec4` (support variable indexing) or helper functions with `if/else` chains. Affects `affine_grid_bwd.wgsl` and `blur_dhw3.wgsl` (both fixed).
+- **MI gradient weakness** — MI loss is numerically correct but gradients are ~1e-7 magnitude at coarse scales, too weak to drive rigid/affine convergence. The CUDA fused MI loop may use different optimizer scaling.
 - Segfault on exit during wgpu-native cleanup — cosmetic, does not affect results
-- MI loss GPU shader compiles and runs but too slow for production (global CAS atomics)
 - SyN warp field resize between scales uses zero-init instead of interpolation
 - Pipeline cache stores string literal pointers — names must be static/literal
 
 ## Plan to Proceed
 
-### Priority 1: MI Loss GPU Performance
+### Priority 1: MI Gradient Effectiveness
 
-The MI loss is the critical remaining bottleneck. CUDA uses shared-memory histogram accumulation (workgroup-local). WebGPU approach:
+**Done:** MI loss runs on GPU with workgroup-local histogram (fixed-point u32 atomicAdd, no CAS). The histogram and gradient are numerically correct (match CPU to 5e-5/2e-9). Shaders are in `shaders/mi_histogram.wgsl` and `shaders/mi_gradient.wgsl`.
 
-1. **Workgroup-local histogram**: Each workgroup (256 threads) accumulates a local 32×32 histogram in `var<workgroup>` shared memory using `atomicAdd` on `atomic<u32>` (workgroup atomics are fast). Total shared memory: 32×32×4 = 4KB (within WebGPU's 16KB minimum).
-2. **Global merge**: After the local histogram is complete, one thread per workgroup does a single CAS-based merge to the global histogram. This reduces global atomics from O(N × bins²) to O(workgroups × bins²).
-3. **Gradient pass**: Already working as a separate WGSL shader (binding layout fixed).
-
-This would bring MI from ~80s to ~2-5s for rigid+affine, making the MI+CC pipeline viable at ~15-20s total.
+**Remaining issue:** MI gradients are ~1e-7 magnitude at coarse scales, too weak to drive rigid/affine convergence. The CUDA fused MI loop achieves NCC 0.96 on the same dataset. Possible causes:
+- Different optimizer scaling (CUDA may scale MI gradients differently in the fused loop)
+- Learning rate needs tuning for MI vs CC (MI gradients are inherently smaller)
+- The Gaussian Parzen windowing with sigma=0.5*bin_spacing produces very smooth distributions at low resolution
 
 ### Priority 2: SyN Dispatch Overhead
 
@@ -221,8 +226,8 @@ Once MI is fast enough, run the full validation suite (small/medium/large) and d
 ### WebGPU vs CUDA
 - FFT downsample (kissfft vs cuFFT): max diff 0.01 on real images (validated on all sizes)
 - Grid sampling, affine grid, CC loss: expected identical to float32 (same algorithms)
-- MI loss: CPU fallback uses same code as CPU backend, different from CUDA MI (different reduction order)
-- Overall NCC After: 0.81 (WebGPU CC-only) vs 0.96 (CUDA MI+CC) — gap is from loss function choice, not numerical precision
+- MI loss: GPU histogram with fixed-point u32 atomicAdd (FP_SCALE=256). Matches CPU MI to 5e-5 (loss) and 2e-9 (gradient). Falls back to CPU when num_bins != 32.
+- Overall NCC After: 0.73 (WebGPU CC-only, Metal) vs 0.96 (CUDA MI+CC) — gap is from loss function choice + Metal performance characteristics
 
 ## Dependencies
 
