@@ -56,7 +56,7 @@ int main(void) {
     rigid_opts_t ropts = {
         .n_scales = 3, .scales = rigid_scales,
         .iterations = rigid_iters,
-        .lr = 0.01f, .loss_type = LOSS_CC,
+        .lr = 0.005f, .loss_type = LOSS_CC,
         .cc_kernel_size = 5,
         .tolerance = 1e-6f, .max_tolerance_iters = 10
     };

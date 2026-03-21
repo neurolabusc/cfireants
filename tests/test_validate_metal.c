@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
         t1 = get_time();
         int rs[] = {4, 2, 1}, ri[] = {200, 100, 50};
         rigid_opts_t ropts = { .n_scales = 3, .scales = rs, .iterations = ri,
-            .lr = 0.01f, .loss_type = LOSS_CC, .cc_kernel_size = 5,
+            .lr = 0.005f, .loss_type = LOSS_CC, .cc_kernel_size = 5,
             .tolerance = 1e-6f, .max_tolerance_iters = 10 };
         rigid_result_t rigid;
         rigid_register_metal(&fixed, &moving, &mom, ropts, &rigid);

@@ -285,7 +285,8 @@ void metal_box_filter_axis(const float *in, float *out,
 /*
  * box_filter_intermediates_metal — apply 3-pass separable box filter to each
  * of 5 channels packed in interm[5*spatial].  For each channel, filters along
- * axes W, H, D in order (matching CUDA).  Uses scratch as temporary.
+ * axes D, H, W in order (matching CUDA's separable_box_filter_gpu).
+ * Uses scratch as temporary.
  */
 static void box_filter_intermediates_metal(float *interm, int spatial,
                                             int D, int H, int W, int ks,
@@ -293,16 +294,36 @@ static void box_filter_intermediates_metal(float *interm, int spatial,
     float scale = 1.0f / (float)ks;
     for (int ch = 0; ch < 5; ch++) {
         float *chan = interm + (size_t)ch * spatial;
-        /* W axis: chan -> scratch */
-        metal_box_filter_axis(chan, scratch, D, H, W, ks, 2, scale);
-        /* H axis: scratch -> chan */
-        metal_box_filter_axis(scratch, chan, D, H, W, ks, 1, scale);
         /* D axis: chan -> scratch */
         metal_box_filter_axis(chan, scratch, D, H, W, ks, 0, scale);
+        /* H axis: scratch -> chan */
+        metal_box_filter_axis(scratch, chan, D, H, W, ks, 1, scale);
+        /* W axis: chan -> scratch */
+        metal_box_filter_axis(chan, scratch, D, H, W, ks, 2, scale);
         /* Copy scratch back to chan (unified memory) */
         metal_sync();
         memcpy(chan, scratch, (size_t)spatial * sizeof(float));
     }
+}
+
+/*
+ * separable_box_filter_metal — apply 3-pass separable box filter to a single
+ * buffer. Axis order: D→tmp, H→out, W→tmp, copy back.
+ * Matches CUDA's separable_box_filter_gpu exactly.
+ */
+static void separable_box_filter_metal(const float *in, float *out,
+                                        int D, int H, int W, int ks,
+                                        float *tmp) {
+    float scale = 1.0f / (float)ks;
+    /* D axis: in -> tmp */
+    metal_box_filter_axis(in, tmp, D, H, W, ks, 0, scale);
+    /* H axis: tmp -> out */
+    metal_box_filter_axis(tmp, out, D, H, W, ks, 1, scale);
+    /* W axis: out -> tmp */
+    metal_box_filter_axis(out, tmp, D, H, W, ks, 2, scale);
+    /* Copy tmp back to out (unified memory) */
+    metal_sync();
+    memcpy(out, tmp, (size_t)D * H * W * sizeof(float));
 }
 
 void metal_fused_cc_loss(
@@ -481,38 +502,235 @@ void metal_blur_disp_dhw3(float *data, float *scratch,
     memcpy(data, scratch, (size_t)total * sizeof(float));
 }
 
-void metal_cc_loss_3d(const float *pred, const float *target,
-                       float *grad_pred,
-                       int D, int H, int W, int ks, float *h_loss_out) {
+/*
+ * metal_cc_loss_3d_v2 — CC loss matching CUDA's cc_loss.cu algorithm exactly.
+ *
+ * Uses separate buffers for each of the 5 filtered intermediates, with
+ * 8 box-filter passes (5 forward + 3 adjoint) instead of fused_cc's 10
+ * (5 forward + 5 adjoint). The gradient formula is different but
+ * mathematically equivalent.
+ *
+ * Algorithm:
+ *   1. Box-filter: pred, target, pred², target², pred*target
+ *      → p_sum, t_sum, p2_sum, t2_sum, tp_sum
+ *   2. Compute per-voxel NCC + gradient sources:
+ *      cross = tp_sum - p_sum * t_sum
+ *      p_var = max(p2_sum - p_sum², dr)
+ *      t_var = max(t2_sum - t_sum², dr)
+ *      ncc = (cross² + nr) / (p_var * t_var + dr)
+ *      src_tp = 2*cross*g / g²
+ *      src_p2 = -f*t_var / g²
+ *      src_p = (-2*cross*t_sum*g + 2*f*p_sum*t_var) / g²
+ *   3. Adjoint box-filter: src_p, src_p2, src_tp → adj_p, adj_p2, adj_tp
+ *   4. Combine: grad = -inv_count * (adj_p + 2*P*adj_p2 + T*adj_tp)
+ */
+static void metal_cc_loss_3d_v2(const float *pred, const float *target,
+                                 float *grad_pred,
+                                 int D, int H, int W, int ks, float *h_loss_out) {
     @autoreleasepool {
-        uint32_t spatial = (uint32_t)(D * H * W);
-        size_t interm_bytes = (size_t)5 * spatial * sizeof(float);
-        size_t scratch_bytes = (size_t)spatial * sizeof(float);
+        uint32_t n = (uint32_t)(D * H * W);
+        size_t buf_bytes = (size_t)n * sizeof(float);
+        float nr = 1e-5f, dr = 1e-5f;
 
-        /* Allocate workspace as shared MTLBuffers */
-        id<MTLBuffer> interm_buf = [g_metal.device newBufferWithLength:interm_bytes
-                                                               options:MTLResourceStorageModeShared];
-        id<MTLBuffer> scratch_buf = [g_metal.device newBufferWithLength:scratch_bytes
-                                                                options:MTLResourceStorageModeShared];
-        if (!interm_buf || !scratch_buf) {
-            fprintf(stderr, "metal_cc_loss_3d: failed to allocate workspace\n");
+        /* Declare all ARC variables up front to avoid goto-past-init errors */
+        id<MTLBuffer> src_p_buf = nil, src_p2_buf = nil, src_tp_buf = nil;
+        float *src_p = NULL, *src_p2 = NULL, *src_tp = NULL;
+        int compute_grad = (grad_pred != NULL);
+
+        /* Allocate 7 work buffers: p_sum, t_sum, p2_sum, t2_sum, tp_sum, work, tmp */
+        id<MTLBuffer> p_sum_buf  = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> t_sum_buf  = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> p2_sum_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> t2_sum_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tp_sum_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> work_buf   = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tmp_buf    = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+
+        if (!p_sum_buf || !t_sum_buf || !p2_sum_buf || !t2_sum_buf ||
+            !tp_sum_buf || !work_buf || !tmp_buf) {
+            fprintf(stderr, "metal_cc_loss_3d_v2: failed to allocate workspace\n");
             return;
         }
 
-        float *interm = (float *)[interm_buf contents];
-        float *scratch = (float *)[scratch_buf contents];
+        float *p_sum  = (float *)[p_sum_buf contents];
+        float *t_sum  = (float *)[t_sum_buf contents];
+        float *p2_sum = (float *)[p2_sum_buf contents];
+        float *t2_sum = (float *)[t2_sum_buf contents];
+        float *tp_sum = (float *)[tp_sum_buf contents];
+        float *work   = (float *)[work_buf contents];
+        float *tmp    = (float *)[tmp_buf contents];
 
-        metal_register_buffer(interm, (__bridge void *)interm_buf, interm_bytes);
-        metal_register_buffer(scratch, (__bridge void *)scratch_buf, scratch_bytes);
+        metal_register_buffer(p_sum,  (__bridge void *)p_sum_buf,  buf_bytes);
+        metal_register_buffer(t_sum,  (__bridge void *)t_sum_buf,  buf_bytes);
+        metal_register_buffer(p2_sum, (__bridge void *)p2_sum_buf, buf_bytes);
+        metal_register_buffer(t2_sum, (__bridge void *)t2_sum_buf, buf_bytes);
+        metal_register_buffer(tp_sum, (__bridge void *)tp_sum_buf, buf_bytes);
+        metal_register_buffer(work,   (__bridge void *)work_buf,   buf_bytes);
+        metal_register_buffer(tmp,    (__bridge void *)tmp_buf,    buf_bytes);
 
-        metal_fused_cc_loss(pred, target, grad_pred, NULL,
-                            D, H, W, ks, h_loss_out, interm, scratch);
+        /* --- Step 1: Box filter the 5 forward intermediates --- */
 
+        /* box(pred) → p_sum */
+        separable_box_filter_metal(pred, p_sum, D, H, W, ks, tmp);
+
+        /* box(target) → t_sum */
+        separable_box_filter_metal(target, t_sum, D, H, W, ks, tmp);
+
+        /* pred² → work, box(work) → p2_sum */
+        {
+            void *pso = metal_get_pipeline("cc_multiply");
+            if (!pso) { fprintf(stderr, "metal_cc_loss_3d_v2: cc_multiply pipeline not found\n"); goto cleanup; }
+            struct { uint32_t n, _pad; } params = { .n = n, ._pad = 0 };
+            const void *bufs[] = { pred, pred, work };
+            size_t sizes[] = { buf_bytes, buf_bytes, buf_bytes };
+            metal_dispatch(pso, bufs, sizes, 3, &params, sizeof(params), n);
+        }
+        separable_box_filter_metal(work, p2_sum, D, H, W, ks, tmp);
+
+        /* target² → work, box(work) → t2_sum */
+        {
+            void *pso = metal_get_pipeline("cc_multiply");
+            struct { uint32_t n, _pad; } params = { .n = n, ._pad = 0 };
+            const void *bufs[] = { target, target, work };
+            size_t sizes[] = { buf_bytes, buf_bytes, buf_bytes };
+            metal_dispatch(pso, bufs, sizes, 3, &params, sizeof(params), n);
+        }
+        separable_box_filter_metal(work, t2_sum, D, H, W, ks, tmp);
+
+        /* pred*target → work, box(work) → tp_sum */
+        {
+            void *pso = metal_get_pipeline("cc_multiply");
+            struct { uint32_t n, _pad; } params = { .n = n, ._pad = 0 };
+            const void *bufs[] = { pred, target, work };
+            size_t sizes[] = { buf_bytes, buf_bytes, buf_bytes };
+            metal_dispatch(pso, bufs, sizes, 3, &params, sizeof(params), n);
+        }
+        separable_box_filter_metal(work, tp_sum, D, H, W, ks, tmp);
+
+        /* --- Step 2: Compute NCC and gradient source terms --- */
+
+        /* Reuse work buffer for NCC values */
+        float *ncc_buf = work;
+
+        if (compute_grad) {
+            src_p_buf  = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+            src_p2_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+            src_tp_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+            if (!src_p_buf || !src_p2_buf || !src_tp_buf) {
+                fprintf(stderr, "metal_cc_loss_3d_v2: failed to allocate gradient source buffers\n");
+                goto cleanup;
+            }
+            src_p  = (float *)[src_p_buf contents];
+            src_p2 = (float *)[src_p2_buf contents];
+            src_tp = (float *)[src_tp_buf contents];
+            metal_register_buffer(src_p,  (__bridge void *)src_p_buf,  buf_bytes);
+            metal_register_buffer(src_p2, (__bridge void *)src_p2_buf, buf_bytes);
+            metal_register_buffer(src_tp, (__bridge void *)src_tp_buf, buf_bytes);
+        }
+
+        {
+            void *pso = metal_get_pipeline("cc_ncc_and_grad_sources");
+            if (!pso) { fprintf(stderr, "metal_cc_loss_3d_v2: cc_ncc_and_grad_sources pipeline not found\n"); goto cleanup_grad; }
+            struct { uint32_t n; float nr, dr; int32_t compute_grad; } params = {
+                .n = n, .nr = nr, .dr = dr, .compute_grad = compute_grad
+            };
+            /* Use dummy pointers for src buffers when not computing gradient */
+            const void *bufs[] = {
+                p_sum, t_sum, p2_sum, t2_sum, tp_sum,
+                ncc_buf,
+                compute_grad ? (const void *)src_p  : (const void *)ncc_buf,
+                compute_grad ? (const void *)src_p2 : (const void *)ncc_buf,
+                compute_grad ? (const void *)src_tp : (const void *)ncc_buf
+            };
+            size_t sizes[] = {
+                buf_bytes, buf_bytes, buf_bytes, buf_bytes, buf_bytes,
+                buf_bytes, buf_bytes, buf_bytes, buf_bytes
+            };
+            metal_dispatch(pso, bufs, sizes, 9, &params, sizeof(params), n);
+        }
+
+        /* --- Step 2b: Reduce NCC to scalar loss --- */
+        if (h_loss_out) {
+            /* Use partial sum reduction via cc_ncc_partial_sum shader */
+            uint32_t n_groups = metal_div_ceil(n, MTL_THREADGROUP_SIZE);
+            size_t partial_bytes = (size_t)n_groups * sizeof(float);
+
+            id<MTLBuffer> partial_buf = [g_metal.device newBufferWithLength:partial_bytes
+                                                                    options:MTLResourceStorageModeShared];
+            if (!partial_buf) {
+                fprintf(stderr, "metal_cc_loss_3d_v2: failed to allocate partial sum buffer\n");
+                goto cleanup_grad;
+            }
+            float *partial = (float *)[partial_buf contents];
+            metal_register_buffer(partial, (__bridge void *)partial_buf, partial_bytes);
+
+            {
+                void *pso = metal_get_pipeline("cc_ncc_partial_sum");
+                if (!pso) { fprintf(stderr, "metal_cc_loss_3d_v2: cc_ncc_partial_sum pipeline not found\n");
+                    metal_unregister_buffer(partial); goto cleanup_grad; }
+                struct { uint32_t n, _pad; } params = { .n = n, ._pad = 0 };
+                const void *bufs[] = { ncc_buf, partial };
+                size_t sizes[] = { buf_bytes, partial_bytes };
+                metal_dispatch(pso, bufs, sizes, 2, &params, sizeof(params), n);
+            }
+
+            /* CPU final sum of partial results */
+            metal_sync();
+            double sum = 0.0;
+            for (uint32_t i = 0; i < n_groups; i++) {
+                sum += (double)partial[i];
+            }
+            *h_loss_out = -(float)(sum / (double)n);
+
+            metal_unregister_buffer(partial);
+        }
+
+        /* --- Step 3: Compute gradient if requested --- */
+        if (compute_grad) {
+            /* Adjoint box-filter the 3 gradient source terms */
+            /* Reuse p_sum, t_sum, p2_sum as adj_p, adj_p2, adj_tp */
+            float *adj_p  = p_sum;   /* reuse */
+            float *adj_p2 = t_sum;   /* reuse */
+            float *adj_tp = p2_sum;  /* reuse */
+
+            separable_box_filter_metal(src_p,  adj_p,  D, H, W, ks, tmp);
+            separable_box_filter_metal(src_p2, adj_p2, D, H, W, ks, tmp);
+            separable_box_filter_metal(src_tp, adj_tp, D, H, W, ks, tmp);
+
+            /* Combine: grad = -inv_count * (adj_p + 2*P*adj_p2 + T*adj_tp) */
+            {
+                void *pso = metal_get_pipeline("cc_combine_grad");
+                if (!pso) { fprintf(stderr, "metal_cc_loss_3d_v2: cc_combine_grad pipeline not found\n"); goto cleanup_grad; }
+                struct { uint32_t n; float inv_count; } params = {
+                    .n = n, .inv_count = 1.0f / (float)n
+                };
+                const void *bufs[] = { adj_p, adj_p2, adj_tp, pred, target, grad_pred };
+                size_t sizes[] = { buf_bytes, buf_bytes, buf_bytes, buf_bytes, buf_bytes, buf_bytes };
+                metal_dispatch(pso, bufs, sizes, 6, &params, sizeof(params), n);
+            }
+        }
+
+    cleanup_grad:
+        if (src_tp)  metal_unregister_buffer(src_tp);
+        if (src_p2)  metal_unregister_buffer(src_p2);
+        if (src_p)   metal_unregister_buffer(src_p);
+
+    cleanup:
         metal_sync();
-
-        metal_unregister_buffer(scratch);
-        metal_unregister_buffer(interm);
+        metal_unregister_buffer(tmp);
+        metal_unregister_buffer(work);
+        metal_unregister_buffer(tp_sum);
+        metal_unregister_buffer(t2_sum);
+        metal_unregister_buffer(p2_sum);
+        metal_unregister_buffer(t_sum);
+        metal_unregister_buffer(p_sum);
     }
+}
+
+void metal_cc_loss_3d(const float *pred, const float *target,
+                       float *grad_pred,
+                       int D, int H, int W, int ks, float *h_loss_out) {
+    metal_cc_loss_3d_v2(pred, target, grad_pred, D, H, W, ks, h_loss_out);
 }
 
 /* ================================================================== */

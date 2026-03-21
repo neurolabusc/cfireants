@@ -186,3 +186,138 @@ kernel void fcc_bwd_grads(
         grad_target[gid] = gini_a * I - gini_c * J + gini_mu2;
     }
 }
+
+/* ================================================================== */
+/* cc_loss.cu-style kernels (v2)                                       */
+/* Matching CUDA's cc_loss.cu: separate buffers, 8 box-filter passes   */
+/* (5 forward + 3 adjoint) instead of fused_cc's packed intermediates. */
+/* ================================================================== */
+
+/* ------------------------------------------------------------------ */
+/* cc_multiply: c[i] = a[i] * b[i]                                     */
+/* ------------------------------------------------------------------ */
+
+struct CCMulParams {
+    uint n;
+    uint _pad;
+};
+
+kernel void cc_multiply(
+    const device float *a      [[buffer(0)]],
+    const device float *b      [[buffer(1)]],
+    device float       *c      [[buffer(2)]],
+    constant CCMulParams &p    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.n) return;
+    c[gid] = a[gid] * b[gid];
+}
+
+/* ------------------------------------------------------------------ */
+/* cc_ncc_and_grad_sources: compute per-voxel NCC + gradient sources   */
+/* Matches CUDA cc_ncc_and_grad_sources_kernel exactly.                */
+/* ------------------------------------------------------------------ */
+
+struct CCNccParams {
+    uint  n;
+    float nr;
+    float dr;
+    int   compute_grad;
+};
+
+kernel void cc_ncc_and_grad_sources(
+    const device float *p_sum   [[buffer(0)]],
+    const device float *t_sum   [[buffer(1)]],
+    const device float *p2_sum  [[buffer(2)]],
+    const device float *t2_sum  [[buffer(3)]],
+    const device float *tp_sum  [[buffer(4)]],
+    device float       *ncc_out [[buffer(5)]],
+    device float       *src_p   [[buffer(6)]],
+    device float       *src_p2  [[buffer(7)]],
+    device float       *src_tp  [[buffer(8)]],
+    constant CCNccParams &params [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= params.n) return;
+
+    float ps = p_sum[gid], ts = t_sum[gid];
+    float cross = tp_sum[gid] - ps * ts;
+    float p_var = p2_sum[gid] - ps * ps;
+    float t_var = t2_sum[gid] - ts * ts;
+    if (p_var < params.dr) p_var = params.dr;
+    if (t_var < params.dr) t_var = params.dr;
+
+    float f = cross * cross + params.nr;
+    float g = p_var * t_var + params.dr;
+    float ncc = f / g;
+    if (ncc > 1.0f) ncc = 1.0f;
+    if (ncc < -1.0f) ncc = -1.0f;
+    ncc_out[gid] = ncc;
+
+    if (params.compute_grad) {
+        float g2 = g * g;
+        src_tp[gid] = 2.0f * cross * g / g2;
+        src_p2[gid] = -f * t_var / g2;
+        src_p[gid] = (-2.0f * cross * ts * g + 2.0f * f * ps * t_var) / g2;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* cc_ncc_partial_sum: threadgroup reduction for NCC loss value         */
+/* ------------------------------------------------------------------ */
+
+#define CC_BLOCK 256
+
+struct CCReduceParams {
+    uint n;
+    uint _pad;
+};
+
+kernel void cc_ncc_partial_sum(
+    const device float *ncc_buf     [[buffer(0)]],
+    device float       *partial_sum [[buffer(1)]],
+    constant CCReduceParams &p      [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint wid [[threadgroup_position_in_grid]])
+{
+    threadgroup float sdata[CC_BLOCK];
+
+    sdata[tid] = (gid < p.n) ? ncc_buf[gid] : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = CC_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        partial_sum[wid] = sdata[0];
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* cc_combine_grad: grad = -inv_count * (adj_p + 2*P*adj_p2 + T*adj_tp) */
+/* Matches CUDA cc_combine_grad_kernel exactly.                         */
+/* ------------------------------------------------------------------ */
+
+struct CCCombineParams {
+    uint  n;
+    float inv_count;
+};
+
+kernel void cc_combine_grad(
+    const device float *adj_p   [[buffer(0)]],
+    const device float *adj_p2  [[buffer(1)]],
+    const device float *adj_tp  [[buffer(2)]],
+    const device float *P       [[buffer(3)]],
+    const device float *T       [[buffer(4)]],
+    device float       *grad    [[buffer(5)]],
+    constant CCCombineParams &p [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.n) return;
+    grad[gid] = -p.inv_count * (adj_p[gid] + 2.0f * P[gid] * adj_p2[gid] + T[gid] * adj_tp[gid]);
+}
