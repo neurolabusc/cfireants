@@ -4,7 +4,7 @@ Pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) — GPU-accele
 
 - **CUDA** — production quality, exceeds Python on all validation datasets
 - **WebGPU** — portable via wgpu-native (Vulkan on Linux, Metal on macOS)
-- **Metal** — native macOS/Apple Silicon, 7x faster than WebGPU on same hardware
+- **Metal** — native macOS/Apple Silicon, 2–7x faster than WebGPU on same hardware
 
 Based on FireANTs commit [`0d13a3f`](https://github.com/rohitrango/FireANTs/tree/0d13a3f).
 
@@ -22,6 +22,14 @@ make -j$(nproc)
 # CUDA + WebGPU (requires wgpu-native in third_party/wgpu/)
 cmake .. -DCFIREANTS_CUDA=ON -DCFIREANTS_WEBGPU=ON
 make -j$(nproc)
+
+# Metal (macOS/Apple Silicon)
+cmake .. -DCFIREANTS_CUDA=OFF -DCFIREANTS_METAL=ON
+make -j$(nproc)
+
+# WebGPU + Metal (macOS — both on same hardware for comparison)
+cmake .. -DCFIREANTS_CUDA=OFF -DCFIREANTS_WEBGPU=ON -DCFIREANTS_METAL=ON
+make -j$(nproc)
 ```
 
 ## Quick Start
@@ -36,8 +44,12 @@ build/test_validate_all --dataset small
 build/test_validate_all --dataset small --trilinear
 
 # WebGPU
-build/test_validate_webgpu --dataset small
 build/test_validate_webgpu --dataset small --trilinear
+build/test_validate_webgpu --dataset small --trilinear --greedy
+
+# Metal (macOS)
+build/test_validate_metal --dataset small --trilinear
+build/test_validate_metal --dataset small --trilinear --greedy
 ```
 
 ## Validation Results
@@ -56,7 +68,7 @@ Full pipeline: Moments → Rigid → Affine → SyN/Greedy.
 
 ### Downsample Modes
 
-Both CUDA and WebGPU support two downsampling modes for multi-scale registration:
+All three GPU backends support two downsampling modes for multi-scale registration:
 
 - **FFT** (default) — FFT-based downsample matching Python. CUDA uses cuFFT on GPU; WebGPU uses kissfft on CPU.
 - **Trilinear** (`--trilinear`) — Gaussian blur + trilinear resize, fully GPU-native on both backends. Enables like-for-like comparison between CUDA and WebGPU.

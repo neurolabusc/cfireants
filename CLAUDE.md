@@ -69,14 +69,16 @@ build/test_validate_greedy             # Greedy, all datasets
 build/test_webgpu_basic                # Element-wise ops, H2D/D2H
 build/test_fft_fallback                # kissfft vs cuFFT comparison
 build/test_webgpu_linear               # Moments + Rigid + Affine pipeline
-build/test_validate_webgpu --dataset small              # Full pipeline validation
+build/test_validate_webgpu --dataset small              # Full pipeline validation (SyN)
 build/test_validate_webgpu --dataset small --trilinear  # GPU-native downsample
+build/test_validate_webgpu --dataset small --trilinear --greedy  # Greedy (faster, ~1% less NCC)
 
 # Metal tests
 build/test_metal_backend                               # Element-wise ops, grid sample
 build/test_metal_linear                                # Moments + Rigid + Affine pipeline
-build/test_validate_metal --dataset small               # Full pipeline (MI+CC, FFT)
-build/test_validate_metal --dataset small --trilinear   # Full pipeline (MI+CC, trilinear)
+build/test_validate_metal --dataset small               # Full pipeline (MI+CC, FFT, SyN)
+build/test_validate_metal --dataset small --trilinear   # Full pipeline (MI+CC, trilinear, SyN)
+build/test_validate_metal --dataset small --trilinear --greedy  # Greedy deformable
 ```
 
 ## Architecture
@@ -96,7 +98,7 @@ Each stage uses multi-scale optimization with configurable loss functions (CC or
 
 ### Backend Abstraction
 
-`backend_ops_t` in `include/cfireants/backend.h` provides 18 function pointers covering tensor ops, grid sampling, losses, blur, Adam, and interpolation. Three backends:
+`backend_ops_t` in `include/cfireants/backend.h` provides 18 function pointers covering tensor ops, grid sampling, losses, blur, Adam, and interpolation. Four backends (CPU + three GPU):
 
 - **CPU** (`backend/cpu/`) — reference implementations, stubs for compute-intensive ops
 - **CUDA** (`backend/cuda/`) — production GPU backend with fused kernels

@@ -206,9 +206,8 @@ int main(int argc, char **argv) {
 
         if (use_greedy) {
             t1 = get_time();
-            int gs[] = {4, 2, 1}, gi[] = {200, 100, 50};
             greedy_opts_t gopts = {
-                .n_scales=3, .scales=gs, .iterations=gi,
+                .n_scales=ds->syn_n, .scales=ds->syn_scales, .iterations=ds->syn_iters,
                 .cc_kernel_size=5, .lr=0.1f,
                 .smooth_warp_sigma=0.5f, .smooth_grad_sigma=1.0f,
                 .tolerance=1e-6f, .max_tolerance_iters=10,
