@@ -13,7 +13,7 @@
 /* ------------------------------------------------------------------ */
 
 /* Build 1D Gaussian kernel matching fireants gaussian_1d with approx="erf" */
-static int make_gaussian_kernel(float sigma, float truncated,
+int make_gaussian_kernel(float sigma, float truncated,
                                 float **kernel_out, int *len_out) {
     if (sigma <= 0.0f) {
         *kernel_out = (float *)malloc(sizeof(float));
@@ -130,6 +130,63 @@ int cpu_gaussian_blur_3d(const tensor_t *input, tensor_t *output,
     free(tmp);
     free(kernel);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-axis Gaussian blur (in-place on single-channel [D,H,W])         */
+/* ------------------------------------------------------------------ */
+
+void cpu_blur_volume(float *data, int D, int H, int W,
+                      float sigma_d, float sigma_h, float sigma_w,
+                      float truncated) {
+    size_t sz = (size_t)D * H * W;
+    float *tmp = (float *)malloc(sz * sizeof(float));
+    float sigmas[3] = { sigma_d, sigma_h, sigma_w };
+
+    for (int axis = 0; axis < 3; axis++) {
+        if (sigmas[axis] <= 0) continue;
+        float *kernel = NULL;
+        int klen = 0;
+        make_gaussian_kernel(sigmas[axis], truncated, &kernel, &klen);
+        conv1d_axis(data, tmp, D, H, W, kernel, klen, axis);
+        memcpy(data, tmp, sz * sizeof(float));
+        free(kernel);
+    }
+    free(tmp);
+}
+
+/* ------------------------------------------------------------------ */
+/* Gaussian blur + trilinear downsample (matching GPU blur_downsample)  */
+/* ------------------------------------------------------------------ */
+
+void cpu_blur_downsample(const float *input, float *output,
+                          int iD, int iH, int iW,
+                          int oD, int oH, int oW) {
+    size_t in_sz = (size_t)iD * iH * iW;
+
+    /* Copy input so we don't modify it */
+    float *blurred = (float *)malloc(in_sz * sizeof(float));
+    memcpy(blurred, input, in_sz * sizeof(float));
+
+    /* Gaussian blur with per-axis sigma = 0.5 * in_dim / out_dim */
+    cpu_blur_volume(blurred, iD, iH, iW,
+                     0.5f * (float)iD / (float)oD,
+                     0.5f * (float)iH / (float)oH,
+                     0.5f * (float)iW / (float)oW,
+                     2.0f);
+
+    /* Trilinear resize: blurred [iD,iH,iW] -> output [oD,oH,oW] */
+    tensor_t in_t, out_t;
+    int is[5] = {1, 1, iD, iH, iW};
+    int os[5] = {1, 1, oD, oH, oW};
+    in_t.ndim = 5; memcpy(in_t.shape, is, sizeof(is));
+    in_t.dtype = DTYPE_FLOAT32; in_t.device = DEVICE_CPU;
+    in_t.data = blurred; in_t.owns_data = 0;
+    tensor_alloc(&out_t, 5, os, DTYPE_FLOAT32, DEVICE_CPU);
+    cpu_trilinear_resize(&in_t, &out_t, 1);
+    memcpy(output, out_t.data, (size_t)oD * oH * oW * sizeof(float));
+    tensor_free(&out_t);
+    free(blurred);
 }
 
 /* ------------------------------------------------------------------ */

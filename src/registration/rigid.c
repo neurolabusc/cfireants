@@ -362,31 +362,54 @@ int rigid_register(const image_t *fixed, const image_t *moving,
     const int *iterations = opts.iterations;
 
     int fD = fixed->data.shape[2], fH = fixed->data.shape[3], fW = fixed->data.shape[4];
+    int mD = moving->data.shape[2], mH = moving->data.shape[3], mW = moving->data.shape[4];
 
     for (int si = 0; si < n_scales; si++) {
         int scale = scales[si];
         int iters = iterations[si];
 
-        /* Downsample fixed and moving images */
+        /* Downsample fixed and moving images (matching GPU pipeline):
+         * - Fixed and moving downsampled independently (may have different sizes)
+         * - Anti-aliasing Gaussian blur before trilinear resize
+         * - Extra Gaussian blur on moving (Python _smooth_image_not_mask) */
+        int dD = (scale > 1) ? fD/scale : fD;
+        int dH = (scale > 1) ? fH/scale : fH;
+        int dW = (scale > 1) ? fW/scale : fW;
+        if (dD < 8) dD = 8; if (dH < 8) dH = 8; if (dW < 8) dW = 8;
+        if (scale == 1) { dD = fD; dH = fH; dW = fW; }
+
+        int mdD = (scale > 1) ? mD/scale : mD;
+        int mdH = (scale > 1) ? mH/scale : mH;
+        int mdW = (scale > 1) ? mW/scale : mW;
+        if (mdD < 8) mdD = 8; if (mdH < 8) mdH = 8; if (mdW < 8) mdW = 8;
+        if (scale == 1) { mdD = mD; mdH = mH; mdW = mW; }
+
         tensor_t fixed_down, moving_down;
         if (scale > 1) {
-            /* Simple trilinear downsample for now */
-            int dD = fD/scale, dH = fH/scale, dW = fW/scale;
-            if (dD < 8) dD = 8;
-            if (dH < 8) dH = 8;
-            if (dW < 8) dW = 8;
-            int ds[5] = {1, 1, dD, dH, dW};
-            tensor_alloc(&fixed_down, 5, ds, DTYPE_FLOAT32, DEVICE_CPU);
-            tensor_alloc(&moving_down, 5, ds, DTYPE_FLOAT32, DEVICE_CPU);
-            cpu_trilinear_resize(&fixed->data, &fixed_down, 1);
-            cpu_trilinear_resize(&moving->data, &moving_down, 1);
+            int fds[5] = {1, 1, dD, dH, dW};
+            int mds[5] = {1, 1, mdD, mdH, mdW};
+            tensor_alloc(&fixed_down, 5, fds, DTYPE_FLOAT32, DEVICE_CPU);
+            tensor_alloc(&moving_down, 5, mds, DTYPE_FLOAT32, DEVICE_CPU);
+            cpu_blur_downsample(tensor_data_f32(&fixed->data),
+                                 tensor_data_f32(&fixed_down),
+                                 fD, fH, fW, dD, dH, dW);
+            cpu_blur_downsample(tensor_data_f32(&moving->data),
+                                 tensor_data_f32(&moving_down),
+                                 mD, mH, mW, mdD, mdH, mdW);
+            /* Extra Gaussian blur on moving (matching Python rigid._smooth_image_not_mask) */
+            cpu_blur_volume(tensor_data_f32(&moving_down), mdD, mdH, mdW,
+                             0.5f * (float)fD / (float)dD,
+                             0.5f * (float)fH / (float)dH,
+                             0.5f * (float)fW / (float)dW,
+                             2.0f);
         } else {
             tensor_view(&fixed_down, &fixed->data);
             tensor_view(&moving_down, &moving->data);
+            mdD = mD; mdH = mH; mdW = mW;
         }
 
-        fprintf(stderr, "  Scale %d: [%d,%d,%d] x %d iters\n",
-                scale, fixed_down.shape[2], fixed_down.shape[3], fixed_down.shape[4], iters);
+        fprintf(stderr, "  Scale %d: fixed[%d,%d,%d] moving[%d,%d,%d] x %d iters\n",
+                scale, dD, dH, dW, mdD, mdH, mdW, iters);
 
         /* Reset Adam step counter for each scale */
         state.step = 0;
