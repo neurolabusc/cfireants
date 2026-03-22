@@ -179,6 +179,7 @@ void cpu_blur_downsample(const float *input, float *output,
     tensor_t in_t, out_t;
     int is[5] = {1, 1, iD, iH, iW};
     int os[5] = {1, 1, oD, oH, oW};
+    memset(&in_t, 0, sizeof(in_t));
     in_t.ndim = 5; memcpy(in_t.shape, is, sizeof(is));
     in_t.dtype = DTYPE_FLOAT32; in_t.device = DEVICE_CPU;
     in_t.data = blurred; in_t.owns_data = 0;

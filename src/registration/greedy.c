@@ -367,6 +367,12 @@ int greedy_register(const image_t *fixed, const image_t *moving,
             if (it % 50 == 0 || it == iters - 1)
                 fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
 
+            /* Cleanup iteration tensors (before convergence break) */
+            tensor_free(&sampling_grid);
+            tensor_free(&moved);
+            tensor_free(&grad_moved);
+            tensor_free(&grad_grid);
+
             /* Convergence check */
             if (fabsf(loss - prev_loss) < opts.tolerance) {
                 converge_count++;
@@ -378,12 +384,6 @@ int greedy_register(const image_t *fixed, const image_t *moving,
                 converge_count = 0;
             }
             prev_loss = loss;
-
-            /* Cleanup iteration tensors */
-            tensor_free(&sampling_grid);
-            tensor_free(&moved);
-            tensor_free(&grad_moved);
-            tensor_free(&grad_grid);
         }
 
         free(adam_dir);
@@ -393,6 +393,10 @@ int greedy_register(const image_t *fixed, const image_t *moving,
             tensor_free(&moving_down);
         }
     }
+
+    /* Free Adam state from last scale */
+    tensor_free(&adam_m);
+    tensor_free(&adam_v);
 
     /* Store final displacement for evaluation */
     result->disp = disp; /* transfer ownership */
