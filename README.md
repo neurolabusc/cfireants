@@ -119,15 +119,25 @@ Like-for-like comparison using `--trilinear` on the same hardware. Both use MI l
 
 Trilinear matches or exceeds FFT accuracy. All measurements on NVIDIA GB10 (unified memory).
 
-### All Datasets — Trilinear Mode (Apple M4 Pro, Metal backend via wgpu-native)
+### Metal: FFT vs Trilinear (small dataset)
+
+| Metric | FFT (MPSGraph) | Trilinear |
+|--------|---------------|-----------|
+| NCC After | 0.9608 | 0.9639 |
+| Total Time | 7.4s | 7.3s |
+| Peak RAM | 390 MB | 391 MB |
+
+Trilinear slightly exceeds FFT accuracy on Metal (same pattern as CUDA). FFT uses MPSGraph 3D FFT; trilinear uses GPU Gaussian blur + hardware resize. All measurements on Apple M4 Pro.
+
+### All Datasets — SyN Trilinear Mode (Apple M4 Pro, Metal backend via wgpu-native)
 
 | Dataset | WebGPU NCC | Metal NCC | WebGPU Time | Metal Time | Metal RAM |
 |---------|------------|-----------|-------------|------------|-----------|
-| small (2mm full-head) | 0.9642 | **0.9638** | 60.1s | 8.5s | 391 MB |
-| medium (1mm brain) | 0.9541 | **0.9542** | 131.7s | 20.8s | 3023 MB |
-| large (1mm full-head) | 0.9191 | **0.9198** | 88.5s | 44.0s | 3259 MB |
+| small (2mm full-head) | 0.9642 | **0.9636** | 60.1s | 7.2s | 391 MB |
+| medium (1mm brain) | 0.9541 | **0.9540** | 131.7s | 18.7s | 3023 MB |
+| large (1mm full-head) | 0.9191 | **0.9199** | 88.5s | 36.2s | 3259 MB |
 
-**Metal matches WebGPU accuracy on all datasets** (within 0.1%) and runs **2–7x faster** on the same Apple M4 Pro hardware. WebGPU runs via wgpu-native's Metal backend, so both use the same GPU — the speed difference comes from Metal's native API with unified memory (zero-copy) vs WebGPU's abstraction overhead. Both backends use identical registration parameters: MI loss for full-head rigid/affine, CC for brain-extracted, fused CC for SyN deformable.
+**Metal matches WebGPU accuracy on all datasets** (within 0.1%) and runs **2–8x faster** on the same Apple M4 Pro hardware. Metal uses batched command buffer encoding and GPU-native WarpAdam kernels to minimize dispatch overhead. WebGPU runs via wgpu-native's Metal backend — the speed difference comes from Metal's native API with unified memory (zero-copy) vs WebGPU's abstraction overhead.
 
 ### WebGPU: Greedy vs SyN (Apple M4 Pro, trilinear)
 
@@ -150,11 +160,11 @@ Trilinear matches or exceeds FFT accuracy. All measurements on NVIDIA GB10 (unif
 
 ### Metal: Greedy vs SyN (Apple M4 Pro, trilinear)
 
-| Dataset | SyN NCC | Greedy NCC | SyN Time | Greedy Time |
-|---------|---------|------------|----------|-------------|
-| small | 0.9638 | 0.9507 | 8.5s | **7.4s** |
-| medium | 0.9542 | 0.9420 | 20.8s | **17.3s** |
-| large | 0.9198 | 0.8995 | 44.0s | **30.9s** |
+| Dataset | SyN NCC | Greedy NCC | SyN Time | Greedy Time | SyN RAM | Greedy RAM |
+|---------|---------|------------|----------|-------------|---------|------------|
+| small | 0.9636 | 0.9511 | 7.2s | **6.5s** | 391 MB | 276 MB |
+| medium | 0.9540 | 0.9420 | 18.7s | **16.7s** | 3023 MB | 2103 MB |
+| large | 0.9199 | 0.8996 | 36.2s | **37.6s** | 3259 MB | 2340 MB |
 
 See [CLAUDE.md](CLAUDE.md) for architecture details and known issues. See [validate/README.md](validate/README.md) for detailed CUDA benchmarks.
 
