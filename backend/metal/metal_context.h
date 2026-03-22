@@ -62,6 +62,11 @@ typedef struct {
         size_t size;
     } buffers[MTL_MAX_BUFFERS];
     int n_buffers;
+
+    /* Batch mode state (Obj-C types stored as void* for C compat) */
+    void *batch_cmd;     /* id<MTLCommandBuffer> or NULL */
+    void *batch_enc;     /* id<MTLComputeCommandEncoder> or NULL */
+    int batch_active;
 } metal_context_t;
 
 extern metal_context_t g_metal;
@@ -114,6 +119,17 @@ void metal_dispatch_no_params(void *pipeline,
 /* Synchronize: wait for all GPU work to complete.
    After this call, all shared-memory buffers are CPU-readable. */
 void metal_sync(void);
+
+/* --- Batched dispatch mode --- */
+/* Begin batching: subsequent metal_dispatch calls encode into a single
+   command buffer instead of submitting individually. Much faster when
+   multiple kernels run in sequence without CPU readback between them.
+   Metal guarantees in-order execution within a command buffer. */
+void metal_begin_batch(void);
+
+/* Flush the current batch: submits the accumulated command buffer and
+   waits for completion. After this, all results are CPU-readable. */
+void metal_flush_batch(void);
 
 /* Compute ceil(n / d) */
 static inline uint32_t metal_div_ceil(uint32_t n, uint32_t d) {

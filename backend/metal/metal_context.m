@@ -238,8 +238,18 @@ void metal_dispatch(void *pipeline,
     @autoreleasepool {
         id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipeline;
 
-        id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        /* In batch mode: reuse the existing encoder (Metal guarantees in-order
+           execution within a command buffer, so no barriers needed). */
+        int batched = g_metal.batch_active;
+        id<MTLCommandBuffer> cmd = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        if (batched) {
+            enc = (__bridge id<MTLComputeCommandEncoder>)g_metal.batch_enc;
+        } else {
+            cmd = [g_metal.queue commandBuffer];
+            enc = [cmd computeCommandEncoder];
+        }
         [enc setComputePipelineState:pso];
 
         /* Bind data buffers (supports sub-buffer offsets for pointer arithmetic) */
@@ -249,7 +259,7 @@ void metal_dispatch(void *pipeline,
             if (!ref) {
                 fprintf(stderr, "metal_dispatch: buffer %d (ptr=%p) not found in table\n",
                         i, buffer_ptrs[i]);
-                [enc endEncoding];
+                if (!batched) [enc endEncoding];
                 return;
             }
             id<MTLBuffer> buf = (__bridge id<MTLBuffer>)ref;
@@ -271,9 +281,11 @@ void metal_dispatch(void *pipeline,
         MTLSize tgSize = MTLSizeMake(threadgroupSize, 1, 1);
         [enc dispatchThreads:threads threadsPerThreadgroup:tgSize];
 
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        if (!batched) {
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
     }
 }
 
@@ -285,12 +297,40 @@ void metal_dispatch_no_params(void *pipeline,
 }
 
 void metal_sync(void) {
+    /* If batch is active, flush it first */
+    if (g_metal.batch_active)
+        metal_flush_batch();
     @autoreleasepool {
-        /* Submit an empty command buffer and wait for it to complete.
-         * This ensures all prior work on the queue has finished and
-         * shared-memory buffers are CPU-coherent. */
         id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
         [cmd commit];
         [cmd waitUntilCompleted];
+    }
+}
+
+/* --- Batched dispatch mode --- */
+
+void metal_begin_batch(void) {
+    if (g_metal.batch_active) return;  /* already batching */
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        /* Retain to prevent ARC release when leaving autoreleasepool */
+        g_metal.batch_cmd = (__bridge_retained void *)cmd;
+        g_metal.batch_enc = (__bridge_retained void *)enc;
+        g_metal.batch_active = 1;
+    }
+}
+
+void metal_flush_batch(void) {
+    if (!g_metal.batch_active) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = (__bridge_transfer id<MTLComputeCommandEncoder>)g_metal.batch_enc;
+        id<MTLCommandBuffer> cmd = (__bridge_transfer id<MTLCommandBuffer>)g_metal.batch_cmd;
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        g_metal.batch_cmd = NULL;
+        g_metal.batch_enc = NULL;
+        g_metal.batch_active = 0;
     }
 }

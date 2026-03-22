@@ -362,18 +362,29 @@ void metal_box_filter_axis(const float *in, float *out,
 static void box_filter_intermediates_metal(float *interm, int spatial,
                                             int D, int H, int W, int ks,
                                             float *scratch) {
-    float scale = 1.0f / (float)ks;
-    for (int ch = 0; ch < 5; ch++) {
-        float *chan = interm + (size_t)ch * spatial;
-        /* D axis: chan -> scratch */
-        metal_box_filter_axis(chan, scratch, D, H, W, ks, 0, scale);
-        /* H axis: scratch -> chan */
-        metal_box_filter_axis(scratch, chan, D, H, W, ks, 1, scale);
-        /* W axis: chan -> scratch */
-        metal_box_filter_axis(chan, scratch, D, H, W, ks, 2, scale);
-        /* Copy scratch back to chan (unified memory) */
-        metal_sync();
-        memcpy(chan, scratch, (size_t)spatial * sizeof(float));
+    @autoreleasepool {
+        /* Pre-allocate uniform kernel buffer once (shared across all 15 dispatches) */
+        float scale = 1.0f / (float)ks;
+        id<MTLBuffer> kern_buf = [g_metal.device newBufferWithLength:(NSUInteger)(ks * sizeof(float))
+                                                             options:MTLResourceStorageModeShared];
+        float *kern_ptr = (float *)[kern_buf contents];
+        for (int i = 0; i < ks; i++) kern_ptr[i] = scale;
+        metal_register_buffer(kern_ptr, (__bridge void *)kern_buf, (size_t)(ks * sizeof(float)));
+
+        /* Batch all 15 box filter dispatches (5 channels × 3 axes) */
+        metal_begin_batch();
+        for (int ch = 0; ch < 5; ch++) {
+            float *chan = interm + (size_t)ch * spatial;
+            metal_conv1d_axis(chan, scratch, D, H, W, kern_ptr, ks, 0);    /* D: chan→scratch */
+            metal_conv1d_axis(scratch, chan, D, H, W, kern_ptr, ks, 1);    /* H: scratch→chan */
+            metal_conv1d_axis(chan, scratch, D, H, W, kern_ptr, ks, 2);    /* W: chan→scratch */
+            /* Must flush before memcpy since batch is still pending */
+            metal_flush_batch();
+            memcpy(chan, scratch, (size_t)spatial * sizeof(float));
+            if (ch < 4) metal_begin_batch();  /* start next batch for remaining channels */
+        }
+
+        metal_unregister_buffer(kern_ptr);
     }
 }
 
@@ -520,56 +531,32 @@ void metal_blur_disp_dhw3(float *data, float *scratch,
         .W = (uint32_t)W, .klen = (uint32_t)klen
     };
 
+    void *pso0 = metal_get_pipeline("blur_dhw3_axis0");
+    void *pso1 = metal_get_pipeline("blur_dhw3_axis1");
+    void *pso2 = metal_get_pipeline("blur_dhw3_axis2");
+    if (!pso0 || !pso1 || !pso2) {
+        fprintf(stderr, "metal_blur_disp_dhw3: pipeline not found\n");
+        return;
+    }
+
+    /* Batch all 3 axis dispatches into one command buffer.
+     * Metal guarantees sequential execution within a command buffer. */
+    int was_batching = g_metal.batch_active;
+    if (!was_batching) metal_begin_batch();
+
     /* Axis 0 (D): data -> scratch */
-    {
-        void *pso = metal_get_pipeline("blur_dhw3_axis0");
-        if (!pso) {
-            fprintf(stderr, "metal_blur_disp_dhw3: blur_dhw3_axis0 pipeline not found\n");
-            return;
-        }
-        const void *bufs[] = { data, scratch, kernel_data };
-        size_t sizes[] = {
-            (size_t)total * sizeof(float),
-            (size_t)total * sizeof(float),
-            (size_t)klen * sizeof(float)
-        };
-        metal_dispatch(pso, bufs, sizes, 3, &params, sizeof(params), total);
-    }
-
+    const void *bufs0[] = { data, scratch, kernel_data };
+    metal_dispatch(pso0, bufs0, NULL, 3, &params, sizeof(params), total);
     /* Axis 1 (H): scratch -> data */
-    {
-        void *pso = metal_get_pipeline("blur_dhw3_axis1");
-        if (!pso) {
-            fprintf(stderr, "metal_blur_disp_dhw3: blur_dhw3_axis1 pipeline not found\n");
-            return;
-        }
-        const void *bufs[] = { scratch, data, kernel_data };
-        size_t sizes[] = {
-            (size_t)total * sizeof(float),
-            (size_t)total * sizeof(float),
-            (size_t)klen * sizeof(float)
-        };
-        metal_dispatch(pso, bufs, sizes, 3, &params, sizeof(params), total);
-    }
-
+    const void *bufs1[] = { scratch, data, kernel_data };
+    metal_dispatch(pso1, bufs1, NULL, 3, &params, sizeof(params), total);
     /* Axis 2 (W): data -> scratch */
-    {
-        void *pso = metal_get_pipeline("blur_dhw3_axis2");
-        if (!pso) {
-            fprintf(stderr, "metal_blur_disp_dhw3: blur_dhw3_axis2 pipeline not found\n");
-            return;
-        }
-        const void *bufs[] = { data, scratch, kernel_data };
-        size_t sizes[] = {
-            (size_t)total * sizeof(float),
-            (size_t)total * sizeof(float),
-            (size_t)klen * sizeof(float)
-        };
-        metal_dispatch(pso, bufs, sizes, 3, &params, sizeof(params), total);
-    }
+    const void *bufs2[] = { data, scratch, kernel_data };
+    metal_dispatch(pso2, bufs2, NULL, 3, &params, sizeof(params), total);
+
+    if (!was_batching) metal_flush_batch();
 
     /* Copy result back: scratch -> data (unified memory) */
-    metal_sync();
     memcpy(data, scratch, (size_t)total * sizeof(float));
 }
 
@@ -988,10 +975,8 @@ void metal_mi_loss_3d(const float *pred, const float *target,
 
 /* --- Vector add: out[i] = a[i] + b[i] --- */
 void metal_vec_add(float *out, const float *a, const float *b, int n) {
-    /* Use tensor_axpy pattern: copy a to out, then axpy with b */
-    /* For simplicity and to avoid needing a new shader, do on CPU
-       since unified memory makes this fast. */
-    metal_sync();
+    /* CPU loop on unified memory — no sync needed since prior dispatches
+     * already called waitUntilCompleted (data is CPU-visible). */
     for (int i = 0; i < n; i++)
         out[i] = a[i] + b[i];
 }
@@ -1149,19 +1134,21 @@ void metal_warp_inverse(const float *u, float *inv_u, int D, int H, int W, int n
 
         warp_params_t params = { .D = (uint32_t)D, .H = (uint32_t)H, .W = (uint32_t)W, ._pad = 0 };
 
-        for (int iter = 0; iter < n_iters; iter++) {
-            /* out = -interp(u, identity + inv_u)
-             * Alternate between inv_u->tmp and tmp->inv_u */
-            float *src = (iter % 2 == 0) ? inv_u : d_tmp;
-            float *dst = (iter % 2 == 0) ? d_tmp : inv_u;
-
-            const void *bufs[] = { u, src, dst };
-            size_t sizes[] = {
-                (size_t)n3 * sizeof(float),
-                (size_t)n3 * sizeof(float),
-                (size_t)n3 * sizeof(float)
-            };
-            metal_dispatch(iter_pso, bufs, sizes, 3, &params, sizeof(params), spatial);
+        /* Batch iterations into chunks of 50 for command buffer efficiency.
+         * Each chunk: 50 dispatches in one command buffer (Metal guarantees order). */
+        int chunk = 50;
+        for (int iter = 0; iter < n_iters; ) {
+            int end = iter + chunk;
+            if (end > n_iters) end = n_iters;
+            metal_begin_batch();
+            for (int i = iter; i < end; i++) {
+                float *src = (i % 2 == 0) ? inv_u : d_tmp;
+                float *dst = (i % 2 == 0) ? d_tmp : inv_u;
+                const void *bufs[] = { u, src, dst };
+                metal_dispatch(iter_pso, bufs, NULL, 3, &params, sizeof(params), spatial);
+            }
+            metal_flush_batch();
+            iter = end;
         }
 
         /* If n_iters is odd, result is in d_tmp; copy back to inv_u */
