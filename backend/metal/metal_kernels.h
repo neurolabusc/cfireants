@@ -103,6 +103,16 @@ void metal_mi_loss_3d(const float *pred, const float *target,
                        int D, int H, int W,
                        int num_bins, float *h_loss_out);
 
+/* --- Phase 6b: WarpAdam GPU kernels --- */
+
+/* WarpAdam moments update on GPU (replaces CPU loop) */
+void metal_warp_adam_moments(const float *grad, float *exp_avg, float *exp_avg_sq,
+                              float beta1, float beta2, int n);
+
+/* WarpAdam direction computation on GPU */
+void metal_warp_adam_direction(float *output, const float *exp_avg, const float *exp_avg_sq,
+                                float bc1, float bc2, float eps, int n);
+
 /* --- Phase 7: Deformable registration ops --- */
 
 /* Vector add: out[i] = a[i] + b[i] */

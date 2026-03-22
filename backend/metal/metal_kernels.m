@@ -970,6 +970,48 @@ void metal_mi_loss_3d(const float *pred, const float *target,
 }
 
 /* ================================================================== */
+/* Phase 6b: WarpAdam GPU kernels                                      */
+/* ================================================================== */
+
+void metal_warp_adam_moments(const float *grad, float *exp_avg, float *exp_avg_sq,
+                              float beta1, float beta2, int n) {
+    void *pso = metal_get_pipeline("warp_adam_moments");
+    if (!pso) {
+        /* CPU fallback */
+        metal_sync();
+        for (int i = 0; i < n; i++) {
+            float g = grad[i];
+            exp_avg[i] = beta1 * exp_avg[i] + (1.0f - beta1) * g;
+            exp_avg_sq[i] = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g * g;
+        }
+        return;
+    }
+    typedef struct { uint32_t n; float beta1, beta2; uint32_t _pad; } p_t;
+    p_t params = { (uint32_t)n, beta1, beta2, 0 };
+    const void *bufs[] = { grad, exp_avg, exp_avg_sq };
+    metal_dispatch(pso, bufs, NULL, 3, &params, sizeof(params), (uint32_t)n);
+}
+
+void metal_warp_adam_direction(float *output, const float *exp_avg, const float *exp_avg_sq,
+                                float bc1, float bc2, float eps, int n) {
+    void *pso = metal_get_pipeline("warp_adam_direction");
+    if (!pso) {
+        /* CPU fallback */
+        metal_sync();
+        for (int i = 0; i < n; i++) {
+            float m_hat = exp_avg[i] / bc1;
+            float v_hat = exp_avg_sq[i] / bc2;
+            output[i] = m_hat / (sqrtf(v_hat) + eps);
+        }
+        return;
+    }
+    typedef struct { uint32_t n; float bc1, bc2, eps; } p_t;
+    p_t params = { (uint32_t)n, bc1, bc2, eps };
+    const void *bufs[] = { output, exp_avg, exp_avg_sq };
+    metal_dispatch(pso, bufs, NULL, 3, &params, sizeof(params), (uint32_t)n);
+}
+
+/* ================================================================== */
 /* Phase 7: Deformable registration ops                                */
 /* ================================================================== */
 

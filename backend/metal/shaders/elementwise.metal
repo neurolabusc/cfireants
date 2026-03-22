@@ -69,3 +69,41 @@ kernel void adam_step(device float *param [[buffer(0)]],
 
     param[gid] -= p.lr * m_hat / (sqrt(v_hat) + p.eps);
 }
+
+// WarpAdam moments update: exp_avg/exp_avg_sq updated from gradient
+struct WarpAdamMomentsParams {
+    uint n;
+    float beta1;
+    float beta2;
+    uint _pad;
+};
+
+kernel void warp_adam_moments(const device float *grad [[buffer(0)]],
+                              device float *exp_avg [[buffer(1)]],
+                              device float *exp_avg_sq [[buffer(2)]],
+                              constant WarpAdamMomentsParams &p [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    float g = grad[gid];
+    exp_avg[gid] = p.beta1 * exp_avg[gid] + (1.0f - p.beta1) * g;
+    exp_avg_sq[gid] = p.beta2 * exp_avg_sq[gid] + (1.0f - p.beta2) * g * g;
+}
+
+// WarpAdam direction: output = (exp_avg/bc1) / (sqrt(exp_avg_sq/bc2) + eps)
+struct WarpAdamDirParams {
+    uint n;
+    float bc1;
+    float bc2;
+    float eps;
+};
+
+kernel void warp_adam_direction(device float *output [[buffer(0)]],
+                                const device float *exp_avg [[buffer(1)]],
+                                const device float *exp_avg_sq [[buffer(2)]],
+                                constant WarpAdamDirParams &p [[buffer(3)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    float m_hat = exp_avg[gid] / p.bc1;
+    float v_hat = exp_avg_sq[gid] / p.bc2;
+    output[gid] = m_hat / (sqrt(v_hat) + p.eps);
+}

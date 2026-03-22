@@ -98,20 +98,9 @@ static void syn_warp_adam_step(
     float bc1 = 1.0f - powf(beta1, (float)*step_t);
     float bc2 = 1.0f - powf(beta2, (float)*step_t);
 
-    /* Update moments and compute direction on CPU (unified memory) */
-    metal_sync();
-
-    for (long i = 0; i < n3; i++) {
-        float g = d_grad[i];
-        d_exp_avg[i] = beta1 * d_exp_avg[i] + (1.0f - beta1) * g;
-        d_exp_avg_sq[i] = beta2 * d_exp_avg_sq[i] + (1.0f - beta2) * g * g;
-    }
-
-    for (long i = 0; i < n3; i++) {
-        float m_hat = d_exp_avg[i] / bc1;
-        float v_hat = d_exp_avg_sq[i] / bc2;
-        d_adam_dir[i] = m_hat / (sqrtf(v_hat) + eps);
-    }
+    /* Update moments and compute direction on GPU */
+    metal_warp_adam_moments(d_grad, d_exp_avg, d_exp_avg_sq, beta1, beta2, (int)n3);
+    metal_warp_adam_direction(d_adam_dir, d_exp_avg, d_exp_avg_sq, bc1, bc2, eps, (int)n3);
 
     /* Normalize: gradmax = eps + max(||adam_dir||_2), clamp min=1 */
     float gradmax = metal_max_l2_norm(d_adam_dir, (int)spatial);
@@ -119,8 +108,7 @@ static void syn_warp_adam_step(
     float half_res = 1.0f / (float)((D > H ? (D > W ? D : W) : (H > W ? H : W)) - 1);
     float scale = half_res / gradmax * (-lr);
 
-    for (long i = 0; i < n3; i++)
-        d_adam_dir[i] *= scale;
+    metal_tensor_scale(d_adam_dir, scale, (int)n3);
 
     /* Fused compositive update: adam_dir = adam_dir + interp(warp, identity + adam_dir) */
     metal_fused_compositive_update(d_warp, d_adam_dir, d_adam_dir, D, H, W);

@@ -277,34 +277,23 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
                                       d_grad_kernel, grad_klen);
 
             /* Step 5: WarpAdam.step() — compositive update */
-            /* 5a. Update moments on CPU (unified memory makes this trivial) */
+            /* 5a-b. Update moments and compute direction on GPU */
             step_t++;
             float bc1 = 1.0f - powf(beta1, (float)step_t);
             float bc2 = 1.0f - powf(beta2, (float)step_t);
 
-            metal_sync();  /* ensure GPU writes to grad_grid are visible */
-
-            for (long i = 0; i < n3; i++) {
-                float g = d_grad_grid[i];
-                d_exp_avg[i] = beta1 * d_exp_avg[i] + (1.0f - beta1) * g;
-                d_exp_avg_sq[i] = beta2 * d_exp_avg_sq[i] + (1.0f - beta2) * g * g;
-            }
-
-            /* 5b. Compute Adam direction: adam_dir = m_hat / (sqrt(v_hat) + eps) */
-            for (long i = 0; i < n3; i++) {
-                float m_hat = d_exp_avg[i] / bc1;
-                float v_hat = d_exp_avg_sq[i] / bc2;
-                d_adam_dir[i] = m_hat / (sqrtf(v_hat) + eps);
-            }
+            metal_warp_adam_moments(d_grad_grid, d_exp_avg, d_exp_avg_sq,
+                                    beta1, beta2, (int)n3);
+            metal_warp_adam_direction(d_adam_dir, d_exp_avg, d_exp_avg_sq,
+                                      bc1, bc2, eps, (int)n3);
 
             /* 5c. Normalize: gradmax = eps + max(||adam_dir||_2 per voxel) */
             float gradmax = metal_max_l2_norm(d_adam_dir, (int)spatial);
-            if (gradmax < 1.0f) gradmax = 1.0f;  /* clamp min=1 */
+            if (gradmax < 1.0f) gradmax = 1.0f;
             float scale_factor = half_resolution / gradmax * (-opts.lr);
 
-            /* 5d. adam_dir *= (-lr * half_resolution / gradmax) */
-            for (long i = 0; i < n3; i++)
-                d_adam_dir[i] *= scale_factor;
+            /* 5d. adam_dir *= scale on GPU */
+            metal_tensor_scale(d_adam_dir, scale_factor, (int)n3);
 
             /* 5e. Fused compositive update: adam_dir = adam_dir + interp(warp, identity + adam_dir) */
             metal_fused_compositive_update(d_warp, d_adam_dir, d_adam_dir, dD, dH, dW);
