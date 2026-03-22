@@ -25,6 +25,11 @@ extern "C" {
 int cpu_cc_loss_3d(const tensor_t *pred, const tensor_t *target,
                    int kernel_size, float *loss_out, tensor_t *grad_pred);
 
+/* CC loss with both pred AND target gradients (for SyN) */
+int cpu_cc_loss_3d_both(const tensor_t *pred, const tensor_t *target,
+                         int kernel_size, float *loss_out,
+                         tensor_t *grad_pred, tensor_t *grad_target);
+
 /* Global mutual information loss (CPU).
  * Matches fireants GlobalMutualInformationLoss with
  * kernel_type='gaussian', reduction='mean'.

@@ -320,6 +320,7 @@ if(CFIREANTS_METAL)
 
     add_executable(test_cpu_vs_metal tests/test_cpu_vs_metal.c
         src/registration/moments.c src/registration/rigid.c
-        src/registration/affine.c src/registration/greedy.c)
+        src/registration/affine.c src/registration/greedy.c
+        src/registration/syn.c)
     target_link_libraries(test_cpu_vs_metal cfireants cfireants_gpu)
 endif()

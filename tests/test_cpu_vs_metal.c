@@ -66,9 +66,11 @@ int main(int argc, char **argv) {
 
     /* Use CC for all stages so CPU and Metal are directly comparable.
      * MI would also work but CC is simpler to debug differences. */
-    int use_mi = 0;
-    for (int i = 1; i < argc; i++)
+    int use_mi = 0, use_syn = 0;
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mi") == 0) use_mi = 1;
+        if (strcmp(argv[i], "--syn") == 0) use_syn = 1;
+    }
 
     int loss_type = use_mi ? LOSS_MI : LOSS_CC;
     const char *loss_name = use_mi ? "MI" : "CC";
@@ -207,6 +209,47 @@ int main(int argc, char **argv) {
     printf("  %s\n", ncc_diff < 0.05f ? "PASS (diff < 0.05)" : "*** LARGE DIFF ***");
 
     /* ============================================================ */
+    /* Stage 5: SyN (optional — slow on CPU)                         */
+    /* ============================================================ */
+    float syn_ncc_cpu = 0, syn_ncc_metal = 0, syn_ncc_diff = 0;
+    if (use_syn) {
+        printf("\n--- Stage 5: SyN (CC) ---\n");
+        int ss[] = {4, 2, 1}, si_arr[] = {200, 100, 50};
+        syn_opts_t sopts = {
+            .n_scales = 3, .scales = ss, .iterations = si_arr,
+            .cc_kernel_size = 5, .lr = 0.1f,
+            .smooth_warp_sigma = 0.5f, .smooth_grad_sigma = 1.0f,
+            .tolerance = 1e-6f, .max_tolerance_iters = 10,
+            .downsample_mode = DOWNSAMPLE_TRILINEAR };
+
+        t0 = get_time();
+        syn_result_t syn_cpu;
+        syn_register(&fixed, &moving, aff44_cpu, sopts, &syn_cpu);
+        double t_syn_cpu = get_time() - t0;
+
+        t0 = get_time();
+        syn_result_t syn_metal;
+        syn_register_metal(&fixed, &moving, aff44_metal, sopts, &syn_metal);
+        double t_syn_metal = get_time() - t0;
+
+        syn_ncc_cpu = compute_global_ncc((float *)fixed.data.data,
+                                          (float *)syn_cpu.moved.data, fN);
+        syn_ncc_metal = compute_global_ncc((float *)fixed.data.data,
+                                            (float *)syn_metal.moved.data, fN);
+        syn_ncc_diff = fabsf(syn_ncc_cpu - syn_ncc_metal);
+
+        printf("  CPU:   Global NCC = %.4f  Local NCC Loss = %.4f  Time = %.1fs\n",
+               syn_ncc_cpu, syn_cpu.ncc_loss, t_syn_cpu);
+        printf("  Metal: Global NCC = %.4f  Local NCC Loss = %.4f  Time = %.1fs\n",
+               syn_ncc_metal, syn_metal.ncc_loss, t_syn_metal);
+        printf("  Global NCC diff: %.4f\n", syn_ncc_diff);
+        printf("  %s\n", syn_ncc_diff < 0.05f ? "PASS (diff < 0.05)" : "*** LARGE DIFF ***");
+
+        tensor_free(&syn_cpu.moved);
+        tensor_free(&syn_metal.moved);
+    }
+
+    /* ============================================================ */
     /* Summary                                                       */
     /* ============================================================ */
     printf("\n=== Summary ===\n");
@@ -217,6 +260,10 @@ int main(int argc, char **argv) {
     printf("  Greedy: NCC diff = %.4f  CPU=%.4f Metal=%.4f  %s\n",
            ncc_diff, ncc_cpu, ncc_metal,
            ncc_diff < 0.05f ? "OK" : "FAIL");
+    if (use_syn)
+        printf("  SyN:    NCC diff = %.4f  CPU=%.4f Metal=%.4f  %s\n",
+               syn_ncc_diff, syn_ncc_cpu, syn_ncc_metal,
+               syn_ncc_diff < 0.05f ? "OK" : "FAIL");
 
     tensor_free(&greedy_cpu.moved);
     tensor_free(&greedy_metal.moved);

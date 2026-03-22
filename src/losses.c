@@ -267,6 +267,112 @@ int cpu_cc_loss_3d(const tensor_t *pred, const tensor_t *target,
     return 0;
 }
 
+/* CC loss with both pred and target gradients (for SyN fused CC) */
+int cpu_cc_loss_3d_both(const tensor_t *pred, const tensor_t *target,
+                         int kernel_size, float *loss_out,
+                         tensor_t *grad_pred, tensor_t *grad_target) {
+    int B = pred->shape[0], C = pred->shape[1];
+    int D = pred->shape[2], H = pred->shape[3], W = pred->shape[4];
+    size_t spatial = (size_t)D * H * W;
+    float smooth_nr = 1e-5f, smooth_dr = 1e-5f;
+    size_t total_count = (size_t)B * C * D * H * W;
+
+    int shape[5] = {B, C, D, H, W};
+    if (grad_pred) tensor_alloc(grad_pred, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
+    if (grad_target) tensor_alloc(grad_target, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
+
+    const float *P = tensor_data_f32(pred);
+    const float *T = tensor_data_f32(target);
+
+    float *p_sum = (float *)malloc(spatial*sizeof(float));
+    float *t_sum = (float *)malloc(spatial*sizeof(float));
+    float *p2_sum = (float *)malloc(spatial*sizeof(float));
+    float *t2_sum = (float *)malloc(spatial*sizeof(float));
+    float *tp_sum = (float *)malloc(spatial*sizeof(float));
+    float *work = (float *)malloc(spatial*sizeof(float));
+    float *tmp = (float *)malloc(spatial*sizeof(float));
+
+    double total_loss = 0;
+
+    for (int b = 0; b < B; b++) {
+        for (int c = 0; c < C; c++) {
+            const float *Pbc = P + (b*C+c)*spatial;
+            const float *Tbc = T + (b*C+c)*spatial;
+
+            separable_box_filter_3d(Pbc, p_sum, D, H, W, kernel_size, tmp);
+            separable_box_filter_3d(Tbc, t_sum, D, H, W, kernel_size, tmp);
+            for (size_t i=0;i<spatial;i++) work[i]=Pbc[i]*Pbc[i];
+            separable_box_filter_3d(work, p2_sum, D, H, W, kernel_size, tmp);
+            for (size_t i=0;i<spatial;i++) work[i]=Tbc[i]*Tbc[i];
+            separable_box_filter_3d(work, t2_sum, D, H, W, kernel_size, tmp);
+            for (size_t i=0;i<spatial;i++) work[i]=Tbc[i]*Pbc[i];
+            separable_box_filter_3d(work, tp_sum, D, H, W, kernel_size, tmp);
+
+            /* Per-voxel source terms for both pred and target gradients */
+            float *src_p=NULL, *src_p2=NULL, *src_tp_p=NULL;
+            float *src_t=NULL, *src_t2=NULL, *src_tp_t=NULL;
+            if (grad_pred)  { src_p=calloc(spatial,4); src_p2=calloc(spatial,4); src_tp_p=calloc(spatial,4); }
+            if (grad_target) { src_t=calloc(spatial,4); src_t2=calloc(spatial,4); src_tp_t=calloc(spatial,4); }
+
+            for (size_t i = 0; i < spatial; i++) {
+                float ps=p_sum[i], ts=t_sum[i];
+                float cross = tp_sum[i] - ps*ts;
+                float p_var = p2_sum[i] - ps*ps;
+                float t_var = t2_sum[i] - ts*ts;
+                if (p_var < smooth_dr) p_var = smooth_dr;
+                if (t_var < smooth_dr) t_var = smooth_dr;
+                float f = cross*cross + smooth_nr;
+                float g = p_var*t_var + smooth_dr;
+                float ncc = f/g;
+                if (ncc>1.0f) ncc=1.0f;
+                if (ncc<-1.0f) ncc=-1.0f;
+                total_loss += ncc;
+
+                float g2 = g*g;
+                if (grad_pred) {
+                    src_tp_p[i] = 2.0f*cross*g / g2;
+                    src_p2[i] = -f*t_var / g2;
+                    src_p[i] = (-2.0f*cross*ts*g + 2.0f*f*ps*t_var) / g2;
+                }
+                if (grad_target) {
+                    src_tp_t[i] = 2.0f*cross*g / g2;  /* same as pred */
+                    src_t2[i] = -f*p_var / g2;         /* swapped: p_var instead of t_var */
+                    src_t[i] = (-2.0f*cross*ps*g + 2.0f*f*ts*p_var) / g2; /* swapped */
+                }
+            }
+
+            float inv_count = 1.0f / total_count;
+            if (grad_pred) {
+                float *gp = tensor_data_f32(grad_pred) + (b*C+c)*spatial;
+                float *adj_p=malloc(spatial*4), *adj_p2=malloc(spatial*4), *adj_tp=malloc(spatial*4);
+                separable_box_filter_3d(src_p, adj_p, D, H, W, kernel_size, tmp);
+                separable_box_filter_3d(src_p2, adj_p2, D, H, W, kernel_size, tmp);
+                separable_box_filter_3d(src_tp_p, adj_tp, D, H, W, kernel_size, tmp);
+                for (size_t i=0;i<spatial;i++)
+                    gp[i] = -inv_count * (adj_p[i] + 2.0f*Pbc[i]*adj_p2[i] + Tbc[i]*adj_tp[i]);
+                free(adj_p); free(adj_p2); free(adj_tp);
+                free(src_p); free(src_p2); free(src_tp_p);
+            }
+            if (grad_target) {
+                float *gt = tensor_data_f32(grad_target) + (b*C+c)*spatial;
+                float *adj_t=malloc(spatial*4), *adj_t2=malloc(spatial*4), *adj_tp=malloc(spatial*4);
+                separable_box_filter_3d(src_t, adj_t, D, H, W, kernel_size, tmp);
+                separable_box_filter_3d(src_t2, adj_t2, D, H, W, kernel_size, tmp);
+                separable_box_filter_3d(src_tp_t, adj_tp, D, H, W, kernel_size, tmp);
+                for (size_t i=0;i<spatial;i++)
+                    gt[i] = -inv_count * (adj_t[i] + 2.0f*Tbc[i]*adj_t2[i] + Pbc[i]*adj_tp[i]);
+                free(adj_t); free(adj_t2); free(adj_tp);
+                free(src_t); free(src_t2); free(src_tp_t);
+            }
+        }
+    }
+
+    if (loss_out) *loss_out = -(float)(total_loss / total_count);
+    free(p_sum); free(t_sum); free(p2_sum); free(t2_sum);
+    free(tp_sum); free(work); free(tmp);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Mutual Information loss (Gaussian Parzen windowing)                 */
 /* ------------------------------------------------------------------ */
