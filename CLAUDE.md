@@ -81,6 +81,11 @@ build/test_validate_metal --dataset small --trilinear   # Full pipeline (MI+CC, 
 build/test_validate_metal --dataset small --trilinear --greedy  # Greedy deformable
 build/test_cpu_vs_metal                                    # CPU vs Metal stage-by-stage comparison
 build/test_cpu_vs_metal --syn                              # Include SyN comparison (slow)
+
+# CLI tool (ANTs-style arguments)
+build/cfireants_reg -f fixed.nii.gz -m moving.nii.gz -o out_  # Default SyN pipeline
+build/cfireants_reg -f fixed.nii.gz -m moving.nii.gz --affine -o out_  # Affine only
+build/cfireants_reg -f fixed.nii.gz -m moving.nii.gz --greedy --trilinear -o out_
 ```
 
 ## Architecture

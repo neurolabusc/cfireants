@@ -83,6 +83,7 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
 | `--affine` | Preset: Rigid + Affine |
 | `--syn` | Preset: Rigid + Affine + SyN (default) |
 | `--greedy` | Preset: Rigid + Affine + Greedy |
+| `-v, --verbose` | Print per-iteration loss |
 
 ### Per-stage options
 
@@ -92,6 +93,7 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
 | `--metric Type[param]` | `MI[bins]` or `CC[kernel_size]` |
 | `--convergence [iters,tol,win]` | Iterations per level (e.g., `200x100x50`), tolerance, window |
 | `--shrink-factors NxNx...` | Downsample factors per level (e.g., `4x2x1`) |
+| `--smoothing-sigmas NxNx...` | Blur sigmas per level (reserved for future use) |
 
 ### Output
 

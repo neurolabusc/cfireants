@@ -30,6 +30,9 @@ extern int cfireants_init_metal(void);
 #ifdef CFIREANTS_HAS_WEBGPU
 extern int cfireants_init_webgpu(void);
 #endif
+#ifdef CFIREANTS_HAS_CUDA
+extern int cfireants_init_cuda(void);
+#endif
 
 /* Maximum registration stages */
 #define MAX_STAGES 8
@@ -319,7 +322,10 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
     cfg->backend = BACKEND_WEBGPU;
 #endif
 
-    int current_stage = -1; /* index into cfg->stages, -1 = no stage yet */
+    int current_stage = -1;
+
+    #define NEED_ARG() do { if (i + 1 >= argc) { \
+        fprintf(stderr, "Missing value for %s\n", arg); return -1; } } while(0)
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -327,13 +333,13 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
         if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             print_usage(argv[0]); return -1;
         } else if (strcmp(arg, "-f") == 0 || strcmp(arg, "--fixed") == 0) {
-            cfg->fixed_path = argv[++i];
+            NEED_ARG(); cfg->fixed_path = argv[++i];
         } else if (strcmp(arg, "-m") == 0 || strcmp(arg, "--moving") == 0) {
-            cfg->moving_path = argv[++i];
+            NEED_ARG(); cfg->moving_path = argv[++i];
         } else if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
-            cfg->output_prefix = argv[++i];
+            NEED_ARG(); cfg->output_prefix = argv[++i];
         } else if (strcmp(arg, "-w") == 0 || strcmp(arg, "--warped") == 0) {
-            cfg->output_warped = argv[++i];
+            NEED_ARG(); cfg->output_warped = argv[++i];
         } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             cfg->verbose = 1;
         } else if (strcmp(arg, "--trilinear") == 0) {
@@ -343,7 +349,7 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
         } else if (strcmp(arg, "--no-moments") == 0) {
             cfg->initial_moving_transform = 0;
         } else if (strcmp(arg, "--backend") == 0) {
-            const char *b = argv[++i];
+            NEED_ARG(); const char *b = argv[++i];
             if (strcmp(b, "cpu") == 0) cfg->backend = BACKEND_CPU;
             else if (strcmp(b, "metal") == 0) cfg->backend = BACKEND_METAL;
             else if (strcmp(b, "webgpu") == 0) cfg->backend = BACKEND_WEBGPU;
@@ -367,21 +373,21 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
             int di[] = {200, 100, 50}; memcpy(s->iterations, di, sizeof(di));
             int ds[] = {4, 2, 1}; memcpy(s->shrink_factors, ds, sizeof(ds));
             s->tolerance = 1e-6f; s->tolerance_window = 10;
-            if (parse_transform(argv[++i], s) != 0) return -1;
+            NEED_ARG(); if (parse_transform(argv[++i], s) != 0) return -1;
         } else if (strcmp(arg, "--metric") == 0) {
             if (current_stage < 0) { fprintf(stderr, "--metric before --transform\n"); return -1; }
-            if (parse_metric(argv[++i], &cfg->stages[current_stage]) != 0) return -1;
+            NEED_ARG(); if (parse_metric(argv[++i], &cfg->stages[current_stage]) != 0) return -1;
         } else if (strcmp(arg, "--convergence") == 0) {
             if (current_stage < 0) { fprintf(stderr, "--convergence before --transform\n"); return -1; }
-            if (parse_convergence(argv[++i], &cfg->stages[current_stage]) != 0) return -1;
+            NEED_ARG(); if (parse_convergence(argv[++i], &cfg->stages[current_stage]) != 0) return -1;
         } else if (strcmp(arg, "--shrink-factors") == 0) {
             if (current_stage < 0) { fprintf(stderr, "--shrink-factors before --transform\n"); return -1; }
             stage_config_t *s = &cfg->stages[current_stage];
-            int n = parse_xlist_int(argv[++i], s->shrink_factors, MAX_LEVELS);
+            NEED_ARG(); int n = parse_xlist_int(argv[++i], s->shrink_factors, MAX_LEVELS);
             if (s->n_levels == 0) s->n_levels = n;
         } else if (strcmp(arg, "--smoothing-sigmas") == 0) {
             if (current_stage < 0) { fprintf(stderr, "--smoothing-sigmas before --transform\n"); return -1; }
-            parse_xlist_float(argv[++i], cfg->stages[current_stage].smoothing_sigmas, MAX_LEVELS);
+            NEED_ARG(); parse_xlist_float(argv[++i], cfg->stages[current_stage].smoothing_sigmas, MAX_LEVELS);
         } else {
             fprintf(stderr, "Unknown argument: %s\n", arg);
             print_usage(argv[0]);
@@ -430,6 +436,12 @@ int main(int argc, char **argv) {
 #else
         fprintf(stderr, "WebGPU not compiled in\n"); return 1;
 #endif
+    } else if (cfg.backend == BACKEND_CUDA) {
+#ifdef CFIREANTS_HAS_CUDA
+        if (cfireants_init_cuda() != 0) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+#else
+        fprintf(stderr, "CUDA not compiled in\n"); return 1;
+#endif
     }
 
     /* Load images */
@@ -457,6 +469,8 @@ int main(int argc, char **argv) {
     moments_result_t mom;
     memset(&mom, 0, sizeof(mom));
     mom.Rf[0][0] = mom.Rf[1][1] = mom.Rf[2][2] = 1.0f;
+    /* Identity affine [3x4] for --no-moments case */
+    mom.affine[0][0] = mom.affine[1][1] = mom.affine[2][2] = 1.0f;
 
     if (cfg.initial_moving_transform) {
         double t0 = get_time();
@@ -507,6 +521,9 @@ int main(int argc, char **argv) {
             int rc;
             switch (cfg.backend) {
 #ifdef CFIREANTS_HAS_METAL
+#ifdef CFIREANTS_HAS_CUDA
+                case BACKEND_CUDA: rc = rigid_register_gpu(&fixed, &moving, &mom, opts, &result); break;
+#endif
                 case BACKEND_METAL: rc = rigid_register_metal(&fixed, &moving, &mom, opts, &result); break;
 #endif
 #ifdef CFIREANTS_HAS_WEBGPU
@@ -536,6 +553,9 @@ int main(int argc, char **argv) {
             int rc;
             switch (cfg.backend) {
 #ifdef CFIREANTS_HAS_METAL
+#ifdef CFIREANTS_HAS_CUDA
+                case BACKEND_CUDA: rc = affine_register_gpu(&fixed, &moving, rigid_mat, opts, &result); break;
+#endif
                 case BACKEND_METAL: rc = affine_register_metal(&fixed, &moving, rigid_mat, opts, &result); break;
 #endif
 #ifdef CFIREANTS_HAS_WEBGPU
@@ -569,6 +589,9 @@ int main(int argc, char **argv) {
             int rc;
             switch (cfg.backend) {
 #ifdef CFIREANTS_HAS_METAL
+#ifdef CFIREANTS_HAS_CUDA
+                case BACKEND_CUDA: rc = syn_register_gpu(&fixed, &moving, affine_44, opts, &result); break;
+#endif
                 case BACKEND_METAL: rc = syn_register_metal(&fixed, &moving, affine_44, opts, &result); break;
 #endif
 #ifdef CFIREANTS_HAS_WEBGPU
@@ -599,6 +622,9 @@ int main(int argc, char **argv) {
             int rc;
             switch (cfg.backend) {
 #ifdef CFIREANTS_HAS_METAL
+#ifdef CFIREANTS_HAS_CUDA
+                case BACKEND_CUDA: rc = greedy_register_gpu(&fixed, &moving, affine_44, opts, &result); break;
+#endif
                 case BACKEND_METAL: rc = greedy_register_metal(&fixed, &moving, affine_44, opts, &result); break;
 #endif
 #ifdef CFIREANTS_HAS_WEBGPU
