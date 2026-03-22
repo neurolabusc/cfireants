@@ -11,8 +11,8 @@ struct AffineGridParams {
 @group(0) @binding(2) var<uniform> p: AffineGridParams;
 
 @compute @workgroup_size(256)
-fn affine_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn affine_grid(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 256u;
     let total = p.B * p.D * p.H * p.W;
     if (idx >= total) { return; }
 

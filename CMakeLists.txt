@@ -124,6 +124,9 @@ target_link_libraries(test_phase2 cfireants cfireants_gpu)
 add_executable(test_validate_all tests/test_validate_all.c
     src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
 target_link_libraries(test_validate_all cfireants cfireants_gpu)
+if(CFIREANTS_CUDA)
+    target_include_directories(test_validate_all PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+endif()
 
 add_executable(test_gpu_pipeline tests/test_gpu_pipeline.c
     src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
@@ -281,6 +284,9 @@ add_executable(test_validate_greedy tests/test_validate_all.c
     src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
 target_compile_definitions(test_validate_greedy PRIVATE USE_GREEDY)
 target_link_libraries(test_validate_greedy cfireants cfireants_gpu)
+if(CFIREANTS_CUDA)
+    target_include_directories(test_validate_greedy PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+endif()
 
 # WebGPU tests
 if(CFIREANTS_WEBGPU)

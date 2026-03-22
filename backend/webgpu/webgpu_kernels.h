@@ -56,6 +56,15 @@ void wgpu_adam_step(
 
 /* --- CC loss --- */
 
+/* Fused CC loss matching CUDA fused_cc.cu: computes loss and both gradients
+ * in a single pass using shared intermediates. For SyN which needs both. */
+void wgpu_fused_cc_loss(
+    WGPUBuffer pred, WGPUBuffer target,
+    WGPUBuffer grad_pred,          /* may be NULL */
+    WGPUBuffer grad_target,        /* may be NULL */
+    int D, int H, int W, int ks,
+    float *h_loss_out);            /* may be NULL */
+
 void wgpu_cc_loss_3d_raw(
     WGPUBuffer pred, WGPUBuffer target,
     WGPUBuffer grad_pred,   /* may be NULL if no gradient needed */
@@ -75,6 +84,23 @@ void wgpu_mi_loss_3d_raw(
 void webgpu_downsample_fft(
     const float *input, float *output,
     int B, int C, int iD, int iH, int iW, int oD, int oH, int oW);
+
+/* --- Blur + trilinear downsample (GPU-native, no FFT) --- */
+
+void wgpu_blur_downsample(
+    WGPUBuffer input, WGPUBuffer output,
+    int B, int C, int iD, int iH, int iW, int oD, int oH, int oW);
+
+/* --- Downsample with mode selection (shared helper for all registration loops) --- */
+/* mode: DOWNSAMPLE_FFT (0) or DOWNSAMPLE_TRILINEAR (1) from registration.h
+ * Returns a NEW buffer (caller must release) containing the downsampled image. */
+WGPUBuffer wgpu_downsample_image(WGPUBuffer src, int iD, int iH, int iW,
+                                  int oD, int oH, int oW, int mode);
+
+/* --- Per-axis GPU Gaussian blur on a single [D,H,W] volume (in-place) --- */
+
+void wgpu_blur_volume(WGPUBuffer data, int D, int H, int W,
+                       float sigma_d, float sigma_h, float sigma_w);
 
 /* --- Separable Gaussian blur --- */
 

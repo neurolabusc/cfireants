@@ -248,7 +248,10 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
         int moving_blur_owned = 0;
         if (scale > 1) {
             cudaMalloc(&d_fixed_down, spatial*sizeof(float));
-            cuda_downsample_fft(d_fixed, d_fixed_down, 1,1,fD,fH,fW,dD,dH,dW);
+            if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR)
+                cuda_blur_downsample(d_fixed, d_fixed_down, 1,1,fD,fH,fW,dD,dH,dW);
+            else
+                cuda_downsample_fft(d_fixed, d_fixed_down, 1,1,fD,fH,fW,dD,dH,dW);
 
             /* Python: moving_image_blur = self._smooth_image_not_mask(moving_arrays, gaussians)
              * Applies Gaussian blur at full resolution without downsampling.

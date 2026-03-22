@@ -18,8 +18,8 @@ struct GP { n: u32, num_bins: u32, inv_maxval: f32, preterm: f32,
 @group(0) @binding(6) var<uniform> gpp: GP;
 
 @compute @workgroup_size(256)
-fn mi_gradient(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x; if (i >= gpp.n) { return; }
+fn mi_gradient(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u; if (i >= gpp.n) { return; }
     let nb = gpp.num_bins;
     let im = gpp.inv_maxval;
     let pt = gpp.preterm;

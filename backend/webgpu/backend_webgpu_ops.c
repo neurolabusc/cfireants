@@ -34,15 +34,15 @@ static const char elementwise_wgsl[] =
     "@group(0) @binding(1) var<uniform> params: Params;\n"
     "\n"
     "@compute @workgroup_size(256)\n"
-    "fn fill(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
-    "    let i = gid.x;\n"
+    "fn fill(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
+    "    let i = gid.x + gid.y * nwg.x * 256u;\n"
     "    if (i >= params.n) { return; }\n"
     "    data[i] = params.value;\n"
     "}\n"
     "\n"
     "@compute @workgroup_size(256)\n"
-    "fn scale(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
-    "    let i = gid.x;\n"
+    "fn scale(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
+    "    let i = gid.x + gid.y * nwg.x * 256u;\n"
     "    if (i >= params.n) { return; }\n"
     "    data[i] = data[i] * params.value;\n"
     "}\n";
@@ -61,8 +61,8 @@ static const char axpy_wgsl[] =
     "@group(0) @binding(2) var<storage, read> x_data: array<f32>;\n"
     "\n"
     "@compute @workgroup_size(256)\n"
-    "fn axpy(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
-    "    let i = gid.x;\n"
+    "fn axpy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
+    "    let i = gid.x + gid.y * nwg.x * 256u;\n"
     "    if (i >= params.n) { return; }\n"
     "    data[i] = data[i] + params.value * x_data[i];\n"
     "}\n";
@@ -84,8 +84,9 @@ static const char reduction_wgsl[] =
     "@compute @workgroup_size(256)\n"
     "fn reduce_sum(@builtin(global_invocation_id) gid: vec3<u32>,\n"
     "              @builtin(local_invocation_id) lid: vec3<u32>,\n"
-    "              @builtin(workgroup_id) wid: vec3<u32>) {\n"
-    "    let i = gid.x;\n"
+    "              @builtin(workgroup_id) wid: vec3<u32>,\n"
+    "              @builtin(num_workgroups) nwg: vec3<u32>) {\n"
+    "    let i = gid.x + gid.y * nwg.x * 256u;\n"
     "    let tid = lid.x;\n"
     "    if (i < params.n) {\n"
     "        shared_data[tid] = input[i];\n"
@@ -100,7 +101,7 @@ static const char reduction_wgsl[] =
     "        workgroupBarrier();\n"
     "    }\n"
     "    if (tid == 0u) {\n"
-    "        output[wid.x] = shared_data[0];\n"
+    "        output[wid.x + wid.y * nwg.x] = shared_data[0];\n"
     "    }\n"
     "}\n";
 
@@ -151,7 +152,8 @@ static int wgpu_tensor_fill(tensor_t *t, float value) {
     };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &bg_desc);
 
-    wgpu_dispatch(pipeline, bg, wgpu_div_ceil((uint32_t)t->numel, WGPU_WORKGROUP_SIZE), 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil((uint32_t)t->numel, WGPU_WORKGROUP_SIZE), &wx, &wy);
+    wgpu_dispatch(pipeline, bg, wx, wy, 1); }
 
     wgpuBindGroupRelease(bg);
     wgpuBufferRelease(params_buf);
@@ -177,7 +179,8 @@ static int wgpu_tensor_scale(tensor_t *t, float alpha) {
     };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &bg_desc);
 
-    wgpu_dispatch(pipeline, bg, wgpu_div_ceil((uint32_t)t->numel, WGPU_WORKGROUP_SIZE), 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil((uint32_t)t->numel, WGPU_WORKGROUP_SIZE), &wx, &wy);
+    wgpu_dispatch(pipeline, bg, wx, wy, 1); }
 
     wgpuBindGroupRelease(bg);
     wgpuBufferRelease(params_buf);
@@ -204,7 +207,8 @@ static int wgpu_tensor_axpy(tensor_t *y, float alpha, const tensor_t *x) {
     };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &bg_desc);
 
-    wgpu_dispatch(pipeline, bg, wgpu_div_ceil((uint32_t)y->numel, WGPU_WORKGROUP_SIZE), 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil((uint32_t)y->numel, WGPU_WORKGROUP_SIZE), &wx, &wy);
+    wgpu_dispatch(pipeline, bg, wx, wy, 1); }
 
     wgpuBindGroupRelease(bg);
     wgpuBufferRelease(params_buf);
@@ -246,7 +250,8 @@ static float wgpu_tensor_sum(const tensor_t *t) {
     };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &bg_desc);
 
-    wgpu_dispatch(pipeline, bg, n_groups, 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(n_groups, &wx, &wy);
+    wgpu_dispatch(pipeline, bg, wx, wy, 1); }
 
     /* Read partials and sum on CPU */
     float *partials = (float *)malloc(n_groups * sizeof(float));

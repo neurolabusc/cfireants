@@ -20,8 +20,8 @@ struct AdamParams {
 @group(0) @binding(4) var<uniform> p: AdamParams;
 
 @compute @workgroup_size(256)
-fn adam_step(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn adam_step(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= p.n) { return; }
 
     let g = grad[i];

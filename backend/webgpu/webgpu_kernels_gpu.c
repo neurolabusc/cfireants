@@ -65,7 +65,8 @@ void wgpu_fused_compositive_update(WGPUBuffer warp, WGPUBuffer update,
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-    wgpu_dispatch(pl, bg, wgpu_div_ceil(D*H*W, 256), 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(D*H*W, 256), &wx, &wy);
+    wgpu_dispatch(pl, bg, wx, wy, 1); }
     wgpuBindGroupRelease(bg);
     wgpuBufferRelease(pb);
 
@@ -121,7 +122,8 @@ void wgpu_blur_disp_dhw3(WGPUBuffer data, WGPUBuffer scratch,
         };
         WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
         WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-        wgpu_dispatch(pl, bg, wgpu_div_ceil(n, 256), 1, 1);
+        { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
+        wgpu_dispatch(pl, bg, wx, wy, 1); }
         wgpuBindGroupRelease(bg);
         wgpuBufferRelease(pb);
     }
@@ -168,7 +170,8 @@ void wgpu_adam_moments_update_buf(WGPUBuffer grad, WGPUBuffer exp_avg,
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-    wgpu_dispatch(pl, bg, wgpu_div_ceil(n, 256), 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
+    wgpu_dispatch(pl, bg, wx, wy, 1); }
     wgpuBindGroupRelease(bg);
     wgpuBufferRelease(pb);
 }
@@ -196,7 +199,8 @@ void wgpu_adam_direction_buf(WGPUBuffer output, WGPUBuffer exp_avg,
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-    wgpu_dispatch(pl, bg, wgpu_div_ceil(n, 256), 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
+    wgpu_dispatch(pl, bg, wx, wy, 1); }
     wgpuBindGroupRelease(bg);
     wgpuBufferRelease(pb);
 }
@@ -239,7 +243,8 @@ float wgpu_max_l2_norm_buf(WGPUBuffer data, int spatial, float eps) {
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = e };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-    wgpu_dispatch(pl, bg, n_groups, 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(n_groups, &wx, &wy);
+    wgpu_dispatch(pl, bg, wx, wy, 1); }
     wgpuBindGroupRelease(bg);
 
     /* Read partials and find max on CPU */
@@ -296,7 +301,8 @@ void wgpu_affine_grid_backward(WGPUBuffer grad_grid, int D, int H, int W,
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = e };
     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-    wgpu_dispatch(pl, bg, n_blocks, 1, 1);
+    { uint32_t wx, wy; wgpu_dispatch_dims(n_blocks, &wx, &wy);
+    wgpu_dispatch(pl, bg, wx, wy, 1); }
     wgpuBindGroupRelease(bg);
 
     /* Read partials and sum on CPU */
