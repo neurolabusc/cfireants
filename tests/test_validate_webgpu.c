@@ -35,6 +35,16 @@ static double get_time(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+static double get_peak_rss_mb(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256]; double peak_kb = 0;
+    while (fgets(line, sizeof(line), f))
+        if (strncmp(line, "VmHWM:", 6) == 0) { sscanf(line + 6, "%lf", &peak_kb); break; }
+    fclose(f);
+    return peak_kb / 1024.0;
+}
+
 static float compute_global_ncc(const float *a, const float *b, int n) {
     double sum_a=0,sum_b=0,sum_ab=0,sum_a2=0,sum_b2=0;
     for(int i=0;i<n;i++){
@@ -64,19 +74,27 @@ int main(int argc, char **argv) {
     if(cfireants_init_webgpu()!=0){printf("WebGPU init failed\n");return 1;}
 
     const char *only_dataset = NULL;
-    if(argc>2 && strcmp(argv[1],"--dataset")==0) only_dataset=argv[2];
+    int downsample_mode = DOWNSAMPLE_FFT;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--dataset") == 0 && i+1 < argc) only_dataset = argv[++i];
+        else if (strcmp(argv[i], "--trilinear") == 0) downsample_mode = DOWNSAMPLE_TRILINEAR;
+    }
 
     dataset_t datasets[] = {
         { "small", "2mm full-head MNI to subject (includes scalp)",
           "validate/small/MNI152_T1_2mm.nii.gz", "validate/small/T1_head_2mm.nii.gz",
           {4,2,1},{4,2,1},{4,2,1}, {200,100,50},{200,100,50},{200,100,50},
-          3,3,3, LOSS_CC, LOSS_CC },  /* CC for all stages */
+          3,3,3, LOSS_MI, LOSS_MI },  /* MI for rigid/affine (matching CUDA) */
         { "medium", "1mm brain-extracted MNI to subject",
           "validate/medium/MNI152_T1_1mm_brain.nii.gz", "validate/medium/t1_brain.nii.gz",
           {4,2,1},{4,2,1},{4,2,1}, {200,100,50},{200,100,50},{200,100,50},
-          3,3,3, LOSS_CC, LOSS_CC },
+          3,3,3, LOSS_CC, LOSS_CC },  /* CC for brain-extracted (same intensity range) */
+        { "large", "1mm full-head MNI to subject (0.88mm, includes scalp)",
+          "validate/large/MNI152_T1_1mm.nii.gz", "validate/large/chris_t1.nii.gz",
+          {8,4,2,1},{8,4,2,1},{4,2,1}, {200,200,100,50},{200,200,100,50},{200,100,50},
+          4,4,3, LOSS_MI, LOSS_MI },  /* MI for full-head (matching CUDA) */
     };
-    int n_ds = 2;
+    int n_ds = 3;
 
     for(int di=0; di<n_ds; di++){
         dataset_t *ds = &datasets[di];
@@ -138,21 +156,33 @@ int main(int argc, char **argv) {
         t1 = get_time();
         rigid_opts_t ropts = {
             .n_scales=ds->rigid_n, .scales=ds->rigid_scales, .iterations=ds->rigid_iters,
-            .lr=0.01f, .loss_type=ds->rigid_loss, .mi_num_bins=32, .cc_kernel_size=5,
-            .tolerance=1e-6f, .max_tolerance_iters=10 };
+            .lr=3e-3f, .loss_type=ds->rigid_loss, .mi_num_bins=32, .cc_kernel_size=5,
+            .tolerance=1e-6f, .max_tolerance_iters=10,
+            .downsample_mode=downsample_mode };
         rigid_result_t rigid;
         rigid_register_webgpu(&fixed, &moving, &mom, ropts, &rigid);
         double t_rigid = get_time()-t1;
+        fprintf(stderr, "  Rigid NCC: %.4f\n", rigid.ncc_loss);
+        fprintf(stderr, "  Rigid mat: [%.6f %.6f %.6f %.6f; %.6f %.6f %.6f %.6f; %.6f %.6f %.6f %.6f]\n",
+                rigid.rigid_mat[0][0], rigid.rigid_mat[0][1], rigid.rigid_mat[0][2], rigid.rigid_mat[0][3],
+                rigid.rigid_mat[1][0], rigid.rigid_mat[1][1], rigid.rigid_mat[1][2], rigid.rigid_mat[1][3],
+                rigid.rigid_mat[2][0], rigid.rigid_mat[2][1], rigid.rigid_mat[2][2], rigid.rigid_mat[2][3]);
 
         /* Affine */
         t1 = get_time();
         affine_opts_t aopts = {
             .n_scales=ds->affine_n, .scales=ds->affine_scales, .iterations=ds->affine_iters,
-            .lr=0.001f, .loss_type=ds->affine_loss, .mi_num_bins=32, .cc_kernel_size=5,
-            .tolerance=1e-6f, .max_tolerance_iters=10 };
+            .lr=1e-3f, .loss_type=ds->affine_loss, .mi_num_bins=32, .cc_kernel_size=5,
+            .tolerance=1e-6f, .max_tolerance_iters=10,
+            .downsample_mode=downsample_mode };
         affine_result_t affine;
         affine_register_webgpu(&fixed, &moving, rigid.rigid_mat, aopts, &affine);
         double t_affine = get_time()-t1;
+        fprintf(stderr, "  Affine NCC: %.4f\n", affine.ncc_loss);
+        fprintf(stderr, "  Affine mat: [%.6f %.6f %.6f %.6f; %.6f %.6f %.6f %.6f; %.6f %.6f %.6f %.6f]\n",
+                affine.affine_mat[0][0], affine.affine_mat[0][1], affine.affine_mat[0][2], affine.affine_mat[0][3],
+                affine.affine_mat[1][0], affine.affine_mat[1][1], affine.affine_mat[1][2], affine.affine_mat[1][3],
+                affine.affine_mat[2][0], affine.affine_mat[2][1], affine.affine_mat[2][2], affine.affine_mat[2][3]);
 
         /* Build 4x4 for deformable */
         float aff44[4][4]={{0}};
@@ -163,9 +193,10 @@ int main(int argc, char **argv) {
         t1 = get_time();
         syn_opts_t sopts = {
             .n_scales=ds->syn_n, .scales=ds->syn_scales, .iterations=ds->syn_iters,
-            .cc_kernel_size=5, .lr=0.25f,
-            .smooth_warp_sigma=0.5f, .smooth_grad_sigma=3.0f,
-            .tolerance=1e-6f, .max_tolerance_iters=10 };
+            .cc_kernel_size=5, .lr=0.1f,
+            .smooth_warp_sigma=0.5f, .smooth_grad_sigma=1.0f,
+            .tolerance=1e-6f, .max_tolerance_iters=10,
+            .downsample_mode=downsample_mode };
         syn_result_t syn;
         syn_register_webgpu(&fixed, &moving, aff44, sopts, &syn);
         double t_syn = get_time()-t1;
@@ -177,7 +208,8 @@ int main(int argc, char **argv) {
                                               (float*)syn.moved.data, fN);
 
         printf("\n============================================================\n");
-        printf("Dataset: %s — %s (WebGPU)\n", ds->name, ds->desc);
+        printf("Dataset: %s — %s (WebGPU, %s)\n", ds->name, ds->desc,
+               downsample_mode == DOWNSAMPLE_TRILINEAR ? "trilinear" : "FFT");
         printf("============================================================\n");
         printf("  Results:\n");
         printf("    NCC Before:     %.4f\n", ncc_before);
@@ -188,6 +220,11 @@ int main(int argc, char **argv) {
         printf("    Rigid:          %.1fs\n", t_rigid);
         printf("    Affine:         %.1fs\n", t_affine);
         printf("    SyN:            %.1fs\n", t_syn);
+        printf("    Peak RAM:       %.0f MB\n", get_peak_rss_mb());
+
+        printf("\n  CSV: %s,%.4f,%.4f,%.4f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f\n",
+               ds->name, ncc_before, ncc_after, syn.ncc_loss,
+               t_total, t_mom, t_rigid, t_affine, t_syn, get_peak_rss_mb());
 
         tensor_free(&syn.moved);
         image_free(&fixed); image_free(&moving);

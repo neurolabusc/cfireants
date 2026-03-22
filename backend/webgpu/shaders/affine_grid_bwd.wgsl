@@ -14,8 +14,9 @@ var<workgroup> sdata: array<f32, 3072>;  // 256 * 12
 @compute @workgroup_size(256)
 fn affine_grid_bwd(@builtin(global_invocation_id) gid: vec3<u32>,
                    @builtin(local_invocation_id) lid: vec3<u32>,
-                   @builtin(workgroup_id) wid: vec3<u32>) {
-    let idx = gid.x;
+                   @builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 256u;
     let tid = lid.x;
     let total = p.D * p.H * p.W;
 
@@ -66,7 +67,7 @@ fn affine_grid_bwd(@builtin(global_invocation_id) gid: vec3<u32>,
 
     if (tid == 0u) {
         for (var k = 0u; k < 12u; k = k + 1u) {
-            partial[wid.x * 12u + k] = sdata[k];
+            partial[(wid.x + wid.y * nwg.x) * 12u + k] = sdata[k];
         }
     }
 }

@@ -4,7 +4,7 @@
  * Matches validate/run_validation.py: Moments → Rigid → Affine → Greedy
  * Reports global NCC (before/after), local NCC loss, time, peak GPU memory.
  *
- * Usage: test_validate_all [--dataset small|medium|large]
+ * Usage: test_validate_all [--dataset small|medium|large] [--trilinear]
  */
 
 #include "cfireants/tensor.h"
@@ -144,6 +144,8 @@ static dataset_config_t DATASETS[] = {
     },
 };
 
+static int g_downsample_mode = DOWNSAMPLE_FFT;
+
 static void run_dataset(const dataset_config_t *ds) {
     printf("\n============================================================\n");
     printf("Dataset: %s — %s\n", ds->name, ds->description);
@@ -180,11 +182,17 @@ static void run_dataset(const dataset_config_t *ds) {
         .n_scales = ds->rigid_n_scales, .scales = ds->rigid_scales,
         .iterations = ds->rigid_iters, .loss_type = ds->rigid_loss_type,
         .cc_kernel_size = 5, .mi_num_bins = 32, .lr = ds->rigid_lr,
-        .tolerance = 1e-6f, .max_tolerance_iters = 10
+        .tolerance = 1e-6f, .max_tolerance_iters = 10,
+        .downsample_mode = g_downsample_mode
     };
     rigid_result_t rigid_result;
     rigid_register_gpu(&fixed, &moving, &mom_result, ropts, &rigid_result);
     double t_rigid = get_time() - t1;
+    fprintf(stderr, "  Rigid NCC: %.4f\n", rigid_result.ncc_loss);
+    fprintf(stderr, "  Rigid mat: [%.6f %.6f %.6f %.6f; %.6f %.6f %.6f %.6f; %.6f %.6f %.6f %.6f]\n",
+            rigid_result.rigid_mat[0][0], rigid_result.rigid_mat[0][1], rigid_result.rigid_mat[0][2], rigid_result.rigid_mat[0][3],
+            rigid_result.rigid_mat[1][0], rigid_result.rigid_mat[1][1], rigid_result.rigid_mat[1][2], rigid_result.rigid_mat[1][3],
+            rigid_result.rigid_mat[2][0], rigid_result.rigid_mat[2][1], rigid_result.rigid_mat[2][2], rigid_result.rigid_mat[2][3]);
 
     /* Affine (GPU) */
     t1 = get_time();
@@ -192,11 +200,17 @@ static void run_dataset(const dataset_config_t *ds) {
         .n_scales = ds->affine_n_scales, .scales = ds->affine_scales,
         .iterations = ds->affine_iters, .loss_type = ds->affine_loss_type,
         .cc_kernel_size = 5, .mi_num_bins = 32, .lr = ds->affine_lr,
-        .tolerance = 1e-6f, .max_tolerance_iters = 10
+        .tolerance = 1e-6f, .max_tolerance_iters = 10,
+        .downsample_mode = g_downsample_mode
     };
     affine_result_t affine_result;
     affine_register_gpu(&fixed, &moving, rigid_result.rigid_mat, aopts, &affine_result);
     double t_affine = get_time() - t1;
+    fprintf(stderr, "  Affine NCC: %.4f\n", affine_result.ncc_loss);
+    fprintf(stderr, "  Affine mat: [%.6f %.6f %.6f %.6f; %.6f %.6f %.6f %.6f; %.6f %.6f %.6f %.6f]\n",
+            affine_result.affine_mat[0][0], affine_result.affine_mat[0][1], affine_result.affine_mat[0][2], affine_result.affine_mat[0][3],
+            affine_result.affine_mat[1][0], affine_result.affine_mat[1][1], affine_result.affine_mat[1][2], affine_result.affine_mat[1][3],
+            affine_result.affine_mat[2][0], affine_result.affine_mat[2][1], affine_result.affine_mat[2][2], affine_result.affine_mat[2][3]);
 
     /* Build 4x4 affine for deformable init */
     float aff44[4][4] = {{0}};
@@ -220,7 +234,8 @@ static void run_dataset(const dataset_config_t *ds) {
             .cc_kernel_size = ds->greedy_cc_ks, .lr = ds->greedy_lr,
             .smooth_warp_sigma = ds->greedy_smooth_warp,
             .smooth_grad_sigma = ds->greedy_smooth_grad,
-            .tolerance = 1e-6f, .max_tolerance_iters = 10
+            .tolerance = 1e-6f, .max_tolerance_iters = 10,
+            .downsample_mode = g_downsample_mode
         };
         greedy_register_gpu(&fixed, &moving, aff44, gopts, &greedy_result);
         local_ncc_loss = greedy_result.ncc_loss;
@@ -235,7 +250,8 @@ static void run_dataset(const dataset_config_t *ds) {
             .cc_kernel_size = ds->greedy_cc_ks, .lr = ds->greedy_lr,
             .smooth_warp_sigma = ds->greedy_smooth_warp,
             .smooth_grad_sigma = ds->greedy_smooth_grad,
-            .tolerance = 1e-6f, .max_tolerance_iters = 10
+            .tolerance = 1e-6f, .max_tolerance_iters = 10,
+            .downsample_mode = g_downsample_mode
         };
         syn_register_gpu(&fixed, &moving, aff44, sopts, &syn_result);
         local_ncc_loss = syn_result.ncc_loss;
@@ -300,8 +316,10 @@ int main(int argc, char **argv) {
 #endif
 
     const char *only_dataset = NULL;
-    if (argc > 2 && strcmp(argv[1], "--dataset") == 0)
-        only_dataset = argv[2];
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--dataset") == 0 && i+1 < argc) only_dataset = argv[++i];
+        else if (strcmp(argv[i], "--trilinear") == 0) g_downsample_mode = DOWNSAMPLE_TRILINEAR;
+    }
 
     int n_datasets = sizeof(DATASETS) / sizeof(DATASETS[0]);
     for (int i = 0; i < n_datasets; i++) {

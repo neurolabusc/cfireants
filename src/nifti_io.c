@@ -23,6 +23,7 @@
 #endif
 #ifdef HAVE_ZSTD
   #include <zstd.h>
+  #include <zstd_errors.h>
 #endif
 
 /* compile-time flags from Makefile */

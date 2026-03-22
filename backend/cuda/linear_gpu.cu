@@ -203,14 +203,20 @@ int rigid_register_gpu(const image_t *fixed, const image_t *moving,
         long mSDown = mdD * mdH * mdW;
 
         /* Downsample on GPU (matching Python rigid.optimize):
-         * fixed: downsample_fft
-         * moving: downsample_fft + extra Gaussian blur (_smooth_image_not_mask) */
+         * fixed: downsample_fft (or blur+trilinear)
+         * moving: downsample + extra Gaussian blur (_smooth_image_not_mask) */
         float *d_fdown, *d_mdown;
         if (scale > 1) {
             cudaMalloc(&d_fdown, spatial*sizeof(float));
             cudaMalloc(&d_mdown, mSDown*sizeof(float));
-            cuda_downsample_fft(d_fixed, d_fdown, 1,1, fD,fH,fW, dD,dH,dW);
-            cuda_downsample_fft(d_moving, d_mdown, 1,1, mD,mH,mW, mdD,mdH,mdW);
+
+            if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
+                cuda_blur_downsample(d_fixed, d_fdown, 1,1, fD,fH,fW, dD,dH,dW);
+                cuda_blur_downsample(d_moving, d_mdown, 1,1, mD,mH,mW, mdD,mdH,mdW);
+            } else {
+                cuda_downsample_fft(d_fixed, d_fdown, 1,1, fD,fH,fW, dD,dH,dW);
+                cuda_downsample_fft(d_moving, d_mdown, 1,1, mD,mH,mW, mdD,mdH,mdW);
+            }
 
             /* Extra Gaussian blur on moving (matching Python rigid line 345:
              * moving_image_blur = self._smooth_image_not_mask(moving_image_blur, gaussians))
@@ -501,13 +507,18 @@ int affine_register_gpu(const image_t *fixed, const image_t *moving,
         long spatial=(long)dD*dH*dW, n3=spatial*3, mSD=mdD*mdH*mdW;
 
         /* Downsample on GPU (matching Python affine.optimize):
-         * Both images: downsample_fft (NO extra blur on moving, unlike rigid) */
+         * Both images: downsample (NO extra blur on moving, unlike rigid) */
         float *d_fdown, *d_mdown;
         if (scale > 1) {
             cudaMalloc(&d_fdown, spatial*sizeof(float));
             cudaMalloc(&d_mdown, mSD*sizeof(float));
-            cuda_downsample_fft(d_fixed, d_fdown, 1,1,fD,fH,fW,dD,dH,dW);
-            cuda_downsample_fft(d_moving, d_mdown, 1,1,mD,mH,mW,mdD,mdH,mdW);
+            if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
+                cuda_blur_downsample(d_fixed, d_fdown, 1,1,fD,fH,fW,dD,dH,dW);
+                cuda_blur_downsample(d_moving, d_mdown, 1,1,mD,mH,mW,mdD,mdH,mdW);
+            } else {
+                cuda_downsample_fft(d_fixed, d_fdown, 1,1,fD,fH,fW,dD,dH,dW);
+                cuda_downsample_fft(d_moving, d_mdown, 1,1,mD,mH,mW,mdD,mdH,mdW);
+            }
         } else { d_fdown=d_fixed; d_mdown=d_moving; mdD=mD;mdH=mH;mdW=mW; }
 
         float *d_aff, *d_grid, *d_moved, *d_grad_moved, *d_grad_grid;

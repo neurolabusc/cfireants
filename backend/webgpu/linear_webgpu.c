@@ -75,87 +75,16 @@ static void cpu_affine_grid_backward(const float *h_grad_grid, int D, int H, int
 }
 
 /* ------------------------------------------------------------------ */
-/* Helper: downsample image on CPU (download, FFT, upload)             */
+/* Helper: downsample image (delegates to shared wgpu_downsample_image) */
 /* ------------------------------------------------------------------ */
 
-static WGPUBuffer downsample_to_webgpu(WGPUBuffer src_buf, int iD, int iH, int iW,
-                                        int oD, int oH, int oW) {
-    size_t in_sz = (size_t)iD * iH * iW * sizeof(float);
-    size_t out_sz = (size_t)oD * oH * oW * sizeof(float);
-
-    fprintf(stderr, "    downsample_to_webgpu: [%d,%d,%d]->[%d,%d,%d] in_sz=%zu out_sz=%zu\n",
-            iD, iH, iW, oD, oH, oW, in_sz, out_sz);
-    float *h_in = (float *)malloc(in_sz);
-    float *h_out = (float *)malloc(out_sz);
-    if (!h_in || !h_out) { fprintf(stderr, "    downsample: malloc failed!\n"); return NULL; }
-    fprintf(stderr, "    downsample: reading buffer...\n");
-    wgpu_read_buffer(src_buf, 0, h_in, in_sz);
-    fprintf(stderr, "    downsample: read done, running FFT...\n");
-
-    webgpu_downsample_fft(h_in, h_out, 1, 1, iD, iH, iW, oD, oH, oW);
-
-    WGPUBuffer out_buf = wgpu_create_buffer(out_sz,
-        WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst, "ds");
-    wgpu_write_buffer(out_buf, 0, h_out, out_sz);
-
-    free(h_in);
-    free(h_out);
-    return out_buf;
-}
-
-/* Helper: apply per-axis Gaussian blur on CPU */
-static void blur_moving_cpu(WGPUBuffer buf, int D, int H, int W,
-                             int fD, int fH, int fW, int dD, int dH, int dW) {
-    size_t sz = (size_t)D * H * W * sizeof(float);
-    float *h = (float *)malloc(sz);
-    wgpu_read_buffer(buf, 0, h, sz);
-
-    /* Per-axis blur matching Python _smooth_image_not_mask */
-    float sigmas[3] = {
-        0.5f * (float)fD / (float)dD,
-        0.5f * (float)fH / (float)dH,
-        0.5f * (float)fW / (float)dW
-    };
-
-    /* Simple separable Gaussian blur on CPU */
-    for (int axis = 0; axis < 3; axis++) {
-        float sigma = sigmas[axis];
-        int tail = (int)(2.0f * sigma + 0.5f);
-        int klen = 2 * tail + 1;
-        float *kern = (float *)malloc(klen * sizeof(float));
-        float inv = 1.0f / (sigma * sqrtf(2.0f));
-        float ksum = 0;
-        for (int i = 0; i < klen; i++) {
-            float x = (float)(i - tail);
-            kern[i] = 0.5f * (erff((x+0.5f)*inv) - erff((x-0.5f)*inv));
-            ksum += kern[i];
-        }
-        for (int i = 0; i < klen; i++) kern[i] /= ksum;
-
-        float *tmp = (float *)malloc(sz);
-        int r = klen / 2;
-        int dims[3] = {D, H, W};
-        int strides[3] = {H * W, W, 1};
-
-        for (int i = 0; i < D * H * W; i++) {
-            int coords[3] = { i / (H * W), (i / W) % H, i % W };
-            float sum = 0;
-            for (int k = 0; k < klen; k++) {
-                int c = coords[axis] + k - r;
-                if (c >= 0 && c < dims[axis]) {
-                    int src_idx = i + (c - coords[axis]) * strides[axis];
-                    sum += h[src_idx] * kern[k];
-                }
-            }
-            tmp[i] = sum;
-        }
-        memcpy(h, tmp, sz);
-        free(tmp);
-        free(kern);
-    }
-
-    wgpu_write_buffer(buf, 0, h, sz);
-    free(h);
+/* Helper: apply per-axis Gaussian blur on GPU */
+static void blur_moving_gpu(WGPUBuffer buf, int D, int H, int W,
+                              int fD, int fH, int fW, int dD, int dH, int dW) {
+    float sig_d = 0.5f * (float)fD / (float)dD;
+    float sig_h = 0.5f * (float)fH / (float)dH;
+    float sig_w = 0.5f * (float)fW / (float)dW;
+    wgpu_blur_volume(buf, D, H, W, sig_d, sig_h, sig_w);
 }
 
 /* ------------------------------------------------------------------ */
@@ -231,10 +160,10 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
         fprintf(stderr, "  rigid: scale %d, downsampling...\n", scale);
         WGPUBuffer d_fdown, d_mdown;
         if (scale > 1) {
-            d_fdown = downsample_to_webgpu(d_fixed, fD, fH, fW, dD, dH, dW);
-            d_mdown = downsample_to_webgpu(d_moving, mD, mH, mW, mdD, mdH, mdW);
+            d_fdown = wgpu_downsample_image(d_fixed, fD, fH, fW, dD, dH, dW, opts.downsample_mode);
+            d_mdown = wgpu_downsample_image(d_moving, mD, mH, mW, mdD, mdH, mdW, opts.downsample_mode);
             /* Extra blur on moving for rigid (matching Python) */
-            blur_moving_cpu(d_mdown, mdD, mdH, mdW, fD, fH, fW, dD, dH, dW);
+            blur_moving_gpu(d_mdown, mdD, mdH, mdW, fD, fH, fW, dD, dH, dW);
         } else {
             d_fdown = d_fixed; d_mdown = d_moving;
             mdD = mD; mdH = mH; mdW = mW;
@@ -296,6 +225,8 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
             wgpu_grid_sample_3d_fwd(d_mdown, d_grid, d_moved,
                                      1, 1, mdD, mdH, mdW, dD, dH, dW);
 
+            /* Flush forward batch before loss computation */
+            wgpu_flush();
             float loss;
             if (opts.loss_type == LOSS_MI) {
                 int nbins = opts.mi_num_bins > 0 ? opts.mi_num_bins : 32;
@@ -306,7 +237,7 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
                                      dD, dH, dW, opts.cc_kernel_size, &loss);
             }
 
-            wgpu_begin_batch();
+            /* Backward pass — no batch needed (each op flushes internally) */
             wgpu_grid_sample_3d_bwd(d_grad_moved, d_mdown, d_grid,
                                      d_grad_grid, 1, 1, mdD, mdH, mdW, dD, dH, dW);
             /* affine_grid_backward does wgpu_read_buffer which auto-flushes */
@@ -480,8 +411,8 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
 
         WGPUBuffer d_fdown, d_mdown;
         if (scale > 1) {
-            d_fdown = downsample_to_webgpu(d_fixed, fD, fH, fW, dD, dH, dW);
-            d_mdown = downsample_to_webgpu(d_moving, mD, mH, mW, mdD, mdH, mdW);
+            d_fdown = wgpu_downsample_image(d_fixed, fD, fH, fW, dD, dH, dW, opts.downsample_mode);
+            d_mdown = wgpu_downsample_image(d_moving, mD, mH, mW, mdD, mdH, mdW, opts.downsample_mode);
             /* Affine: NO extra blur on moving (unlike rigid) */
         } else { d_fdown=d_fixed; d_mdown=d_moving; mdD=mD;mdH=mH;mdW=mW; }
 
@@ -514,6 +445,7 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
             wgpu_write_buffer(d_aff, 0, ha, 12*4);
             wgpu_affine_grid_3d(d_aff, d_grid, 1, dD, dH, dW);
             wgpu_grid_sample_3d_fwd(d_mdown, d_grid, d_moved, 1,1,mdD,mdH,mdW,dD,dH,dW);
+            wgpuDevicePoll(g_wgpu.device, 1, NULL);  /* Ensure forward pass completes */
 
             float loss;
             if (opts.loss_type == LOSS_MI) {

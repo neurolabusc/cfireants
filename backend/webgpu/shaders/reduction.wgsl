@@ -19,8 +19,9 @@ var<workgroup> shared_data: array<f32, 256>;
 @compute @workgroup_size(256)
 fn reduce_sum(@builtin(global_invocation_id) gid: vec3<u32>,
               @builtin(local_invocation_id) lid: vec3<u32>,
-              @builtin(workgroup_id) wid: vec3<u32>) {
-    let i = gid.x;
+              @builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     let tid = lid.x;
 
     // Load element or zero
@@ -41,6 +42,6 @@ fn reduce_sum(@builtin(global_invocation_id) gid: vec3<u32>,
 
     // Write partial sum
     if (tid == 0u) {
-        output[wid.x] = shared_data[0];
+        output[wid.x + wid.y * nwg.x] = shared_data[0];
     }
 }

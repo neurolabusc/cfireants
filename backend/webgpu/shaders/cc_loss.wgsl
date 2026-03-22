@@ -19,8 +19,8 @@ struct MulParams { n: u32, _p0: u32, _p1: u32, _p2: u32, }
 @group(0) @binding(3) var<uniform> mul_p: MulParams;
 
 @compute @workgroup_size(256)
-fn multiply(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn multiply(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= mul_p.n) { return; }
     mul_c[i] = mul_a[i] * mul_b[i];
 }
@@ -40,8 +40,8 @@ struct BoxParams {
 @group(0) @binding(2) var<uniform> box_p: BoxParams;
 
 @compute @workgroup_size(256)
-fn box_filter(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn box_filter(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 256u;
     let total = box_p.D * box_p.H * box_p.W;
     if (idx >= total) { return; }
 
@@ -100,8 +100,8 @@ struct NccParams {
 @group(0) @binding(9) var<uniform> ncc_p: NccParams;
 
 @compute @workgroup_size(256)
-fn ncc_and_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn ncc_and_grad(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= ncc_p.n) { return; }
 
     let ps = p_sum[i]; let ts = t_sum[i];
@@ -143,8 +143,8 @@ struct CombineParams {
 @group(0) @binding(6) var<uniform> comb_p: CombineParams;
 
 @compute @workgroup_size(256)
-fn combine_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn combine_grad(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= comb_p.n) { return; }
     grad_out[i] = -comb_p.inv_count * (adj_p[i] + 2.0 * cc_P[i] * adj_p2[i] + cc_T[i] * adj_tp[i]);
 }

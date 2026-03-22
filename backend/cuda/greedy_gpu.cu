@@ -227,8 +227,13 @@ int greedy_register_gpu(const image_t *fixed, const image_t *moving,
         if (scale > 1) {
             cudaMalloc(&d_fixed_down, spatial*sizeof(float));
             cudaMalloc(&d_moving_down, mSpatialDown*sizeof(float));
-            cuda_downsample_fft(d_fixed_full, d_fixed_down, 1,1, fD,fH,fW, dD,dH,dW);
-            cuda_downsample_fft(d_moving_full, d_moving_down, 1,1, mD,mH,mW, mdD,mdH,mdW);
+            if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
+                cuda_blur_downsample(d_fixed_full, d_fixed_down, 1,1, fD,fH,fW, dD,dH,dW);
+                cuda_blur_downsample(d_moving_full, d_moving_down, 1,1, mD,mH,mW, mdD,mdH,mdW);
+            } else {
+                cuda_downsample_fft(d_fixed_full, d_fixed_down, 1,1, fD,fH,fW, dD,dH,dW);
+                cuda_downsample_fft(d_moving_full, d_moving_down, 1,1, mD,mH,mW, mdD,mdH,mdW);
+            }
         } else {
             d_fixed_down = d_fixed_full;
             d_moving_down = d_moving_full;

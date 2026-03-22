@@ -73,6 +73,10 @@ typedef struct {
 #define LOSS_CC  0
 #define LOSS_MI  1
 
+/* Downsample mode codes */
+#define DOWNSAMPLE_FFT       0   /* FFT-based (matching Python default) */
+#define DOWNSAMPLE_TRILINEAR 1   /* Gaussian blur + trilinear resize (faster, GPU-native) */
+
 /* Options for rigid registration */
 typedef struct {
     int n_scales;              /* Number of scales */
@@ -84,6 +88,7 @@ typedef struct {
     float lr;                  /* Adam learning rate */
     float tolerance;           /* Convergence tolerance */
     int max_tolerance_iters;   /* Max iters at tolerance before stopping */
+    int downsample_mode;       /* DOWNSAMPLE_FFT or DOWNSAMPLE_TRILINEAR */
 } rigid_opts_t;
 
 /* Run rigid registration.
@@ -128,6 +133,7 @@ typedef struct {
     float lr;
     float tolerance;
     int max_tolerance_iters;
+    int downsample_mode;       /* DOWNSAMPLE_FFT or DOWNSAMPLE_TRILINEAR */
 } affine_opts_t;
 
 int affine_register(const image_t *fixed, const image_t *moving,
@@ -167,6 +173,7 @@ typedef struct {
     float smooth_grad_sigma;
     float tolerance;
     int max_tolerance_iters;
+    int downsample_mode;       /* DOWNSAMPLE_FFT or DOWNSAMPLE_TRILINEAR */
 } greedy_opts_t;
 
 int greedy_register(const image_t *fixed, const image_t *moving,
@@ -208,6 +215,7 @@ typedef struct {
     float smooth_grad_sigma;
     float tolerance;
     int max_tolerance_iters;
+    int downsample_mode;       /* DOWNSAMPLE_FFT or DOWNSAMPLE_TRILINEAR */
 } syn_opts_t;
 
 int syn_register(const image_t *fixed, const image_t *moving,

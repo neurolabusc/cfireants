@@ -16,18 +16,7 @@
 #include <string.h>
 #include <math.h>
 
-extern void webgpu_downsample_fft(const float *, float *, int, int, int, int, int, int, int, int);
-
-static WGPUBuffer ds_buf(WGPUBuffer src, int iD, int iH, int iW, int oD, int oH, int oW) {
-    size_t isz=(size_t)iD*iH*iW*4, osz=(size_t)oD*oH*oW*4;
-    float *hi=(float*)malloc(isz), *ho=(float*)malloc(osz);
-    wgpu_read_buffer(src,0,hi,isz);
-    webgpu_downsample_fft(hi,ho,1,1,iD,iH,iW,oD,oH,oW);
-    WGPUBufferUsage u=WGPUBufferUsage_Storage|WGPUBufferUsage_CopySrc|WGPUBufferUsage_CopyDst;
-    WGPUBuffer b=wgpu_create_buffer(osz,u,"ds");
-    wgpu_write_buffer(b,0,ho,osz);
-    free(hi);free(ho);return b;
-}
+/* ds_buf removed — uses shared wgpu_downsample_image from webgpu_kernels.h */
 
 static WGPUBuffer make_gauss_buf(float sigma, float trunc, int *klen) {
     if(sigma<=0){*klen=0;return NULL;}
@@ -157,64 +146,76 @@ int syn_register_webgpu(const image_t *fixed, const image_t *moving,
         long sp=(long)dD*dH*dW,n3=sp*3;
 
         WGPUBuffer d_fd;
-        if(scale>1) d_fd=ds_buf(d_ff,fD,fH,fW,dD,dH,dW); else d_fd=d_ff;
-        /* Blur moving image (matching Python _smooth_image_not_mask) */
+        if(scale>1) {
+            d_fd=wgpu_downsample_image(d_ff,fD,fH,fW,dD,dH,dW,opts.downsample_mode);
+        } else d_fd=d_ff;
+        /* Blur moving image on GPU (matching Python _smooth_image_not_mask) */
         WGPUBuffer d_mb;
         int moving_blur_owned = 0;
         if (scale > 1) {
-            float sigmas[3] = {
-                0.5f * (float)fD / (float)dD,
-                0.5f * (float)fH / (float)dH,
-                0.5f * (float)fW / (float)dW
-            };
+            float sig_d = 0.5f * (float)fD / (float)dD;
+            float sig_h = 0.5f * (float)fH / (float)dH;
+            float sig_w = 0.5f * (float)fW / (float)dW;
             size_t msz = (size_t)mD*mH*mW*sizeof(float);
-            float *h_mov = (float*)malloc(msz);
-            wgpu_read_buffer(d_mf, 0, h_mov, msz);
 
-            /* Per-axis separable Gaussian blur on CPU */
-            int dims[3] = {mD, mH, mW};
-            int strides[3] = {mH*mW, mW, 1};
-            int mn = mD*mH*mW;
-            float *tmp2 = (float*)malloc(msz);
-            for (int axis = 0; axis < 3; axis++) {
-                float sigma = sigmas[axis];
-                int tail = (int)(2.0f * sigma + 0.5f);
-                int klen = 2*tail+1;
-                float *k = (float*)malloc(klen*sizeof(float));
-                float inv = 1.0f/(sigma*sqrtf(2.0f)), ksum=0;
-                for(int j=0;j<klen;j++){float x=(float)(j-tail);k[j]=0.5f*(erff((x+.5f)*inv)-erff((x-.5f)*inv));ksum+=k[j];}
-                for(int j=0;j<klen;j++) k[j]/=ksum;
-                int r=klen/2;
-                for(int ii=0;ii<mn;ii++){
-                    int co[3]={ii/(mH*mW),(ii/mW)%mH,ii%mW};
-                    float s=0;
-                    for(int j=0;j<klen;j++){
-                        int ci=co[axis]+j-r;
-                        if(ci>=0 && ci<dims[axis]) s+=h_mov[ii+(ci-co[axis])*strides[axis]]*k[j];
-                    }
-                    tmp2[ii]=s;
-                }
-                memcpy(h_mov, tmp2, msz);
-                free(k);
-            }
-            free(tmp2);
-
+            /* Copy moving to new buffer, blur in-place on GPU */
             d_mb = wgpu_create_buffer(msz, u, "mblur");
-            wgpu_write_buffer(d_mb, 0, h_mov, msz);
-            free(h_mov);
+            {
+                WGPUCommandEncoder enc=wgpuDeviceCreateCommandEncoder(g_wgpu.device,NULL);
+                wgpuCommandEncoderCopyBufferToBuffer(enc,d_mf,0,d_mb,0,msz);
+                WGPUCommandBuffer cmd=wgpuCommandEncoderFinish(enc,NULL);
+                wgpuQueueSubmit(g_wgpu.queue,1,&cmd);
+                wgpuCommandBufferRelease(cmd);wgpuCommandEncoderRelease(enc);
+                wgpuDevicePoll(g_wgpu.device,1,NULL);
+            }
+            wgpu_blur_volume(d_mb, mD, mH, mW, sig_d, sig_h, sig_w);
             moving_blur_owned = 1;
         } else {
             d_mb = d_mf;
         }
 
-        /* Init/reset warps */
+        /* Init/reset warps — resize via trilinear interpolation (matching CUDA) */
         if(!d_fw){
             d_fw=wgpu_create_buffer(n3*4,u,"fw");wgpu_tensor_fill_buf(d_fw,0,(int)n3);
             d_rv=wgpu_create_buffer(n3*4,u,"rv");wgpu_tensor_fill_buf(d_rv,0,(int)n3);
         } else if(prev_dD!=dD||prev_dH!=dH||prev_dW!=dW){
-            wgpuBufferRelease(d_fw);wgpuBufferRelease(d_rv);
-            d_fw=wgpu_create_buffer(n3*4,u,"fw");wgpu_tensor_fill_buf(d_fw,0,(int)n3);
-            d_rv=wgpu_create_buffer(n3*4,u,"rv");wgpu_tensor_fill_buf(d_rv,0,(int)n3);
+            /* Resize warps: permute [D,H,W,3]→[3,D,H,W], trilinear resize, permute back */
+            long prev_sp=(long)prev_dD*prev_dH*prev_dW;
+            size_t prev_n3_sz=(size_t)prev_sp*3*sizeof(float);
+            size_t new_n3_sz=(size_t)n3*sizeof(float);
+            float *h_old=(float*)malloc(prev_n3_sz);
+            float *h_3dhw=(float*)malloc(prev_n3_sz);
+            float *h_3dhw_new=(float*)malloc(new_n3_sz);
+            float *h_new=(float*)malloc(new_n3_sz);
+
+            /* Resize fwd warp */
+            wgpu_read_buffer(d_fw,0,h_old,prev_n3_sz);
+            /* Permute [D,H,W,3] → [3,D,H,W] */
+            for(long i=0;i<prev_sp;i++) for(int c=0;c<3;c++) h_3dhw[c*prev_sp+i]=h_old[i*3+c];
+            /* Upload permuted, resize via GPU trilinear, download */
+            WGPUBuffer b_src=wgpu_create_buffer_init(h_3dhw,prev_n3_sz,u,"wr_src");
+            WGPUBuffer b_dst=wgpu_create_buffer(new_n3_sz,u,"wr_dst");
+            wgpu_trilinear_resize(b_src,b_dst,1,3,prev_dD,prev_dH,prev_dW,dD,dH,dW,1);
+            wgpu_read_buffer(b_dst,0,h_3dhw_new,new_n3_sz);
+            wgpuBufferRelease(b_src);wgpuBufferRelease(b_dst);
+            /* Permute [3,D,H,W] → [D,H,W,3] */
+            for(long i=0;i<sp;i++) for(int c=0;c<3;c++) h_new[i*3+c]=h_3dhw_new[c*sp+i];
+            wgpuBufferRelease(d_fw);
+            d_fw=wgpu_create_buffer(n3*4,u,"fw");wgpu_write_buffer(d_fw,0,h_new,new_n3_sz);
+
+            /* Resize rev warp */
+            wgpu_read_buffer(d_rv,0,h_old,prev_n3_sz);
+            for(long i=0;i<prev_sp;i++) for(int c=0;c<3;c++) h_3dhw[c*prev_sp+i]=h_old[i*3+c];
+            b_src=wgpu_create_buffer_init(h_3dhw,prev_n3_sz,u,"wr_src");
+            b_dst=wgpu_create_buffer(new_n3_sz,u,"wr_dst");
+            wgpu_trilinear_resize(b_src,b_dst,1,3,prev_dD,prev_dH,prev_dW,dD,dH,dW,1);
+            wgpu_read_buffer(b_dst,0,h_3dhw_new,new_n3_sz);
+            wgpuBufferRelease(b_src);wgpuBufferRelease(b_dst);
+            for(long i=0;i<sp;i++) for(int c=0;c<3;c++) h_new[i*3+c]=h_3dhw_new[c*sp+i];
+            wgpuBufferRelease(d_rv);
+            d_rv=wgpu_create_buffer(n3*4,u,"rv");wgpu_write_buffer(d_rv,0,h_new,new_n3_sz);
+
+            free(h_old);free(h_3dhw);free(h_3dhw_new);free(h_new);
             if(d_fea){wgpuBufferRelease(d_fea);wgpuBufferRelease(d_fev);wgpuBufferRelease(d_rea);wgpuBufferRelease(d_rev);d_fea=NULL;}
         }
         if(!d_fea){
@@ -257,28 +258,29 @@ int syn_register_webgpu(const image_t *fixed, const image_t *moving,
             wgpu_tensor_add_buf(d_sg2,d_rv,(int)n3);
             wgpu_grid_sample_3d_fwd(d_mb,d_sg1,d_m1,1,1,mdD,mdH,mdW,dD,dH,dW);
             wgpu_grid_sample_3d_fwd(d_fd,d_sg2,d_m2,1,1,dD,dH,dW,dD,dH,dW);
-            /* CC loss — only read scalar every 10 iterations to reduce sync */
+            /* Flush forward batch, then fused CC (matching CUDA fused_cc.cu) */
+            wgpu_flush();
             float loss = 0;
             int read_loss = (it % 10 == 0 || it == iters - 1);
-            wgpu_cc_loss_3d_raw(d_m1,d_m2,d_g1,dD,dH,dW,opts.cc_kernel_size,
-                                 read_loss ? &loss : NULL);
-            wgpu_cc_loss_3d_raw(d_m2,d_m1,d_g2,dD,dH,dW,opts.cc_kernel_size,NULL);
+            wgpu_fused_cc_loss(d_m1, d_m2, d_g1, d_g2, dD, dH, dW,
+                               opts.cc_kernel_size, read_loss ? &loss : NULL);
 
-            /* Batch backward */
-            wgpu_begin_batch();
+            /* Backward: grid_sample_bwd for both warps */
             wgpu_grid_sample_3d_bwd(d_g1,d_mb,d_sg1,d_gg1,1,1,mdD,mdH,mdW,dD,dH,dW);
             wgpu_grid_sample_3d_bwd(d_g2,d_fd,d_sg2,d_gg2,1,1,dD,dH,dW,dD,dH,dW);
 
-            /* WarpAdam on both warps — all on GPU */
+            /* WarpAdam on both warps */
             warp_adam_step(d_gg1,d_fw,d_fea,d_fev,d_ad1,d_scr,dD,dH,dW,
                            &fwd_step,b1,b2,eps,opts.lr,hr,d_gk,gk_len,d_wk,wk_len);
             warp_adam_step(d_gg2,d_rv,d_rea,d_rev,d_ad2,d_scr,dD,dH,dW,
                            &rev_step,b1,b2,eps,opts.lr,hr,d_gk,gk_len,d_wk,wk_len);
 
             if(it%50==0||it==iters-1) fprintf(stderr,"    iter %d/%d loss=%.6f\n",it,iters,loss);
-            if(fabsf(loss-pl)<opts.tolerance){cc++;if(cc>=opts.max_tolerance_iters){fprintf(stderr,"    Converged at iter %d\n",it);break;}}
-            else cc=0;
-            pl=loss;
+            if(read_loss) {
+                if(fabsf(loss-pl)<opts.tolerance){cc++;if(cc>=opts.max_tolerance_iters){fprintf(stderr,"    Converged at iter %d\n",it);break;}}
+                else cc=0;
+                pl=loss;
+            }
         }
 
         wgpuBufferRelease(d_ag);wgpuBufferRelease(d_ig);

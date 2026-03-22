@@ -27,8 +27,8 @@ fn inp(b: u32, c: u32, d: i32, h: i32, w: i32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn grid_sample_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn grid_sample_bwd(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 256u;
     let total = p.B * p.oD * p.oH * p.oW;
     if (idx >= total) { return; }
 

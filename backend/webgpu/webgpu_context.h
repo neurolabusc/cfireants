@@ -118,6 +118,18 @@ static inline uint32_t wgpu_div_ceil(uint32_t n, uint32_t d) {
     return (n + d - 1) / d;
 }
 
+/* Compute 2D dispatch dimensions that fit within the 65535 workgroup limit.
+ * total_wg = total workgroups needed. Sets *wx and *wy for dispatch. */
+static inline void wgpu_dispatch_dims(uint32_t total_wg, uint32_t *wx, uint32_t *wy) {
+    if (total_wg <= 65535) {
+        *wx = total_wg; *wy = 1;
+    } else {
+        /* Split into roughly square 2D grid */
+        *wy = (total_wg + 65534) / 65535;
+        *wx = (total_wg + *wy - 1) / *wy;
+    }
+}
+
 /* Create a uniform buffer initialized with data (convenience for params structs) */
 static inline WGPUBuffer wgpu_make_params(const void *data, size_t size) {
     return wgpu_create_buffer_init(data, size,

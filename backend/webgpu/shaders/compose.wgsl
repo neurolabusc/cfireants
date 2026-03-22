@@ -33,8 +33,8 @@ fn sample_warp(nx: f32, ny: f32, nz: f32, c: u32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn compositive_update(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn compositive_update(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 256u;
     let total = p.D * p.H * p.W;
     if (idx >= total) { return; }
 

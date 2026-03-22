@@ -15,16 +15,16 @@ struct Params {
 
 // fill: data[i] = value
 @compute @workgroup_size(256)
-fn fill(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn fill(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= params.n) { return; }
     data[i] = params.value;
 }
 
 // scale: data[i] *= value
 @compute @workgroup_size(256)
-fn scale(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn scale(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= params.n) { return; }
     data[i] = data[i] * params.value;
 }
@@ -34,8 +34,8 @@ fn scale(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(2) var<storage, read> x_data: array<f32>;
 
 @compute @workgroup_size(256)
-fn axpy(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn axpy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= params.n) { return; }
     data[i] = data[i] + params.value * x_data[i];
 }

@@ -3,7 +3,7 @@
 Pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) — GPU-accelerated medical image registration using adaptive Riemannian optimization. Provides rigid, affine, and diffeomorphic deformable registration via two GPU backends:
 
 - **CUDA** — production quality, exceeds Python on all validation datasets
-- **WebGPU** — portable via wgpu-native/Vulkan, in active development
+- **WebGPU** — portable via wgpu-native (Vulkan on Linux, Metal on macOS), in active development
 
 Based on FireANTs commit [`0d13a3f`](https://github.com/rohitrango/FireANTs/tree/0d13a3f).
 
@@ -28,16 +28,20 @@ make -j$(nproc)
 Run the full validation pipeline (Moments → Rigid → Affine → SyN) from the repo root:
 
 ```bash
-# CUDA
+# CUDA (FFT downsample, default)
 build/test_validate_all --dataset small
+
+# CUDA (trilinear downsample, GPU-native)
+build/test_validate_all --dataset small --trilinear
 
 # WebGPU
 build/test_validate_webgpu --dataset small
+build/test_validate_webgpu --dataset small --trilinear
 ```
 
 ## Validation Results
 
-Measured on NVIDIA RTX 4090. Full pipeline: Moments → Rigid → Affine → SyN/Greedy.
+Full pipeline: Moments → Rigid → Affine → SyN/Greedy.
 
 ### CUDA Backend
 
@@ -49,22 +53,60 @@ Measured on NVIDIA RTX 4090. Full pipeline: Moments → Rigid → Affine → SyN
 
 (NCC After — higher is better. Bold = best in row.)
 
-### WebGPU Backend (CC-only mode, small dataset)
+### Downsample Modes
 
-| Stage | WebGPU | CUDA |
-|-------|--------|------|
-| Rigid | 1.1s | 1.0s |
-| Affine | 1.4s | 1.4s |
-| SyN | ~11s | 0.4s |
+Both CUDA and WebGPU support two downsampling modes for multi-scale registration:
 
-| Metric | WebGPU (CC) | CUDA (MI+CC) |
-|--------|-------------|--------------|
-| NCC Before | 0.5957 | 0.5957 |
-| NCC After | 0.8139 | 0.9614 |
+- **FFT** (default) — FFT-based downsample matching Python. CUDA uses cuFFT on GPU; WebGPU uses kissfft on CPU.
+- **Trilinear** (`--trilinear`) — Gaussian blur + trilinear resize, fully GPU-native on both backends. Enables like-for-like comparison between CUDA and WebGPU.
 
-Rigid and affine match CUDA speed. NCC quality gap is from using CC loss instead of MI for linear stages (MI GPU shader in progress). See [CLAUDE.md](CLAUDE.md) for the detailed plan.
+### CUDA vs WebGPU — Trilinear Mode (small dataset, NVIDIA GB10 Vulkan)
 
-See [validate/README.md](validate/README.md) for detailed CUDA benchmarks.
+Like-for-like comparison using `--trilinear` on the same hardware. Both use MI loss for rigid/affine, CC loss for SyN.
+
+| Metric | CUDA | WebGPU | Ratio |
+|--------|------|--------|-------|
+| NCC Before | 0.5957 | 0.5957 | — |
+| **NCC After** | **0.9644** | **0.9643** | **1.000** |
+| Local NCC Loss | -0.6680 | -0.6692 | 1.002 |
+| Total Time | 7.5s | 14.2s | 1.9x |
+| Moments | 0.2s | 0.3s | 1.5x |
+| Rigid (MI) | 2.8s | 0.9s | 0.3x |
+| Affine (MI) | 3.0s | 1.1s | 0.4x |
+| SyN (CC) | 1.4s | 11.9s | 8.5x |
+| Peak RAM | 140 MB | 445 MB | 3.2x |
+
+**WebGPU matches CUDA accuracy** (NCC 0.9643 vs 0.9644). MI loss drives rigid/affine. Fused CC loss (matching CUDA `fused_cc.cu`) drives SyN. WebGPU MI is faster than CUDA MI (CUDA downloads full images for max-finding each iteration). SyN is slower due to per-iteration dispatch overhead.
+
+### All Datasets — CUDA Trilinear (NVIDIA GB10)
+
+| Dataset | NCC Before | NCC After | Local NCC | Time | Peak RAM |
+|---------|-----------|-----------|-----------|------|----------|
+| small (2mm full-head) | 0.5957 | **0.9644** | -0.6680 | 7.5s | 140 MB |
+| medium (1mm brain) | 0.5753 | **0.9536** | -0.8753 | 18.2s | 295 MB |
+| large (1mm full-head) | 0.7254 | **0.9213** | -0.3784 | 55.1s | 369 MB |
+
+### All Datasets — Trilinear Mode (NVIDIA GB10 Vulkan)
+
+| Dataset | CUDA NCC | WebGPU NCC | CUDA Time | WebGPU Time | CUDA RAM | WebGPU RAM |
+|---------|----------|------------|-----------|-------------|----------|------------|
+| small (2mm full-head) | 0.9644 | **0.9647** | 7.5s | 13.7s | 140 MB | 485 MB |
+| medium (1mm brain) | 0.9536 | **0.9541** | 18.2s | 90.5s | 295 MB | 854 MB |
+| large (1mm full-head) | 0.9213 | **0.9190** | 55.1s | 93.2s | 369 MB | 870 MB |
+
+**WebGPU matches CUDA accuracy on all datasets** (within 0.3%). Both backends use identical registration parameters: MI loss for full-head rigid/affine, CC for brain-extracted rigid/affine, fused CC for SyN deformable.
+
+### CUDA: FFT vs Trilinear (small dataset)
+
+| Metric | FFT (default) | Trilinear |
+|--------|--------------|-----------|
+| NCC After | 0.9614 | 0.9644 |
+| Total Time | 7.6s | 7.5s |
+| Peak RAM | 147 MB | 140 MB |
+
+Trilinear matches or exceeds FFT accuracy. All measurements on NVIDIA GB10 (unified memory).
+
+See [CLAUDE.md](CLAUDE.md) for WebGPU architecture and known issues. See [validate/README.md](validate/README.md) for detailed CUDA benchmarks.
 
 ## Why C?
 

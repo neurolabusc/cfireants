@@ -5,16 +5,15 @@
 // u32 atomicAdd (fast). After barrier, local values are merged to global
 // via native atomicAdd (no CAS -- Metal-compatible).
 //
-// Overflow analysis: FP_SCALE=256, max per bin = N * 256 (worst case).
-// Safe for N <= 16M voxels (~256^3). In practice, weights are distributed
-// across bins, so safe for much larger volumes.
+// Overflow analysis: hp.fp_scale=4096, max per bin = N * 4096 (worst case).
+// Safe for N <= 1M voxels (~100^3). In practice, weights are distributed
+// across bins, so safe for larger volumes. For volumes >1M voxels at
+// full resolution, consider reducing hp.fp_scale.
 
 const NB: u32 = 32u;
 const NB2: u32 = 1024u;
 const WG: u32 = 256u;
-const FP_SCALE: f32 = 256.0;
-
-struct HP { n: u32, num_bins: u32, inv_maxval: f32, preterm: f32, }
+struct HP { n: u32, num_bins: u32, inv_maxval: f32, preterm: f32, fp_scale: f32, _p0: u32, _p1: u32, _p2: u32, }
 
 @group(0) @binding(0) var<storage, read> h_pred: array<f32>;
 @group(0) @binding(1) var<storage, read> h_target: array<f32>;
@@ -31,13 +30,14 @@ var<workgroup> lb: array<atomic<u32>, 32>;
 fn histogram(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let tid = lid.x;
     for (var k = tid; k < NB2; k += WG) { atomicStore(&lj[k], 0u); }
     if (tid < NB) { atomicStore(&la[tid], 0u); atomicStore(&lb[tid], 0u); }
     workgroupBarrier();
 
-    let i = gid.x;
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i < hp.n) {
         let im = hp.inv_maxval;
         let pt = hp.preterm;
@@ -72,17 +72,17 @@ fn histogram(
 
         // Accumulate into local histogram (fixed-point atomicAdd)
         for (var a = plo; a < phi; a++) {
-            let wfp = u32(wa[a] * FP_SCALE + 0.5);
+            let wfp = u32(wa[a] * hp.fp_scale + 0.5);
             if (wfp > 0u) {
                 atomicAdd(&la[a], wfp);
                 for (var b = tlo; b < thi; b++) {
-                    let jfp = u32(wa[a] * wb[b] * FP_SCALE + 0.5);
+                    let jfp = u32(wa[a] * wb[b] * hp.fp_scale + 0.5);
                     if (jfp > 0u) { atomicAdd(&lj[a * NB + b], jfp); }
                 }
             }
         }
         for (var b = tlo; b < thi; b++) {
-            let wfp = u32(wb[b] * FP_SCALE + 0.5);
+            let wfp = u32(wb[b] * hp.fp_scale + 0.5);
             if (wfp > 0u) { atomicAdd(&lb[b], wfp); }
         }
     }
