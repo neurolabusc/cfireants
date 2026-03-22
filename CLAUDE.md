@@ -190,7 +190,6 @@ Functional pipeline via wgpu-native (Vulkan on Linux, Metal on macOS). Compatibl
 - **Metal shader restrictions** — naga (wgpu's shader compiler) rejects variable indexing of local `array<T, N>` on Metal. Workaround: use `vec3/vec4` (support variable indexing) or helper functions with `if/else` chains. Affects `affine_grid_bwd.wgsl` and `blur_dhw3.wgsl` (both fixed).
 - ~~MI gradient weakness~~ — **Fixed.** Dynamic FP_SCALE (up to 4096, auto-scaled for volume size). MI drives effective rigid/affine convergence on all datasets.
 - ~~SyN warp field resize~~ — **Fixed.** Now uses trilinear interpolation (matching CUDA).
-- ~~Dispatch limit >65535~~ — **Fixed.** 2D dispatch + auto-split in `wgpu_dispatch`.
 - Segfault on exit during wgpu-native cleanup — cosmetic, does not affect results
 - Pipeline cache stores string literal pointers — names must be static/literal
 
@@ -266,9 +265,9 @@ Full validation completed on all three datasets. WebGPU matches CUDA within 0.3%
 - MI loss: GPU histogram with dynamic FP_SCALE (up to 4096, auto-scaled for volume size). Matches CPU MI to 5e-5 (loss) and 2e-9 (gradient). Falls back to CPU when num_bins != 32.
 
 ### Metal vs WebGPU (small dataset, trilinear, Apple M4 Pro)
-- Metal matches WebGPU within 0.07% global NCC (0.9635 vs 0.9642).
+- Metal matches WebGPU within 0.1% global NCC (0.9636 vs 0.9642).
 - Rigid/affine matrices agree within ~0.005 rotation / ~0.3mm translation (expected float32 precision).
-- Metal runs 7.3x faster than WebGPU on same hardware (8.2s vs 59.9s) — Metal dispatches execute synchronously with zero-copy unified memory, while WebGPU has per-dispatch overhead.
+- Metal runs 2–8x faster than WebGPU on same hardware (7.2s vs 60s on small, 36s vs 89s on large) — Metal uses batched command buffers with zero-copy unified memory, while WebGPU has per-dispatch overhead.
 - **Important metric note:** Use global NCC (Pearson correlation) for cross-backend comparison, not local NCC (kernel=5). Local NCC gives ~0.55-0.70, global NCC gives ~0.95-0.96. The old Metal metrics (NCC After 0.6771) used local NCC and were not comparable to CUDA/WebGPU global NCC.
 
 ## Metal Backend
@@ -288,7 +287,7 @@ Native Metal backend for macOS/Apple Silicon. Uses unified memory (MTLResourceSt
 
 | Config | NCC After (global) | Local NCC Loss | Time |
 |--------|-------------------|----------------|------|
-| Metal MI+trilinear | **0.9635** | -0.5508 | 8.2s |
+| Metal MI+trilinear | **0.9636** | -0.6664 | 7.2s |
 | Metal CC+trilinear | 0.9536 | -0.5892 | 7.1s |
 | WebGPU MI+trilinear | **0.9642** | -0.6686 | 59.9s |
 

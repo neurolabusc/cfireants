@@ -554,10 +554,15 @@ void metal_blur_disp_dhw3(float *data, float *scratch,
     const void *bufs2[] = { data, scratch, kernel_data };
     metal_dispatch(pso2, bufs2, NULL, 3, &params, sizeof(params), total);
 
-    if (!was_batching) metal_flush_batch();
+    /* Always flush before CPU memcpy — even if an outer batch is active,
+     * we must ensure the 3 blur dispatches have completed. */
+    metal_flush_batch();
 
     /* Copy result back: scratch -> data (unified memory) */
     memcpy(data, scratch, (size_t)total * sizeof(float));
+
+    /* Restart outer batch if we interrupted one */
+    if (was_batching) metal_begin_batch();
 }
 
 /*

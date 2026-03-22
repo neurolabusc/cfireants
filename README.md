@@ -4,7 +4,7 @@ Pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) — GPU-accele
 
 - **CUDA** — production quality, exceeds Python on all validation datasets
 - **WebGPU** — portable via wgpu-native (Vulkan on Linux, Metal on macOS)
-- **Metal** — native macOS/Apple Silicon, 2–7x faster than WebGPU on same hardware
+- **Metal** — native macOS/Apple Silicon, 2–8x faster than WebGPU on same hardware
 
 Based on FireANTs commit [`0d13a3f`](https://github.com/rohitrango/FireANTs/tree/0d13a3f).
 

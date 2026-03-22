@@ -259,7 +259,12 @@ void metal_dispatch(void *pipeline,
             if (!ref) {
                 fprintf(stderr, "metal_dispatch: buffer %d (ptr=%p) not found in table\n",
                         i, buffer_ptrs[i]);
-                if (!batched) [enc endEncoding];
+                if (batched) {
+                    /* Abort the batch to avoid corrupted encoder state */
+                    metal_flush_batch();
+                } else {
+                    [enc endEncoding];
+                }
                 return;
             }
             id<MTLBuffer> buf = (__bridge id<MTLBuffer>)ref;
