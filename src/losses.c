@@ -267,6 +267,103 @@ int cpu_cc_loss_3d(const tensor_t *pred, const tensor_t *target,
     return 0;
 }
 
+/* Fused CC loss matching CUDA fused_cc.cu / Metal fcc_* exactly */
+int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
+                       int kernel_size, float *loss_out,
+                       tensor_t *grad_pred, tensor_t *grad_target) {
+    int D = pred->shape[2], H = pred->shape[3], W = pred->shape[4];
+    int n = D * H * W;
+    int kv = kernel_size * kernel_size * kernel_size;
+    float nr = 1e-5f, dr = 1e-5f;
+
+    const float *I = tensor_data_f32(pred);
+    const float *J = tensor_data_f32(target);
+    int shape[5] = {1, 1, D, H, W};
+    if (grad_pred) tensor_alloc(grad_pred, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
+    if (grad_target) tensor_alloc(grad_target, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
+
+    /* Step 1: Create 5 intermediates */
+    float *b_I   = (float *)malloc(n * sizeof(float));
+    float *b_J   = (float *)malloc(n * sizeof(float));
+    float *b_I2  = (float *)malloc(n * sizeof(float));
+    float *b_J2  = (float *)malloc(n * sizeof(float));
+    float *b_IJ  = (float *)malloc(n * sizeof(float));
+    float *tmp   = (float *)malloc(n * sizeof(float));
+
+    memcpy(b_I, I, n * sizeof(float));
+    memcpy(b_J, J, n * sizeof(float));
+    for (int i = 0; i < n; i++) { b_I2[i] = I[i]*I[i]; b_J2[i] = J[i]*J[i]; b_IJ[i] = I[i]*J[i]; }
+
+    /* Step 2: Box filter all 5 */
+    separable_box_filter_3d(b_I,  b_I,  D, H, W, kernel_size, tmp);
+    separable_box_filter_3d(b_J,  b_J,  D, H, W, kernel_size, tmp);
+    separable_box_filter_3d(b_I2, b_I2, D, H, W, kernel_size, tmp);
+    separable_box_filter_3d(b_J2, b_J2, D, H, W, kernel_size, tmp);
+    separable_box_filter_3d(b_IJ, b_IJ, D, H, W, kernel_size, tmp);
+
+    /* Step 3: Forward NCC */
+    if (loss_out) {
+        double ncc_sum = 0;
+        for (int i = 0; i < n; i++) {
+            float mu = b_I[i], rho = b_J[i];
+            float A = (float)kv * (b_IJ[i] - mu*rho);
+            float B = (float)kv * (b_I2[i] - mu*mu); if (B < dr) B = dr;
+            float C = (float)kv * (b_J2[i] - rho*rho); if (C < dr) C = dr;
+            float ncc = (A*A + nr) / (B*C + dr);
+            if (ncc > 1.0f) ncc = 1.0f; if (ncc < -1.0f) ncc = -1.0f;
+            ncc_sum += ncc;
+        }
+        *loss_out = -(float)(ncc_sum / n);
+    }
+
+    /* Steps 4-6: Backward */
+    if (grad_pred || grad_target) {
+        float gO = -1.0f / (float)n;
+        int cgt = (grad_target != NULL) ? 1 : 0;
+
+        /* Step 4: bwd_modify — overwrite intermediates with gradient multipliers */
+        for (int i = 0; i < n; i++) {
+            float mu = b_I[i], rho = b_J[i];
+            float A = (float)kv * (b_IJ[i] - mu*rho);
+            float B = (float)kv * (b_I2[i] - mu*mu);
+            float C = (float)kv * (b_J2[i] - rho*rho);
+            float Dv = 2.0f * gO * A / (B*C + dr);
+            B += dr; C += dr;
+            b_I[i]  = Dv;                           /* gini_a */
+            b_J[i]  = Dv * A / B;                   /* gini_b */
+            b_I2[i] = Dv * (A / B * mu - rho);      /* gini_mu */
+            if (cgt) {
+                b_J2[i] = Dv * A / C;               /* gini_c */
+                b_IJ[i] = Dv * (A / C * rho - mu);  /* gini_mu2 */
+            }
+        }
+
+        /* Step 5: Box filter adjoint */
+        separable_box_filter_3d(b_I,  b_I,  D, H, W, kernel_size, tmp);
+        separable_box_filter_3d(b_J,  b_J,  D, H, W, kernel_size, tmp);
+        separable_box_filter_3d(b_I2, b_I2, D, H, W, kernel_size, tmp);
+        if (cgt) {
+            separable_box_filter_3d(b_J2, b_J2, D, H, W, kernel_size, tmp);
+            separable_box_filter_3d(b_IJ, b_IJ, D, H, W, kernel_size, tmp);
+        }
+
+        /* Step 6: Final gradients */
+        if (grad_pred) {
+            float *gp = tensor_data_f32(grad_pred);
+            for (int i = 0; i < n; i++)
+                gp[i] = b_I[i]*J[i] - b_J[i]*I[i] + b_I2[i];
+        }
+        if (grad_target) {
+            float *gt = tensor_data_f32(grad_target);
+            for (int i = 0; i < n; i++)
+                gt[i] = b_I[i]*I[i] - b_J2[i]*J[i] + b_IJ[i];
+        }
+    }
+
+    free(b_I); free(b_J); free(b_I2); free(b_J2); free(b_IJ); free(tmp);
+    return 0;
+}
+
 /* CC loss with both pred and target gradients (for SyN fused CC) */
 int cpu_cc_loss_3d_both(const tensor_t *pred, const tensor_t *target,
                          int kernel_size, float *loss_out,

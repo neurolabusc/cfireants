@@ -341,11 +341,11 @@ int syn_register(const image_t *fixed, const image_t *moving,
             cpu_grid_sample_3d_forward(&moving_blur, &fwd_sg, &moved, 1);
             cpu_grid_sample_3d_forward(&fixed_down, &rev_sg, &fixed_warped, 1);
 
-            /* 4. Fused CC loss — both pred and target gradients in one call */
+            /* 4. Fused CC loss — matching Metal fused_cc.cu exactly */
             float loss;
             tensor_t grad_moved, grad_fixed_warped;
-            cpu_cc_loss_3d_both(&moved, &fixed_warped, opts.cc_kernel_size, &loss,
-                                 &grad_moved, &grad_fixed_warped);
+            cpu_fused_cc_loss(&moved, &fixed_warped, opts.cc_kernel_size, &loss,
+                               &grad_moved, &grad_fixed_warped);
 
             /* 5. Backward through grid_sample */
             tensor_t grad_fwd_grid, grad_rev_grid;
