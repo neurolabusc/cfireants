@@ -127,25 +127,6 @@ static void quat_rotmat_jacobian(const float q[4], float dR_dq[4][3][3]) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Build Gaussian kernel for blur (matching Python separable_filtering)*/
-/* ------------------------------------------------------------------ */
-
-static float *make_gauss_kernel(float sigma, int *out_klen) {
-    int tail = (int)(2.0f * sigma + 0.5f);
-    int klen = 2 * tail + 1;
-    float *h_k = (float *)malloc(klen * sizeof(float));
-    float inv = 1.0f / (sigma * sqrtf(2.0f));
-    float ksum = 0;
-    for (int i = 0; i < klen; i++) {
-        float x = (float)(i - tail);
-        h_k[i] = 0.5f * (erff((x+0.5f)*inv) - erff((x-0.5f)*inv));
-        ksum += h_k[i];
-    }
-    for (int i = 0; i < klen; i++) h_k[i] /= ksum;
-    *out_klen = klen;
-    return h_k;
-}
-
 /* ------------------------------------------------------------------ */
 /* GPU rigid registration                                              */
 /* ------------------------------------------------------------------ */
@@ -224,47 +205,26 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
         long mSDown = (long)mdD * mdH * mdW;
 
         /* Downsample on GPU (matching Python rigid.optimize):
-         * fixed: downsample_fft
-         * moving: downsample_fft + extra Gaussian blur (_smooth_image_not_mask) */
+         * fixed: downsample (FFT or trilinear)
+         * moving: downsample + extra Gaussian blur (_smooth_image_not_mask) */
         id<MTLBuffer> fdown_buf = nil, mdown_buf = nil;
         float *d_fdown, *d_mdown;
         if (scale > 1) {
             d_fdown = metal_alloc_buf(spatial*sizeof(float), &fdown_buf);
             d_mdown = metal_alloc_buf(mSDown*sizeof(float), &mdown_buf);
-            metal_downsample_fft(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
-            metal_downsample_fft(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
-
-            /* Extra Gaussian blur on moving (matching Python rigid line 345:
-             * moving_image_blur = self._smooth_image_not_mask(moving_image_blur, gaussians))
-             * Python uses per-axis sigmas: sigma[i] = 0.5 * fixed_size[i] / size_down[i]
-             * with separable_filtering applying a different kernel per axis */
-            {
-                float sigmas[3] = {
-                    0.5f * (float)fD / (float)dD,
-                    0.5f * (float)fH / (float)dH,
-                    0.5f * (float)fW / (float)dW
-                };
-                id<MTLBuffer> scratch_buf;
-                float *d_scratch = metal_alloc_buf(mSDown * sizeof(float), &scratch_buf);
-
-                for (int axis = 0; axis < 3; axis++) {
-                    int klen;
-                    float *h_k = make_gauss_kernel(sigmas[axis], &klen);
-
-                    /* Allocate kernel buffer on Metal and copy */
-                    id<MTLBuffer> kern_buf;
-                    float *d_k = metal_alloc_buf(klen * sizeof(float), &kern_buf);
-                    memcpy(d_k, h_k, klen * sizeof(float));
-                    free(h_k);
-
-                    metal_conv1d_axis(d_mdown, d_scratch, mdD, mdH, mdW, d_k, klen, axis);
-                    /* Copy result back (shared memory — just memcpy) */
-                    memcpy(d_mdown, d_scratch, mSDown * sizeof(float));
-
-                    metal_free_buf(d_k, kern_buf);
-                }
-                metal_free_buf(d_scratch, scratch_buf);
+            if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
+                metal_blur_downsample(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
+                metal_blur_downsample(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
+            } else {
+                metal_downsample_fft(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
+                metal_downsample_fft(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
             }
+
+            /* Extra Gaussian blur on moving (matching Python rigid line 345) */
+            metal_blur_volume(d_mdown, mdD, mdH, mdW,
+                              0.5f * (float)fD / (float)dD,
+                              0.5f * (float)fH / (float)dH,
+                              0.5f * (float)fW / (float)dW);
         } else {
             d_fdown = d_fixed;
             d_mdown = d_moving;
@@ -547,14 +507,19 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
         long spatial=(long)dD*dH*dW, n3=spatial*3, mSD=(long)mdD*mdH*mdW;
 
         /* Downsample on GPU (matching Python affine.optimize):
-         * Both images: downsample_fft (NO extra blur on moving, unlike rigid) */
+         * Both images: downsample (NO extra blur on moving, unlike rigid) */
         id<MTLBuffer> fdown_buf = nil, mdown_buf = nil;
         float *d_fdown, *d_mdown;
         if (scale > 1) {
             d_fdown = metal_alloc_buf(spatial*sizeof(float), &fdown_buf);
             d_mdown = metal_alloc_buf(mSD*sizeof(float), &mdown_buf);
-            metal_downsample_fft(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
-            metal_downsample_fft(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
+            if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
+                metal_blur_downsample(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
+                metal_blur_downsample(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
+            } else {
+                metal_downsample_fft(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
+                metal_downsample_fft(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
+            }
         } else {
             d_fdown = d_fixed; d_mdown = d_moving;
             mdD = mD; mdH = mH; mdW = mW;

@@ -1,9 +1,10 @@
 # cfireants
 
-Pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) — GPU-accelerated medical image registration using adaptive Riemannian optimization. Provides rigid, affine, and diffeomorphic deformable registration via two GPU backends:
+Pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) — GPU-accelerated medical image registration using adaptive Riemannian optimization. Provides rigid, affine, and diffeomorphic deformable registration via three GPU backends:
 
 - **CUDA** — production quality, exceeds Python on all validation datasets
-- **WebGPU** — portable via wgpu-native (Vulkan on Linux, Metal on macOS), in active development
+- **WebGPU** — portable via wgpu-native (Vulkan on Linux, Metal on macOS)
+- **Metal** — native macOS/Apple Silicon, 7x faster than WebGPU on same hardware
 
 Based on FireANTs commit [`0d13a3f`](https://github.com/rohitrango/FireANTs/tree/0d13a3f).
 
@@ -106,15 +107,25 @@ Like-for-like comparison using `--trilinear` on the same hardware. Both use MI l
 
 Trilinear matches or exceeds FFT accuracy. All measurements on NVIDIA GB10 (unified memory).
 
-See [CLAUDE.md](CLAUDE.md) for WebGPU architecture and known issues. See [validate/README.md](validate/README.md) for detailed CUDA benchmarks.
+### All Datasets — Trilinear Mode (Apple M4 Pro, Metal backend via wgpu-native)
+
+| Dataset | WebGPU NCC | Metal NCC | WebGPU Time | Metal Time | Metal RAM |
+|---------|------------|-----------|-------------|------------|-----------|
+| small (2mm full-head) | 0.9642 | **0.9638** | 60.1s | 8.5s | 391 MB |
+| medium (1mm brain) | 0.9541 | **0.9542** | 131.7s | 20.8s | 3023 MB |
+| large (1mm full-head) | 0.9191 | **0.9198** | 88.5s | 44.0s | 3259 MB |
+
+**Metal matches WebGPU accuracy on all datasets** (within 0.1%) and runs **2–7x faster** on the same Apple M4 Pro hardware. WebGPU runs via wgpu-native's Metal backend, so both use the same GPU — the speed difference comes from Metal's native API with unified memory (zero-copy) vs WebGPU's abstraction overhead. Both backends use identical registration parameters: MI loss for full-head rigid/affine, CC for brain-extracted, fused CC for SyN.
+
+See [CLAUDE.md](CLAUDE.md) for architecture details and known issues. See [validate/README.md](validate/README.md) for detailed CUDA benchmarks.
 
 ## Why C?
 
 - No Python/PyTorch runtime dependency
-- Predictable ~900 MB GPU memory regardless of image size
+- Predictable ~900 MB GPU memory regardless of image size (CUDA); ~400 MB (Metal small)
 - Explicit forward+backward (no autograd overhead)
-- Single static library (`libcfireants.a` + `libcfireants_cuda.a`)
-- WebGPU backend enables portability beyond NVIDIA GPUs
+- Single static library (`libcfireants.a` + backend libs)
+- Three GPU backends: CUDA (production), WebGPU (portable), Metal (macOS native)
 
 ## License
 

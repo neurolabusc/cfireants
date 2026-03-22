@@ -4,16 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-cfireants is a pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) (commit `0d13a3f`), a GPU-accelerated medical image registration library using adaptive Riemannian optimization. It provides rigid, affine, and diffeomorphic deformable registration with two GPU backends:
+cfireants is a pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) (commit `0d13a3f`), a GPU-accelerated medical image registration library using adaptive Riemannian optimization. It provides rigid, affine, and diffeomorphic deformable registration with three GPU backends:
 
 - **CUDA** — production quality, matches or exceeds Python on all validation datasets
-- **WebGPU** — functional, portable via wgpu-native (Vulkan on Linux, Metal on macOS). In active development.
+- **WebGPU** — portable via wgpu-native (Vulkan on Linux, Metal on macOS). Matches CUDA within 0.3% NCC.
+- **Metal** — native macOS/Apple Silicon. Matches WebGPU within 0.07% NCC, runs 7x faster on same hardware.
 
-The goal is a faithful C reproduction of the Python data flow across both backends.
+The goal is a faithful C reproduction of the Python data flow across all backends.
 
 ## Build
 
-Requires CMake >= 3.18, a C11 compiler, and zlib. CUDA and WebGPU backends are optional.
+Requires CMake >= 3.18, a C11 compiler, and zlib. All GPU backends are optional.
 
 ```bash
 mkdir -p build && cd build
@@ -28,6 +29,14 @@ make -j$(nproc)
 
 # WebGPU only (macOS or Linux without CUDA)
 cmake .. -DCFIREANTS_CUDA=OFF -DCFIREANTS_WEBGPU=ON
+make -j$(nproc)
+
+# Metal only (macOS/Apple Silicon)
+cmake .. -DCFIREANTS_CUDA=OFF -DCFIREANTS_METAL=ON
+make -j$(nproc)
+
+# WebGPU + Metal (macOS — both on same hardware for comparison)
+cmake .. -DCFIREANTS_CUDA=OFF -DCFIREANTS_WEBGPU=ON -DCFIREANTS_METAL=ON
 make -j$(nproc)
 
 # WebGPU requires wgpu-native v27.0.4.0+ in third_party/wgpu/
@@ -62,6 +71,12 @@ build/test_fft_fallback                # kissfft vs cuFFT comparison
 build/test_webgpu_linear               # Moments + Rigid + Affine pipeline
 build/test_validate_webgpu --dataset small              # Full pipeline validation
 build/test_validate_webgpu --dataset small --trilinear  # GPU-native downsample
+
+# Metal tests
+build/test_metal_backend                               # Element-wise ops, grid sample
+build/test_metal_linear                                # Moments + Rigid + Affine pipeline
+build/test_validate_metal --dataset small               # Full pipeline (MI+CC, FFT)
+build/test_validate_metal --dataset small --trilinear   # Full pipeline (MI+CC, trilinear)
 ```
 
 ## Architecture
@@ -86,8 +101,9 @@ Each stage uses multi-scale optimization with configurable loss functions (CC or
 - **CPU** (`backend/cpu/`) — reference implementations, stubs for compute-intensive ops
 - **CUDA** (`backend/cuda/`) — production GPU backend with fused kernels
 - **WebGPU** (`backend/webgpu/`) — portable GPU backend via wgpu-native
+- **Metal** (`backend/metal/`) — native macOS/Apple Silicon GPU backend
 
-The CUDA and WebGPU backends also have **fused registration loops** that bypass `backend_ops_t` for performance — these call GPU kernels directly within the optimization loop, minimizing CPU↔GPU transfers.
+All three GPU backends have **fused registration loops** that bypass `backend_ops_t` for performance — calling GPU kernels directly within the optimization loop, minimizing CPU↔GPU transfers.
 
 ### Source Layout
 
@@ -97,6 +113,7 @@ src/                   Core C (tensor, nifti_io, image, interpolator, losses, ut
 src/registration/      Registration algorithms (moments, rigid, affine, greedy, syn)
 backend/cuda/          CUDA kernels + fused registration loops
 backend/webgpu/        WebGPU shaders + dispatch + fused loops + FFT fallback
+backend/metal/         Metal shaders + dispatch + fused loops + MPSGraph FFT
 third_party/kissfft/   BSD-3 FFT library for WebGPU CPU fallback
 third_party/wgpu/      wgpu-native static library (Vulkan on Linux, Metal on macOS)
 tests/                 Test programs
@@ -190,17 +207,19 @@ Fused CC loss ported from CUDA (`fused_cc.cu`) to WebGPU. Uses 5 separate interm
 - Race condition in `wgpu_blur_downsample` (buffer released before GPU work completed)
 - `wgpu_begin_batch()` before backward pass caused stale gradient reads
 
-### Priority 3: SyN Dispatch Overhead (remaining optimization)
+### Priority 3: SyN Dispatch Overhead — INVESTIGATED, ARCHITECTURAL LIMIT
 
-SyN is ~11s vs CUDA's 1.5s on small dataset. The overhead is from per-iteration sync points:
-- CC loss reads scalar loss → forces flush+poll (mitigated: only every 10 iters)
-- max_l2_norm reads partial sums → forces flush+poll
-- Fused CC does CPU-side gradient computation (step 6) — could be moved to GPU shader
+SyN is ~58s (WebGPU/Metal backend) vs ~8s (native Metal) on small dataset, M4 Pro.
 
-Approaches for future optimization:
-- **GPU-side step 6**: move final gradient computation (`gini_a*J - gini_b*I + gini_mu`) to WGSL shader
-- **Deferred loss readback**: pipeline the readback to overlap with next iteration
-- **Reduce per-iteration buffer allocations** in fused CC (currently allocates/releases 5+1 buffers per call)
+**Root cause: wgpu-native per-dispatch overhead.** Every `wgpu_dispatch()` in non-batch mode creates a command encoder, begins a compute pass, dispatches, ends the pass, finishes, submits, and polls. SyN does ~30 dispatches per iteration × 350 iterations = ~10,500 GPU round-trips. At ~0.1ms each overhead, this accounts for the majority of the gap vs native Metal.
+
+**Optimization attempts (all reverted — no benefit on unified memory):**
+- **GPU step 6 shader**: Replaced 5 CPU readbacks with 3 GPU dispatches. *Slower* — on M4 Pro unified memory, `wgpu_read_buffer` after a flush is essentially a pointer read (~0), while each new `wgpu_dispatch` costs ~0.1ms submit+poll overhead.
+- **Batch backward dispatches**: Wrapping grid_sample_bwd in `wgpu_begin_batch/flush`. *9s slower* — batch mode creates separate compute passes per pipeline change, adding overhead.
+- **Remove warp_adam poll**: Skipping `wgpuDevicePoll` after buffer copies. *12s slower* — command buffers pile up in wgpu-native's internal queue.
+- **3D texture trilinear resize**: Hardware texture sampling for downsample resize step. *No improvement* — resize only runs ~6 times total (scale transitions), not a bottleneck.
+
+**Conclusion:** The WebGPU dispatch model is fundamentally mismatched with unified memory GPUs. On discrete GPUs (NVIDIA Vulkan), the CPU→GPU latency is hidden by pipelining. On Apple Silicon unified memory, native Metal dispatch (synchronous, zero-copy) is 7-8x faster. WebGPU optimizations would need to restructure the entire dispatch model (e.g., recording all dispatches into a single command buffer per iteration) which is beyond the current architecture.
 
 ### Priority 4: FFT on GPU — DONE (via trilinear alternative)
 
@@ -212,11 +231,16 @@ Full validation completed on all three datasets. WebGPU matches CUDA within 0.3%
 
 ### Future Optimizations
 
-**Performance (SyN ~8x slower than CUDA):**
-- Fused CC step 6 runs on CPU (5 GPU readbacks per iteration). Move to GPU using `fused_cc_bwd_grads.wgsl` (shader exists but is unused).
-- Fused CC `bwd_modify` pack/unpack: rewrite shader to accept 5 separate buffers, eliminating 2 GPU copies per backward pass.
-- Reduce per-iteration buffer allocations in `wgpu_fused_cc_loss` (currently allocates/releases 5+1 buffers per call).
-- Deferred loss readback: pipeline to overlap with next iteration.
+**Trilinear downsample via 3D textures:**
+- Implemented for Metal (`trilinear_resize_texture` in grid_sample.metal). Uses `texture3d<float>` with `constexpr sampler(filter::linear)` for hardware interpolation. Accuracy identical to compute shader.
+- **No speed benefit** — the `replaceRegion` copy from buffer to texture costs more than the hardware interpolation saves. Resize only runs ~6 times per pipeline (scale transitions), so compute shader is already fast enough.
+- WebGPU: not implemented. Would require `Float32Filterable` device feature (requested optionally) and substantial bind group plumbing. Similar copy overhead expected via `wgpuQueueWriteTexture`.
+- 3D textures would only help if the inner-loop `grid_sample_3d_fwd` used texture sampling (runs every iteration), but grid_sample requires arbitrary coordinates from the affine/warp grid, which is already what texture sampling does — the compute shader approach is equivalent.
+
+**WebGPU SyN performance (architectural limit):**
+- The per-dispatch overhead (~0.1ms × ~10,500 dispatches per SyN run) is the dominant cost. This is an inherent property of wgpu-native's Metal backend, not fixable by shader optimization.
+- A major restructuring (single command buffer per iteration, persistent compute passes) could help but would require rewriting the dispatch model. Consider this if WebGPU performance on Apple Silicon is critical.
+- On discrete GPUs (NVIDIA Vulkan), the overhead should be lower since CPU→GPU latency is hidden by pipelining. The NVIDIA GB10 numbers (13.7s total) confirm this.
 
 **Dead code to clean up:**
 - `box_filter_channel_inplace` in `webgpu_kernels.c` — unused static function from earlier fused CC design.
@@ -239,12 +263,55 @@ Full validation completed on all three datasets. WebGPU matches CUDA within 0.3%
 - Grid sampling, affine grid, fused CC loss: identical to float32 (same algorithms, same `kv` scaling).
 - MI loss: GPU histogram with dynamic FP_SCALE (up to 4096, auto-scaled for volume size). Matches CPU MI to 5e-5 (loss) and 2e-9 (gradient). Falls back to CPU when num_bins != 32.
 
+### Metal vs WebGPU (small dataset, trilinear, Apple M4 Pro)
+- Metal matches WebGPU within 0.07% global NCC (0.9635 vs 0.9642).
+- Rigid/affine matrices agree within ~0.005 rotation / ~0.3mm translation (expected float32 precision).
+- Metal runs 7.3x faster than WebGPU on same hardware (8.2s vs 59.9s) — Metal dispatches execute synchronously with zero-copy unified memory, while WebGPU has per-dispatch overhead.
+- **Important metric note:** Use global NCC (Pearson correlation) for cross-backend comparison, not local NCC (kernel=5). Local NCC gives ~0.55-0.70, global NCC gives ~0.95-0.96. The old Metal metrics (NCC After 0.6771) used local NCC and were not comparable to CUDA/WebGPU global NCC.
+
+## Metal Backend
+
+Native Metal backend for macOS/Apple Silicon. Uses unified memory (MTLResourceStorageModeShared) for zero-copy CPU↔GPU access, MPSGraph for 3D FFT, and custom Metal compute shaders.
+
+**Key files:**
+- `backend/metal/metal_context.h/.m` — device init, pipeline cache, buffer tracking, dispatch
+- `backend/metal/metal_kernels.h/.m` — kernel dispatch wrappers for all GPU operations
+- `backend/metal/metal_fft.m` — MPSGraph FFT downsample + blur_downsample (trilinear)
+- `backend/metal/linear_metal.m` — rigid/affine fused loops
+- `backend/metal/greedy_metal.m` — greedy deformable loop
+- `backend/metal/syn_metal.m` — SyN loop + warp inverse
+- `backend/metal/shaders/*.metal` — 10 Metal Shading Language compute shader files
+
+### Metal Current Metrics (small dataset, Apple M4 Pro)
+
+| Config | NCC After (global) | Local NCC Loss | Time |
+|--------|-------------------|----------------|------|
+| Metal MI+trilinear | **0.9635** | -0.5508 | 8.2s |
+| Metal CC+trilinear | 0.9536 | -0.5892 | 7.1s |
+| WebGPU MI+trilinear | **0.9642** | -0.6686 | 59.9s |
+
+### Metal Design Decisions
+
+**Downsample modes:** Both FFT (MPSGraph) and trilinear (Gaussian blur + GPU resize) available via `opts.downsample_mode`. Trilinear uses existing `metal_conv1d_axis` (separable 1D blur) + `metal_trilinear_resize` (compute shader).
+
+**Unified memory advantage.** All tensor data lives in `MTLResourceStorageModeShared` buffers. The CPU can read/write GPU buffer contents directly after `waitUntilCompleted`. No explicit H2D/D2H transfers needed.
+
+**MI loss.** Uses CAS-based `atomic_uint` in threadgroup memory (Metal doesn't support `atomic<float>` in threadgroup), then native `device atomic<float>` for global merge. MI drives effective rigid/affine convergence on all tested datasets.
+
+### Metal Known Issues
+
+- `newLibraryWithFile:` deprecated warning (should use `newLibraryWithURL:`)
+- Warp inverse runs 550 sequential Metal dispatches (one per iteration) — could be batched
+- Pipeline cache stores string literal pointers — names must be static/literal
+- Segfault on exit during Metal cleanup — cosmetic, does not affect results
+
 ## Dependencies
 
 - **Core**: CMake >= 3.18, C11 compiler, zlib
 - **CUDA backend**: CUDA toolkit, cufft
 - **WebGPU backend**: wgpu-native (v27.0.4.0+, pre-downloaded in `third_party/wgpu/`)
-- **FFT fallback**: kissfft (BSD-3, vendored in `third_party/kissfft/`)
+- **Metal backend**: macOS 14.0+, Xcode with Metal 3.0, MetalPerformanceShadersGraph
+- **FFT fallback**: kissfft (BSD-3, vendored in `third_party/kissfft/`) — used by WebGPU only
 - Optional: zstd (for zstd-compressed NIfTI)
 
 ## Known Issues (CUDA)

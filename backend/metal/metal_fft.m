@@ -31,6 +31,22 @@
 /* Complex float type matching MPSDataTypeComplexFloat32 layout (real, imag) */
 typedef struct { float real, imag; } cfloat_t;
 
+/* Allocate a Metal shared-memory buffer and register it for dispatch. */
+static float *fft_alloc_buf(size_t bytes, id<MTLBuffer> *out_buf) {
+    id<MTLBuffer> buf = [g_metal.device newBufferWithLength:bytes
+                                                   options:MTLResourceStorageModeShared];
+    if (!buf) return NULL;
+    float *ptr = (float *)buf.contents;
+    metal_register_buffer(ptr, (__bridge void *)buf, bytes);
+    *out_buf = buf;
+    return ptr;
+}
+
+static void fft_free_buf(float *ptr, id<MTLBuffer> buf) {
+    if (ptr) metal_unregister_buffer(ptr);
+    (void)buf;
+}
+
 /*
  * Run a 3D FFT via MPSGraph using MTLBuffer for zero-copy I/O.
  *
@@ -226,4 +242,82 @@ void metal_downsample_fft(
 
     free(fft_out); free(shifted); free(cropped);
     free(trimmed); free(unshift); free(ifft_out);
+}
+
+/* ------------------------------------------------------------------ */
+/* Gaussian blur + trilinear resize (GPU-native, no FFT)               */
+/* ------------------------------------------------------------------ */
+
+static float *make_gauss_kernel_fft(float sigma, int *out_klen) {
+    if (sigma <= 0) {
+        float *k = (float *)malloc(sizeof(float));
+        k[0] = 1.0f;
+        *out_klen = 1;
+        return k;
+    }
+    int tail = (int)(2.0f * sigma + 0.5f);
+    int klen = 2 * tail + 1;
+    float *h = (float *)malloc(klen * sizeof(float));
+    float inv = 1.0f / (sigma * sqrtf(2.0f));
+    float ksum = 0;
+    for (int i = 0; i < klen; i++) {
+        float x = (float)(i - tail);
+        h[i] = 0.5f * (erff((x+0.5f)*inv) - erff((x-0.5f)*inv));
+        ksum += h[i];
+    }
+    for (int i = 0; i < klen; i++) h[i] /= ksum;
+    *out_klen = klen;
+    return h;
+}
+
+void metal_blur_volume(float *data, int D, int H, int W,
+                        float sigma_d, float sigma_h, float sigma_w)
+{
+    size_t sz = (size_t)D * H * W * sizeof(float);
+    id<MTLBuffer> scratch_buf;
+    float *scratch = fft_alloc_buf(sz, &scratch_buf);
+
+    float sigmas[3] = { sigma_d, sigma_h, sigma_w };
+    for (int axis = 0; axis < 3; axis++) {
+        int klen;
+        float *h_k = make_gauss_kernel_fft(sigmas[axis], &klen);
+
+        id<MTLBuffer> kern_buf;
+        float *d_k = fft_alloc_buf(klen * sizeof(float), &kern_buf);
+        memcpy(d_k, h_k, klen * sizeof(float));
+        free(h_k);
+
+        metal_conv1d_axis(data, scratch, D, H, W, d_k, klen, axis);
+        metal_sync();
+        memcpy(data, scratch, sz);
+
+        fft_free_buf(d_k, kern_buf);
+    }
+    fft_free_buf(scratch, scratch_buf);
+}
+
+void metal_blur_downsample(const float *input, float *output,
+                            int B, int C, int iD, int iH, int iW,
+                            int oD, int oH, int oW)
+{
+    metal_sync();
+
+    size_t in_sz = (size_t)iD * iH * iW * sizeof(float);
+
+    /* Allocate temporary for blur (don't modify input) */
+    id<MTLBuffer> blur_buf;
+    float *blurred = fft_alloc_buf(in_sz, &blur_buf);
+    memcpy(blurred, input, in_sz);
+
+    /* Gaussian blur with sigma = 0.5 * (in_dim / out_dim) per axis */
+    float sig_d = 0.5f * (float)iD / (float)oD;
+    float sig_h = 0.5f * (float)iH / (float)oH;
+    float sig_w = 0.5f * (float)iW / (float)oW;
+    metal_blur_volume(blurred, iD, iH, iW, sig_d, sig_h, sig_w);
+
+    /* Trilinear resize via hardware 3D texture sampling */
+    metal_trilinear_resize_texture(blurred, output, iD, iH, iW, oD, oH, oW, 1);
+    metal_sync();
+
+    fft_free_buf(blurred, blur_buf);
 }

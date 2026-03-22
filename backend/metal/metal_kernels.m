@@ -222,6 +222,77 @@ void metal_trilinear_resize(const float *input, float *output,
     metal_dispatch(pso, bufs, sizes, 2, &params, sizeof(params), total_threads);
 }
 
+/* Hardware 3D texture trilinear resize — single channel only.
+ * Creates a temporary MTLTexture from the input buffer, then dispatches
+ * the texture-sampling kernel. The GPU's texture unit performs the
+ * 8-point interpolation in hardware. */
+void metal_trilinear_resize_texture(const float *input, float *output,
+                                     int iD, int iH, int iW,
+                                     int oD, int oH, int oW, int align_corners) {
+    void *pso = metal_get_pipeline("trilinear_resize_texture");
+    if (!pso) {
+        fprintf(stderr, "metal_trilinear_resize_texture: pipeline not found, falling back\n");
+        metal_trilinear_resize(input, output, 1, 1, iD, iH, iW, oD, oH, oW, align_corners);
+        return;
+    }
+
+    id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)metal_buffer_from_ptr(output);
+    if (!out_buf) {
+        fprintf(stderr, "metal_trilinear_resize_texture: output buffer not registered, falling back\n");
+        metal_trilinear_resize(input, output, 1, 1, iD, iH, iW, oD, oH, oW, align_corners);
+        return;
+    }
+
+    @autoreleasepool {
+        MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+        desc.textureType = MTLTextureType3D;
+        desc.pixelFormat = MTLPixelFormatR32Float;
+        desc.width = (NSUInteger)iW;
+        desc.height = (NSUInteger)iH;
+        desc.depth = (NSUInteger)iD;
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+
+        id<MTLTexture> tex = [g_metal.device newTextureWithDescriptor:desc];
+        if (!tex) {
+            fprintf(stderr, "metal_trilinear_resize_texture: failed to create texture\n");
+            metal_trilinear_resize(input, output, 1, 1, iD, iH, iW, oD, oH, oW, align_corners);
+            return;
+        }
+
+        MTLRegion region = MTLRegionMake3D(0, 0, 0, (NSUInteger)iW, (NSUInteger)iH, (NSUInteger)iD);
+        [tex replaceRegion:region mipmapLevel:0 slice:0
+             withBytes:input bytesPerRow:(size_t)iW * sizeof(float)
+             bytesPerImage:(size_t)iW * iH * sizeof(float)];
+
+        typedef struct { uint32_t oD, oH, oW, iD, iH, iW, align_corners, _pad; } tex_resize_params_t;
+        tex_resize_params_t params = {
+            .oD = (uint32_t)oD, .oH = (uint32_t)oH, .oW = (uint32_t)oW,
+            .iD = (uint32_t)iD, .iH = (uint32_t)iH, .iW = (uint32_t)iW,
+            .align_corners = (uint32_t)align_corners, ._pad = 0
+        };
+
+        id<MTLBuffer> param_buf = [g_metal.device newBufferWithBytes:&params
+                                                              length:sizeof(params)
+                                                             options:MTLResourceStorageModeShared];
+        uint32_t total = (uint32_t)(oD * oH * oW);
+        id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)pso;
+        NSUInteger tw = pipeline.maxTotalThreadsPerThreadgroup;
+        if (tw > 256) tw = 256;
+
+        id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pipeline];
+        [enc setTexture:tex atIndex:0];
+        [enc setBuffer:out_buf offset:0 atIndex:0];
+        [enc setBuffer:param_buf offset:0 atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+}
+
 void metal_conv1d_axis(const float *in, float *out,
                         int D, int H, int W,
                         const float *kernel, int klen, int axis) {

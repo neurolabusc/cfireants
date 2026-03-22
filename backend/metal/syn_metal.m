@@ -219,13 +219,16 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         long spatial = (long)dD * dH * dW;
         long n3 = spatial * 3;
 
-        /* Downsample fixed (FFT), smooth moving WITHOUT downsampling (matching Python) */
+        /* Downsample fixed, smooth moving WITHOUT downsampling (matching Python) */
         id<MTLBuffer> fdown_buf = nil, mblur_buf = nil;
         float *d_fixed_down, *d_moving_blur;
         int moving_blur_owned = 0;
         if (scale > 1) {
             d_fixed_down = syn_metal_alloc_buf(spatial * sizeof(float), &fdown_buf);
-            metal_downsample_fft(d_fixed, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
+            if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR)
+                metal_blur_downsample(d_fixed, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
+            else
+                metal_downsample_fft(d_fixed, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
 
             /* Python SyN: moving_image_blur = self._smooth_image_not_mask(moving_arrays, gaussians)
              * Applies per-axis Gaussian blur at FULL resolution without downsampling.
@@ -236,32 +239,10 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
             metal_sync();
             memcpy(d_moving_blur, d_moving, mSpatial * sizeof(float));
 
-            float sigmas[3] = {
-                0.5f * (float)fD / (float)dD,
-                0.5f * (float)fH / (float)dH,
-                0.5f * (float)fW / (float)dW
-            };
-
-            id<MTLBuffer> blur_scratch_buf;
-            float *d_blur_scratch = syn_metal_alloc_buf(mSpatial * sizeof(float), &blur_scratch_buf);
-
-            for (int axis = 0; axis < 3; axis++) {
-                int klen;
-                float *h_k = syn_make_gauss_kernel(sigmas[axis], &klen);
-                if (!h_k || klen == 0) continue;
-
-                id<MTLBuffer> kern_buf;
-                float *d_k = syn_metal_alloc_buf(klen * sizeof(float), &kern_buf);
-                memcpy(d_k, h_k, klen * sizeof(float));
-                free(h_k);
-
-                metal_conv1d_axis(d_moving_blur, d_blur_scratch, mD, mH, mW, d_k, klen, axis);
-                metal_sync();
-                memcpy(d_moving_blur, d_blur_scratch, mSpatial * sizeof(float));
-
-                syn_metal_free_buf(d_k, kern_buf);
-            }
-            syn_metal_free_buf(d_blur_scratch, blur_scratch_buf);
+            metal_blur_volume(d_moving_blur, mD, mH, mW,
+                              0.5f * (float)fD / (float)dD,
+                              0.5f * (float)fH / (float)dH,
+                              0.5f * (float)fW / (float)dW);
         } else {
             d_fixed_down = d_fixed;
             d_moving_blur = d_moving;

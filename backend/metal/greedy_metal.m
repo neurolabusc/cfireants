@@ -163,14 +163,19 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         long n3 = spatial * 3;
         long mSpatialDown = (long)mdD * mdH * mdW;
 
-        /* ---- Downsample images (FFT, matching Python) ---- */
+        /* ---- Downsample images ---- */
         id<MTLBuffer> fdown_buf = nil, mdown_buf = nil;
         float *d_fixed_down, *d_moving_down;
         if (scale > 1) {
             d_fixed_down = greedy_metal_alloc_buf(spatial * sizeof(float), &fdown_buf);
             d_moving_down = greedy_metal_alloc_buf(mSpatialDown * sizeof(float), &mdown_buf);
-            metal_downsample_fft(d_fixed_full, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
-            metal_downsample_fft(d_moving_full, d_moving_down, 1, 1, mD, mH, mW, mdD, mdH, mdW);
+            if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
+                metal_blur_downsample(d_fixed_full, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
+                metal_blur_downsample(d_moving_full, d_moving_down, 1, 1, mD, mH, mW, mdD, mdH, mdW);
+            } else {
+                metal_downsample_fft(d_fixed_full, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
+                metal_downsample_fft(d_moving_full, d_moving_down, 1, 1, mD, mH, mW, mdD, mdH, mdW);
+            }
         } else {
             d_fixed_down = d_fixed_full;
             d_moving_down = d_moving_full;

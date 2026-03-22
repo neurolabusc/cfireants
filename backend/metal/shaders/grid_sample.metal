@@ -336,6 +336,56 @@ kernel void trilinear_resize(
 }
 
 /* ------------------------------------------------------------------ */
+/* Trilinear resize via hardware 3D texture sampling                    */
+/* Uses Metal's texture3d with bilinear sampler — the GPU texture unit  */
+/* performs the 8-point interpolation in hardware.                      */
+/* ------------------------------------------------------------------ */
+
+struct TexResizeParams {
+    uint oD, oH, oW;
+    uint iD, iH, iW;
+    uint align_corners;
+    uint _pad;
+};
+
+kernel void trilinear_resize_texture(
+    texture3d<float, access::sample> tex  [[texture(0)]],
+    device float *output                  [[buffer(0)]],
+    constant TexResizeParams &p           [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint total = p.oD * p.oH * p.oW;
+    if (tid >= total) return;
+
+    uint ow = tid % p.oW;
+    uint oh = (tid / p.oW) % p.oH;
+    uint od = tid / (p.oW * p.oH);
+
+    /* Map output coordinates to input space, then to normalized texture coords.
+     * Metal texture3d: texel center at (i+0.5)/N in normalized coords.
+     * align_corners=1: out_corner maps to in_corner
+     *   src = od * (iD-1) / (oD-1)  →  tex_coord = (src + 0.5) / iD  */
+    float sd, sh, sw;
+    if (p.align_corners != 0 && p.oD > 1) {
+        sd = float(od) * float(p.iD - 1) / float(p.oD - 1);
+        sh = float(oh) * float(p.iH - 1) / float(p.oH - 1);
+        sw = float(ow) * float(p.iW - 1) / float(p.oW - 1);
+    } else {
+        sd = (float(od) + 0.5f) * float(p.iD) / float(p.oD) - 0.5f;
+        sh = (float(oh) + 0.5f) * float(p.iH) / float(p.oH) - 0.5f;
+        sw = (float(ow) + 0.5f) * float(p.iW) / float(p.oW) - 0.5f;
+    }
+
+    /* Convert to normalized texture coordinates: texel i has center at (i+0.5)/N */
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+    float3 tc = float3((sw + 0.5f) / float(p.iW),
+                        (sh + 0.5f) / float(p.iH),
+                        (sd + 0.5f) / float(p.iD));
+
+    output[tid] = tex.sample(s, tc).x;
+}
+
+/* ------------------------------------------------------------------ */
 /* Separable 1D convolution along one axis (zero-padded)               */
 /* One thread per voxel in D*H*W                                       */
 /* axis: 0=D, 1=H, 2=W                                                */

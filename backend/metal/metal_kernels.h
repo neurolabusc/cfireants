@@ -47,6 +47,11 @@ void metal_affine_grid_3d(const float *affine, float *grid,
 void metal_trilinear_resize(const float *input, float *output,
                              int B, int C, int iD, int iH, int iW,
                              int oD, int oH, int oW, int align_corners);
+
+/* Hardware 3D texture trilinear resize (single-channel only) */
+void metal_trilinear_resize_texture(const float *input, float *output,
+                                     int iD, int iH, int iW,
+                                     int oD, int oH, int oW, int align_corners);
 void metal_conv1d_axis(const float *in, float *out,
                         int D, int H, int W,
                         const float *kernel, int klen, int axis);
@@ -79,6 +84,15 @@ void metal_cc_loss_3d(const float *pred, const float *target,
 void metal_downsample_fft(const float *input, float *output,
                            int B, int C, int iD, int iH, int iW,
                            int oD, int oH, int oW);
+
+/* Gaussian blur + trilinear resize (GPU-native, no FFT) */
+void metal_blur_downsample(const float *input, float *output,
+                            int B, int C, int iD, int iH, int iW,
+                            int oD, int oH, int oW);
+
+/* In-place Gaussian blur on single-channel [D,H,W] volume */
+void metal_blur_volume(float *data, int D, int H, int W,
+                        float sigma_d, float sigma_h, float sigma_w);
 
 /* --- Phase 6: MI loss --- */
 

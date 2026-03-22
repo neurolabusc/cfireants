@@ -129,7 +129,15 @@ int wgpu_context_init(void) {
     if (required.maxBufferSize < 512ULL * 1024 * 1024)
         required.maxBufferSize = 512ULL * 1024 * 1024;
 
+    /* Request float32-filterable if supported (optional, for texture trilinear) */
+    WGPUFeatureName features[] = { WGPUFeatureName_Float32Filterable };
+    int n_features = 0;
+    if (wgpuAdapterHasFeature(g_wgpu.adapter, WGPUFeatureName_Float32Filterable))
+        n_features = 1;
+
     WGPUDeviceDescriptor device_desc = {
+        .requiredFeatureCount = n_features,
+        .requiredFeatures = n_features ? features : NULL,
         .requiredLimits = &required,
         .uncapturedErrorCallbackInfo = (WGPUUncapturedErrorCallbackInfo){
             .callback = on_device_error,
