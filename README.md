@@ -117,18 +117,32 @@ Trilinear matches or exceeds FFT accuracy. All measurements on NVIDIA GB10 (unif
 
 **Metal matches WebGPU accuracy on all datasets** (within 0.1%) and runs **2–7x faster** on the same Apple M4 Pro hardware. WebGPU runs via wgpu-native's Metal backend, so both use the same GPU — the speed difference comes from Metal's native API with unified memory (zero-copy) vs WebGPU's abstraction overhead. Both backends use identical registration parameters: MI loss for full-head rigid/affine, CC for brain-extracted, fused CC for SyN deformable.
 
-### Greedy vs SyN — Trilinear Mode (Apple M4 Pro)
+### WebGPU: Greedy vs SyN (Apple M4 Pro, trilinear)
 
-| Dataset | SyN Metal | Greedy Metal | SyN WebGPU | Greedy WebGPU |
-|---------|-----------|--------------|------------|---------------|
-| small NCC | 0.9638 | 0.9507 | 0.9642 | 0.9542 |
-| small Time | 8.5s | **7.4s** | ~73s | **38.6s** |
-| medium NCC | 0.9542 | 0.9420 | 0.9541 | 0.9434 |
-| medium Time | 20.8s | **17.3s** | ~132s | **89.1s** |
-| large NCC | 0.9198 | 0.8995 | 0.9191 | 0.9053 |
-| large Time | 44.0s | **30.9s** | ~89s | **49.5s** |
+| Dataset | | SyN | Greedy | Improvement |
+|---------|------|------|--------|-------------|
+| **small** | NCC After | 0.9642 | 0.9542 | -1.0% |
+| | Deform Time | 48.8s | 26.5s | **1.8x faster** |
+| | Total Time | 61.3s | 39.0s | **1.6x faster** |
+| | Peak RAM | 132 MB | 107 MB | **19% less** |
+| **medium** | NCC After | 0.9541 | 0.9434 | -1.1% |
+| | Deform Time | 77.2s | 33.2s | **2.3x faster** |
+| | Total Time | 132.2s | 88.4s | **1.5x faster** |
+| | Peak RAM | 874 MB | 647 MB | **26% less** |
+| **large** | NCC After | 0.9191 | 0.9053 | -1.5% |
+| | Deform Time | 76.8s | 33.0s | **2.3x faster** |
+| | Total Time | 90.7s | 46.9s | **1.9x faster** |
+| | Peak RAM | 1028 MB | 794 MB | **23% less** |
 
-**Greedy is 1–2% lower NCC but 1.1–1.9x faster.** The speedup is largest on WebGPU where SyN's dual warp + warp inversion overhead dominates. Greedy uses a single compositive displacement field with no inversion step. Use `--greedy` flag with validation tests.
+**Greedy is 1.8–2.3x faster** for the deformable stage and uses **19–26% less memory** than SyN, at the cost of 1–1.5% lower NCC. Greedy uses a single compositive displacement field (no dual warp, no warp inversion). Use `--greedy` flag with validation tests.
+
+### Metal: Greedy vs SyN (Apple M4 Pro, trilinear)
+
+| Dataset | SyN NCC | Greedy NCC | SyN Time | Greedy Time |
+|---------|---------|------------|----------|-------------|
+| small | 0.9638 | 0.9507 | 8.5s | **7.4s** |
+| medium | 0.9542 | 0.9420 | 20.8s | **17.3s** |
+| large | 0.9198 | 0.8995 | 44.0s | **30.9s** |
 
 See [CLAUDE.md](CLAUDE.md) for architecture details and known issues. See [validate/README.md](validate/README.md) for detailed CUDA benchmarks.
 

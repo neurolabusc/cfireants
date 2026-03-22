@@ -14,6 +14,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
 
 #ifdef CFIREANTS_HAS_WEBGPU
 extern int cfireants_init_webgpu(void);
@@ -36,13 +37,19 @@ static double get_time(void) {
 }
 
 static double get_peak_rss_mb(void) {
+#ifdef __APPLE__
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return ru.ru_maxrss / (1024.0 * 1024.0);  /* macOS: bytes */
+#else
     FILE *f = fopen("/proc/self/status", "r");
     if (!f) return 0;
     char line[256]; double peak_kb = 0;
     while (fgets(line, sizeof(line), f))
         if (strncmp(line, "VmHWM:", 6) == 0) { sscanf(line + 6, "%lf", &peak_kb); break; }
     fclose(f);
-    return peak_kb / 1024.0;
+    return peak_kb / 1024.0;  /* Linux: kB */
+#endif
 }
 
 static float compute_global_ncc(const float *a, const float *b, int n) {
