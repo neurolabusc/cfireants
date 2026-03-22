@@ -99,6 +99,12 @@ if(CFIREANTS_METAL)
     target_link_libraries(cfireants_gpu INTERFACE cfireants_metal)
 endif()
 
+# Main executable
+add_executable(cfireants_reg src/main.c
+    src/registration/moments.c src/registration/rigid.c
+    src/registration/affine.c src/registration/greedy.c src/registration/syn.c)
+target_link_libraries(cfireants_reg cfireants cfireants_gpu)
+
 # Test programs
 
 add_executable(test_nifti_load tests/test_nifti_load.c)
