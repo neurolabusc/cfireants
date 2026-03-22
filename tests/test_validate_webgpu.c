@@ -75,9 +75,11 @@ int main(int argc, char **argv) {
 
     const char *only_dataset = NULL;
     int downsample_mode = DOWNSAMPLE_FFT;
+    int use_greedy = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dataset") == 0 && i+1 < argc) only_dataset = argv[++i];
         else if (strcmp(argv[i], "--trilinear") == 0) downsample_mode = DOWNSAMPLE_TRILINEAR;
+        else if (strcmp(argv[i], "--greedy") == 0) use_greedy = 1;
     }
 
     dataset_t datasets[] = {
@@ -189,44 +191,68 @@ int main(int argc, char **argv) {
         for(int i=0;i<3;i++) for(int j=0;j<4;j++) aff44[i][j]=affine.affine_mat[i][j];
         aff44[3][3]=1;
 
-        /* SyN */
-        t1 = get_time();
-        syn_opts_t sopts = {
-            .n_scales=ds->syn_n, .scales=ds->syn_scales, .iterations=ds->syn_iters,
-            .cc_kernel_size=5, .lr=0.1f,
-            .smooth_warp_sigma=0.5f, .smooth_grad_sigma=1.0f,
-            .tolerance=1e-6f, .max_tolerance_iters=10,
-            .downsample_mode=downsample_mode };
-        syn_result_t syn;
-        syn_register_webgpu(&fixed, &moving, aff44, sopts, &syn);
-        double t_syn = get_time()-t1;
+        /* Deformable: Greedy or SyN */
+        tensor_t deform_moved = {0};
+        float deform_ncc_loss = 0;
+        double t_deform;
+        const char *deform_name;
+
+        if (use_greedy) {
+            t1 = get_time();
+            int gs[] = {4, 2, 1}, gi[] = {200, 100, 50};
+            greedy_opts_t gopts = {
+                .n_scales=3, .scales=gs, .iterations=gi,
+                .cc_kernel_size=5, .lr=0.1f,
+                .smooth_warp_sigma=0.5f, .smooth_grad_sigma=1.0f,
+                .tolerance=1e-6f, .max_tolerance_iters=10,
+                .downsample_mode=downsample_mode };
+            greedy_result_t greedy;
+            greedy_register_webgpu(&fixed, &moving, aff44, gopts, &greedy);
+            t_deform = get_time()-t1;
+            deform_moved = greedy.moved;
+            deform_ncc_loss = greedy.ncc_loss;
+            deform_name = "Greedy";
+        } else {
+            t1 = get_time();
+            syn_opts_t sopts = {
+                .n_scales=ds->syn_n, .scales=ds->syn_scales, .iterations=ds->syn_iters,
+                .cc_kernel_size=5, .lr=0.1f,
+                .smooth_warp_sigma=0.5f, .smooth_grad_sigma=1.0f,
+                .tolerance=1e-6f, .max_tolerance_iters=10,
+                .downsample_mode=downsample_mode };
+            syn_result_t syn;
+            syn_register_webgpu(&fixed, &moving, aff44, sopts, &syn);
+            t_deform = get_time()-t1;
+            deform_moved = syn.moved;
+            deform_ncc_loss = syn.ncc_loss;
+            deform_name = "SyN";
+        }
 
         double t_total = get_time()-t0;
 
-        /* Compute global NCC */
         float ncc_after = compute_global_ncc((float*)fixed.data.data,
-                                              (float*)syn.moved.data, fN);
+                                              (float*)deform_moved.data, fN);
 
         printf("\n============================================================\n");
-        printf("Dataset: %s — %s (WebGPU, %s)\n", ds->name, ds->desc,
-               downsample_mode == DOWNSAMPLE_TRILINEAR ? "trilinear" : "FFT");
+        printf("Dataset: %s — %s (WebGPU, %s, %s)\n", ds->name, ds->desc,
+               downsample_mode == DOWNSAMPLE_TRILINEAR ? "trilinear" : "FFT", deform_name);
         printf("============================================================\n");
         printf("  Results:\n");
         printf("    NCC Before:     %.4f\n", ncc_before);
         printf("    NCC After:      %.4f\n", ncc_after);
-        printf("    Local NCC Loss: %.4f\n", syn.ncc_loss);
+        printf("    Local NCC Loss: %.4f\n", deform_ncc_loss);
         printf("    Time:           %.1fs\n", t_total);
         printf("    Moments:        %.1fs\n", t_mom);
         printf("    Rigid:          %.1fs\n", t_rigid);
         printf("    Affine:         %.1fs\n", t_affine);
-        printf("    SyN:            %.1fs\n", t_syn);
+        printf("    %s:            %.1fs\n", deform_name, t_deform);
         printf("    Peak RAM:       %.0f MB\n", get_peak_rss_mb());
 
         printf("\n  CSV: %s,%.4f,%.4f,%.4f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f\n",
-               ds->name, ncc_before, ncc_after, syn.ncc_loss,
-               t_total, t_mom, t_rigid, t_affine, t_syn, get_peak_rss_mb());
+               ds->name, ncc_before, ncc_after, deform_ncc_loss,
+               t_total, t_mom, t_rigid, t_affine, t_deform, get_peak_rss_mb());
 
-        tensor_free(&syn.moved);
+        tensor_free(&deform_moved);
         image_free(&fixed); image_free(&moving);
     }
 

@@ -115,7 +115,20 @@ Trilinear matches or exceeds FFT accuracy. All measurements on NVIDIA GB10 (unif
 | medium (1mm brain) | 0.9541 | **0.9542** | 131.7s | 20.8s | 3023 MB |
 | large (1mm full-head) | 0.9191 | **0.9198** | 88.5s | 44.0s | 3259 MB |
 
-**Metal matches WebGPU accuracy on all datasets** (within 0.1%) and runs **2–7x faster** on the same Apple M4 Pro hardware. WebGPU runs via wgpu-native's Metal backend, so both use the same GPU — the speed difference comes from Metal's native API with unified memory (zero-copy) vs WebGPU's abstraction overhead. Both backends use identical registration parameters: MI loss for full-head rigid/affine, CC for brain-extracted, fused CC for SyN.
+**Metal matches WebGPU accuracy on all datasets** (within 0.1%) and runs **2–7x faster** on the same Apple M4 Pro hardware. WebGPU runs via wgpu-native's Metal backend, so both use the same GPU — the speed difference comes from Metal's native API with unified memory (zero-copy) vs WebGPU's abstraction overhead. Both backends use identical registration parameters: MI loss for full-head rigid/affine, CC for brain-extracted, fused CC for SyN deformable.
+
+### Greedy vs SyN — Trilinear Mode (Apple M4 Pro)
+
+| Dataset | SyN Metal | Greedy Metal | SyN WebGPU | Greedy WebGPU |
+|---------|-----------|--------------|------------|---------------|
+| small NCC | 0.9638 | 0.9507 | 0.9642 | 0.9542 |
+| small Time | 8.5s | **7.4s** | ~73s | **38.6s** |
+| medium NCC | 0.9542 | 0.9420 | 0.9541 | 0.9434 |
+| medium Time | 20.8s | **17.3s** | ~132s | **89.1s** |
+| large NCC | 0.9198 | 0.8995 | 0.9191 | 0.9053 |
+| large Time | 44.0s | **30.9s** | ~89s | **49.5s** |
+
+**Greedy is 1–2% lower NCC but 1.1–1.9x faster.** The speedup is largest on WebGPU where SyN's dual warp + warp inversion overhead dominates. Greedy uses a single compositive displacement field with no inversion step. Use `--greedy` flag with validation tests.
 
 See [CLAUDE.md](CLAUDE.md) for architecture details and known issues. See [validate/README.md](validate/README.md) for detailed CUDA benchmarks.
 

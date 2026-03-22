@@ -177,13 +177,16 @@ int greedy_register_webgpu(const image_t *fixed, const image_t *moving,
             if(gradmax<1.0f) gradmax=1.0f;
             float sf = half_res / gradmax * (-opts.lr);
 
-            /* Batch scale + compose + blur + copy */
-            wgpu_begin_batch();
+            /* Scale + compose + blur + copy (no batch — requires ordered execution) */
             wgpu_tensor_scale_buf(d_adir, sf, (int)n3);
             wgpu_fused_compositive_update(d_warp, d_adir, d_adir, dD,dH,dW);
             if(warp_klen>0) wgpu_blur_disp_dhw3(d_adir, d_scratch, dD,dH,dW, d_warp_kern, warp_klen);
-            wgpu_copy_buffer(d_adir, d_warp, n3*4);
-            wgpu_flush();
+            {WGPUCommandEncoder e=wgpuDeviceCreateCommandEncoder(g_wgpu.device,NULL);
+             wgpuCommandEncoderCopyBufferToBuffer(e,d_adir,0,d_warp,0,n3*4);
+             WGPUCommandBuffer c=wgpuCommandEncoderFinish(e,NULL);
+             wgpuQueueSubmit(g_wgpu.queue,1,&c);
+             wgpuCommandBufferRelease(c);wgpuCommandEncoderRelease(e);
+             wgpuDevicePoll(g_wgpu.device,1,NULL);}
 
             if(it%50==0||it==iters-1)
                 fprintf(stderr,"    iter %d/%d loss=%.6f\n",it,iters,loss);
