@@ -143,3 +143,81 @@ detection via `--check-reference`, which flags any NCC degradation exceeding 2%.
   images are skull-stripped with similar intensity profiles.
 - **large**: Uses an extra 8x downsampling scale for rigid/affine to handle
   the larger field of view and resolution difference (1mm vs 0.88mm).
+
+## Downsample Modes
+
+All three GPU backends support two downsampling modes:
+
+- **FFT** (default) — FFT-based downsample matching Python. CUDA uses cuFFT; Metal uses MPSGraph; WebGPU uses kissfft (CPU fallback).
+- **Trilinear** (`--trilinear`) — Gaussian blur + trilinear resize, fully GPU-native. Matches or exceeds FFT accuracy. Enables like-for-like comparison across all backends.
+
+### FFT vs Trilinear (small dataset)
+
+| Metric | CUDA FFT | CUDA Trilinear | Metal FFT | Metal Trilinear |
+|--------|----------|----------------|-----------|-----------------|
+| NCC After | 0.9614 | 0.9644 | 0.9608 | 0.9639 |
+| Total Time | 7.6s | 7.5s | 7.4s | 7.3s |
+| Peak RAM | 147 MB | 140 MB | 390 MB | 391 MB |
+
+CUDA measured on NVIDIA GB10. Metal measured on Apple M4 Pro.
+
+## WebGPU Backend (wgpu-native)
+
+### CUDA vs WebGPU — Trilinear Mode (small dataset, NVIDIA GB10 Vulkan)
+
+| Metric | CUDA | WebGPU | Ratio |
+|--------|------|--------|-------|
+| NCC After | 0.9644 | 0.9643 | 1.000 |
+| Total Time | 7.5s | 14.2s | 1.9x |
+| Rigid (MI) | 2.8s | 0.9s | 0.3x |
+| Affine (MI) | 3.0s | 1.1s | 0.4x |
+| SyN (CC) | 1.4s | 11.9s | 8.5x |
+| Peak RAM | 140 MB | 445 MB | 3.2x |
+
+WebGPU matches CUDA accuracy. MI is faster on WebGPU (CUDA downloads full images for max-finding). SyN is slower due to per-dispatch overhead.
+
+### CUDA vs WebGPU — All Datasets (Trilinear, NVIDIA GB10)
+
+| Dataset | CUDA NCC | WebGPU NCC | CUDA Time | WebGPU Time |
+|---------|----------|------------|-----------|-------------|
+| small | 0.9644 | 0.9647 | 7.5s | 13.7s |
+| medium | 0.9536 | 0.9541 | 18.2s | 90.5s |
+| large | 0.9213 | 0.9190 | 55.1s | 93.2s |
+
+## Metal Backend (Apple Silicon)
+
+### Metal vs WebGPU — All Datasets (SyN Trilinear, Apple M4 Pro)
+
+Both backends run on the same M4 Pro GPU. Metal uses native API with unified memory; WebGPU runs via wgpu-native's Metal backend.
+
+| Dataset | WebGPU NCC | Metal NCC | WebGPU Time | Metal Time | Metal RAM |
+|---------|------------|-----------|-------------|------------|-----------|
+| small | 0.9642 | 0.9636 | 60.1s | 7.2s | 391 MB |
+| medium | 0.9541 | 0.9540 | 131.7s | 18.7s | 3023 MB |
+| large | 0.9191 | 0.9199 | 88.5s | 36.2s | 3259 MB |
+
+Metal matches WebGPU accuracy (within 0.1%) and runs 2–8x faster.
+
+### Greedy vs SyN — WebGPU (Apple M4 Pro, Trilinear)
+
+| Dataset | | SyN | Greedy | Improvement |
+|---------|------|------|--------|-------------|
+| **small** | NCC | 0.9642 | 0.9542 | -1.0% |
+| | Total Time | 61.3s | 39.0s | 1.6x faster |
+| | Peak RAM | 132 MB | 107 MB | 19% less |
+| **medium** | NCC | 0.9541 | 0.9434 | -1.1% |
+| | Total Time | 132.2s | 88.4s | 1.5x faster |
+| | Peak RAM | 874 MB | 647 MB | 26% less |
+| **large** | NCC | 0.9191 | 0.9053 | -1.5% |
+| | Total Time | 90.7s | 46.9s | 1.9x faster |
+| | Peak RAM | 1028 MB | 794 MB | 23% less |
+
+### Greedy vs SyN — Metal (Apple M4 Pro, Trilinear)
+
+| Dataset | SyN NCC | Greedy NCC | SyN Time | Greedy Time | SyN RAM | Greedy RAM |
+|---------|---------|------------|----------|-------------|---------|------------|
+| small | 0.9636 | 0.9511 | 7.2s | 6.5s | 391 MB | 276 MB |
+| medium | 0.9540 | 0.9420 | 18.7s | 16.7s | 3023 MB | 2103 MB |
+| large | 0.9199 | 0.8996 | 36.2s | 37.6s | 3259 MB | 2340 MB |
+
+Greedy is 1–2% lower NCC but 1.1–1.9x faster with 19–30% less memory. Use `--greedy` flag.
