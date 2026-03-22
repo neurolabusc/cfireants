@@ -21,9 +21,17 @@ python validate/run_validation.py --dataset small          # single dataset
 python validate/run_validation.py --save-reference         # save reference outputs
 python validate/run_validation.py --check-reference        # check for regressions
 
-# C/CUDA validation
-cfireants/build/test_validate_all                          # all datasets
-cfireants/build/test_validate_all --dataset small          # single dataset
+# C/CUDA validation (run from repo root)
+build/test_validate_all                                    # all datasets (SyN)
+build/test_validate_all --dataset small --trilinear        # trilinear downsample
+
+# Metal (macOS)
+build/test_validate_metal --dataset small --trilinear      # SyN
+build/test_validate_metal --dataset small --trilinear --greedy  # Greedy (faster)
+
+# WebGPU
+build/test_validate_webgpu --dataset small --trilinear     # SyN
+build/test_validate_webgpu --dataset small --trilinear --greedy  # Greedy
 ```
 
 ## Baseline Metrics
@@ -220,4 +228,4 @@ Metal matches WebGPU accuracy (within 0.1%) and runs 2–8x faster.
 | medium | 0.9540 | 0.9420 | 18.7s | 16.7s | 3023 MB | 2103 MB |
 | large | 0.9199 | 0.8996 | 36.2s | 37.6s | 3259 MB | 2340 MB |
 
-Greedy is 1–2% lower NCC but 1.1–1.9x faster with 19–30% less memory. Use `--greedy` flag.
+Greedy is 1–2% lower NCC with 19–30% less memory. Speed varies: faster on small/medium, comparable on large. Use `--greedy` flag.

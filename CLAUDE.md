@@ -79,6 +79,8 @@ build/test_metal_linear                                # Moments + Rigid + Affin
 build/test_validate_metal --dataset small               # Full pipeline (MI+CC, FFT, SyN)
 build/test_validate_metal --dataset small --trilinear   # Full pipeline (MI+CC, trilinear, SyN)
 build/test_validate_metal --dataset small --trilinear --greedy  # Greedy deformable
+build/test_cpu_vs_metal                                    # CPU vs Metal stage-by-stage comparison
+build/test_cpu_vs_metal --syn                              # Include SyN comparison (slow)
 ```
 
 ## Architecture

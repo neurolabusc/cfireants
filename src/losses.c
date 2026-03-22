@@ -272,7 +272,7 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
                        int kernel_size, float *loss_out,
                        tensor_t *grad_pred, tensor_t *grad_target) {
     int D = pred->shape[2], H = pred->shape[3], W = pred->shape[4];
-    int n = D * H * W;
+    size_t n = (size_t)D * H * W;
     int kv = kernel_size * kernel_size * kernel_size;
     float nr = 1e-5f, dr = 1e-5f;
 
@@ -292,7 +292,7 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
 
     memcpy(b_I, I, n * sizeof(float));
     memcpy(b_J, J, n * sizeof(float));
-    for (int i = 0; i < n; i++) { b_I2[i] = I[i]*I[i]; b_J2[i] = J[i]*J[i]; b_IJ[i] = I[i]*J[i]; }
+    for (size_t i = 0; i < n; i++) { b_I2[i] = I[i]*I[i]; b_J2[i] = J[i]*J[i]; b_IJ[i] = I[i]*J[i]; }
 
     /* Step 2: Box filter all 5 */
     separable_box_filter_3d(b_I,  b_I,  D, H, W, kernel_size, tmp);
@@ -304,7 +304,7 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
     /* Step 3: Forward NCC */
     if (loss_out) {
         double ncc_sum = 0;
-        for (int i = 0; i < n; i++) {
+        for (size_t i = 0; i < n; i++) {
             float mu = b_I[i], rho = b_J[i];
             float A = (float)kv * (b_IJ[i] - mu*rho);
             float B = (float)kv * (b_I2[i] - mu*mu); if (B < dr) B = dr;
@@ -350,12 +350,12 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
         /* Step 6: Final gradients */
         if (grad_pred) {
             float *gp = tensor_data_f32(grad_pred);
-            for (int i = 0; i < n; i++)
+            for (size_t i = 0; i < n; i++)
                 gp[i] = b_I[i]*J[i] - b_J[i]*I[i] + b_I2[i];
         }
         if (grad_target) {
             float *gt = tensor_data_f32(grad_target);
-            for (int i = 0; i < n; i++)
+            for (size_t i = 0; i < n; i++)
                 gt[i] = b_I[i]*I[i] - b_J2[i]*J[i] + b_IJ[i];
         }
     }
@@ -408,8 +408,8 @@ int cpu_cc_loss_3d_both(const tensor_t *pred, const tensor_t *target,
             /* Per-voxel source terms for both pred and target gradients */
             float *src_p=NULL, *src_p2=NULL, *src_tp_p=NULL;
             float *src_t=NULL, *src_t2=NULL, *src_tp_t=NULL;
-            if (grad_pred)  { src_p=calloc(spatial,4); src_p2=calloc(spatial,4); src_tp_p=calloc(spatial,4); }
-            if (grad_target) { src_t=calloc(spatial,4); src_t2=calloc(spatial,4); src_tp_t=calloc(spatial,4); }
+            if (grad_pred)  { src_p=calloc(spatial,sizeof(float)); src_p2=calloc(spatial,sizeof(float)); src_tp_p=calloc(spatial,sizeof(float)); }
+            if (grad_target) { src_t=calloc(spatial,sizeof(float)); src_t2=calloc(spatial,sizeof(float)); src_tp_t=calloc(spatial,sizeof(float)); }
 
             for (size_t i = 0; i < spatial; i++) {
                 float ps=p_sum[i], ts=t_sum[i];
