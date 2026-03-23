@@ -12,7 +12,7 @@
  *     -o output_
  */
 
-#define CFIREANTS_VERSION "0.1.0"
+#define CFIREANTS_VERSION "0.1.20260323"
 
 #include "cfireants/tensor.h"
 #include "cfireants/image.h"
@@ -80,8 +80,7 @@ typedef struct {
     int verbose;  /* 0=silent (errors only), 1=summary, 2=debug (per-iter) */
 } cli_config_t;
 
-/* Use the global cfireants_verbose from backend.h */
-#define g_verbose cfireants_verbose
+/* Verbosity uses cfireants_verbose from backend.h/registration.h */
 
 /* Ensure parent directory of path exists, creating if needed.
  * Returns 0 on success, -1 on failure. */
@@ -253,10 +252,10 @@ static void print_usage(const char *prog) {
         "  --no-moments                Skip moments initialization\n"
         "\n"
         "Skull stripping:\n"
-        "  --skullstrip <mask.nii.gz>  Brain mask in template/moving space. After registration,\n"
-        "                              warps mask into subject space, thresholds at 0.5, and saves\n"
-        "                              <prefix>Skullstrip.nii.gz with non-brain voxels set to darkest\n"
-        "                              intensity. Also saves <prefix>Mask.nii.gz (warped mask).\n"
+        "  --skullstrip <mask.nii.gz>  Brain mask in template/moving space. Warps mask to subject\n"
+        "                              space, thresholds at 0.5, applies to fixed image. When used,\n"
+        "                              -o is the output filename (not a prefix). Preserves native\n"
+        "                              datatype. Non-brain voxels set to darkest intensity.\n"
         "\n"
         "Registration stages (repeat for each stage):\n"
         "  --transform <Type[params]>  Rigid[lr], Affine[lr], SyN[lr,warp_sigma,grad_sigma],\n"
@@ -503,11 +502,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to load fixed image: %s\n", cfg.fixed_path); return 1;
     }
     if (image_load(&moving, cfg.moving_path, DEVICE_CPU) != 0) {
-        fprintf(stderr, "Failed to load moving image: %s\n", cfg.moving_path); return 1;
+        fprintf(stderr, "Failed to load moving image: %s\n", cfg.moving_path);
+        image_free(&fixed); return 1;
     }
 
     int fD = fixed.data.shape[2], fH = fixed.data.shape[3], fW = fixed.data.shape[4];
-    if (g_verbose >= 1) {
+    if (cfireants_verbose >= 1) {
         fprintf(stderr, "Fixed:  %s [%d x %d x %d]\n", cfg.fixed_path, fD, fH, fW);
         fprintf(stderr, "Moving: %s [%d x %d x %d]\n", cfg.moving_path,
                 moving.data.shape[2], moving.data.shape[3], moving.data.shape[4]);
@@ -531,7 +531,7 @@ int main(int argc, char **argv) {
         double t0 = get_time();
         moments_opts_t mopts = moments_opts_default();
         moments_register(&fixed, &moving, mopts, &mom);
-        if (g_verbose >= 1)
+        if (cfireants_verbose >= 1)
             fprintf(stderr, "Moments: %.1fs (NCC %.4f)\n", get_time() - t0, mom.ncc_loss);
     }
 
@@ -549,13 +549,13 @@ int main(int argc, char **argv) {
     affine_44[3][3] = 1.0f;
 
     tensor_t final_moved = {0};
-    float final_ncc = 0;
+    (void)0; /* final_ncc removed — NCC printed per-stage */
 
     for (int si = 0; si < cfg.n_stages; si++) {
         stage_config_t *s = &cfg.stages[si];
         double t0 = get_time();
 
-        if (g_verbose >= 1) fprintf(stderr, "\n--- Stage %d: %s (lr=%.4f, %s%s%d, %d levels) ---\n",
+        if (cfireants_verbose >= 1) fprintf(stderr, "\n--- Stage %d: %s (lr=%.4f, %s%s%d, %d levels) ---\n",
                 si + 1, stage_name(s->type), s->lr,
                 s->metric_type == LOSS_MI ? "MI bins=" : "CC k=",
                 "", s->metric_param, s->n_levels);
@@ -576,10 +576,10 @@ int main(int argc, char **argv) {
             rigid_result_t result;
             int rc;
             switch (cfg.backend) {
-#ifdef CFIREANTS_HAS_METAL
 #ifdef CFIREANTS_HAS_CUDA
                 case BACKEND_CUDA: rc = rigid_register_gpu(&fixed, &moving, &mom, opts, &result); break;
 #endif
+#ifdef CFIREANTS_HAS_METAL
                 case BACKEND_METAL: rc = rigid_register_metal(&fixed, &moving, &mom, opts, &result); break;
 #endif
 #ifdef CFIREANTS_HAS_WEBGPU
@@ -590,7 +590,7 @@ int main(int argc, char **argv) {
             (void)rc;
             memcpy(rigid_mat, result.rigid_mat, sizeof(rigid_mat));
             memcpy(affine_mat, result.rigid_mat, sizeof(affine_mat));
-            if (g_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            if (cfireants_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
 
         } else if (s->type == STAGE_AFFINE) {
             affine_opts_t opts = {
@@ -608,10 +608,10 @@ int main(int argc, char **argv) {
             affine_result_t result;
             int rc;
             switch (cfg.backend) {
-#ifdef CFIREANTS_HAS_METAL
 #ifdef CFIREANTS_HAS_CUDA
                 case BACKEND_CUDA: rc = affine_register_gpu(&fixed, &moving, rigid_mat, opts, &result); break;
 #endif
+#ifdef CFIREANTS_HAS_METAL
                 case BACKEND_METAL: rc = affine_register_metal(&fixed, &moving, rigid_mat, opts, &result); break;
 #endif
 #ifdef CFIREANTS_HAS_WEBGPU
@@ -626,7 +626,7 @@ int main(int argc, char **argv) {
                 for (int j = 0; j < 4; j++)
                     affine_44[i][j] = affine_mat[i][j];
             affine_44[3][3] = 1.0f;
-            if (g_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            if (cfireants_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
 
         } else if (s->type == STAGE_SYN) {
             syn_opts_t opts = {
@@ -644,10 +644,10 @@ int main(int argc, char **argv) {
             syn_result_t result;
             int rc;
             switch (cfg.backend) {
-#ifdef CFIREANTS_HAS_METAL
 #ifdef CFIREANTS_HAS_CUDA
                 case BACKEND_CUDA: rc = syn_register_gpu(&fixed, &moving, affine_44, opts, &result); break;
 #endif
+#ifdef CFIREANTS_HAS_METAL
                 case BACKEND_METAL: rc = syn_register_metal(&fixed, &moving, affine_44, opts, &result); break;
 #endif
 #ifdef CFIREANTS_HAS_WEBGPU
@@ -658,8 +658,8 @@ int main(int argc, char **argv) {
             (void)rc;
             if (final_moved.data) tensor_free(&final_moved);
             final_moved = result.moved;
-            final_ncc = result.ncc_loss;
-            if (g_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            /* NCC printed per-stage above */
+            if (cfireants_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
 
         } else if (s->type == STAGE_GREEDY) {
             greedy_opts_t opts = {
@@ -677,10 +677,10 @@ int main(int argc, char **argv) {
             greedy_result_t result;
             int rc;
             switch (cfg.backend) {
-#ifdef CFIREANTS_HAS_METAL
 #ifdef CFIREANTS_HAS_CUDA
                 case BACKEND_CUDA: rc = greedy_register_gpu(&fixed, &moving, affine_44, opts, &result); break;
 #endif
+#ifdef CFIREANTS_HAS_METAL
                 case BACKEND_METAL: rc = greedy_register_metal(&fixed, &moving, affine_44, opts, &result); break;
 #endif
 #ifdef CFIREANTS_HAS_WEBGPU
@@ -691,12 +691,12 @@ int main(int argc, char **argv) {
             (void)rc;
             if (final_moved.data) tensor_free(&final_moved);
             final_moved = result.moved;
-            final_ncc = result.ncc_loss;
-            if (g_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            /* NCC printed per-stage above */
+            if (cfireants_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
         }
     }
 
-    if (g_verbose >= 1) fprintf(stderr, "\nTotal: %.1fs\n", get_time() - t_total);
+    if (cfireants_verbose >= 1) fprintf(stderr, "\nTotal: %.1fs\n", get_time() - t_total);
 
     /* Skullstrip mode: -o is the output filename, only produce skull-stripped image */
     if (cfg.skullstrip_mask) {
@@ -725,7 +725,7 @@ int main(int argc, char **argv) {
             /* -o is the skull-stripped output file */
             const char *out = cfg.output_prefix;
             if (ensure_parent_dir(out) != 0) { image_free(&mask_img); goto cleanup; }
-            if (g_verbose >= 1) fprintf(stderr, "Saving: %s (native datatype, threshold=%.2f)\n",
+            if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s (native datatype, threshold=%.2f)\n",
                     out, cfg.skullstrip_threshold);
             image_skullstrip_save(out, cfg.fixed_path,
                                    mask_data, cfg.skullstrip_threshold, fN);
@@ -744,7 +744,7 @@ int main(int argc, char **argv) {
             snprintf(warped_path, sizeof(warped_path), "%sWarped.nii.gz", cfg.output_prefix);
         }
         if (ensure_parent_dir(warped_path) != 0) { tensor_free(&final_moved); goto cleanup; }
-        if (g_verbose >= 1) fprintf(stderr, "Saving: %s\n", warped_path);
+        if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", warped_path);
         int fN = fD * fixed.data.shape[3] * fixed.data.shape[4];
         image_save_like(warped_path, cfg.fixed_path, tensor_data_f32(&final_moved), fN);
         tensor_free(&final_moved);
@@ -770,7 +770,7 @@ int main(int argc, char **argv) {
         if (ensure_parent_dir(warped_path) != 0) {
             tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved); goto cleanup;
         }
-        if (g_verbose >= 1) fprintf(stderr, "Saving: %s\n", warped_path);
+        if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", warped_path);
         image_save_like(warped_path, cfg.fixed_path, tensor_data_f32(&moved),
                          fD * fixed.data.shape[3] * fixed.data.shape[4]);
 

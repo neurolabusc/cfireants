@@ -23,7 +23,7 @@ cmake .. -DCFIREANTS_METAL=ON                                 # Metal (macOS)
 cmake .. -DCFIREANTS_WEBGPU=ON                                # WebGPU
 cmake .. -DCFIREANTS_CUDA=OFF -DCFIREANTS_METAL=OFF           # CPU only
 
-make -j$(nproc)
+make -j8
 ```
 
 WebGPU requires [wgpu-native](https://github.com/gfx-rs/wgpu-native/releases) v27+ in `third_party/wgpu/`.

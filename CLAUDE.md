@@ -11,7 +11,7 @@ Pure C port of [FireANTs](https://github.com/rohitrango/FireANTs) (commit `0d13a
 ```bash
 mkdir -p build && cd build
 cmake .. -DCFIREANTS_METAL=ON    # or -DCFIREANTS_CUDA=ON / -DCFIREANTS_WEBGPU=ON
-make -j$(nproc)
+make -j8
 ```
 
 Tests must run from repo root. WebGPU needs wgpu-native v27+ in `third_party/wgpu/`.
