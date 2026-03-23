@@ -474,6 +474,39 @@ int image_save(const char *path, const tensor_t *data, const image_meta_t *meta)
     return 0;
 }
 
+int image_save_like(const char *out_path, const char *ref_path,
+                     const float *data, int nvox) {
+    /* Load reference header only (no data) */
+    nifti_image *nim = nifti_image_read(ref_path, 0);
+    if (!nim) {
+        fprintf(stderr, "image_save_like: failed to load header from %s\n", ref_path);
+        return -1;
+    }
+    if ((int)nim->nvox != nvox) {
+        fprintf(stderr, "image_save_like: nvox mismatch (%zu vs %d)\n", nim->nvox, nvox);
+        nifti_image_free(nim);
+        return -1;
+    }
+
+    /* Override to float32 data */
+    nim->datatype = DT_FLOAT32;
+    nim->nbyper = 4;
+    nim->scl_slope = 0.0f;
+    nim->scl_inter = 0.0f;
+    nim->data = (void *)data;
+
+    /* Set output path */
+    free(nim->fname); nim->fname = strdup(out_path);
+    free(nim->iname); nim->iname = strdup(out_path);
+    if (nim->nifti_type == 0) nim->nifti_type = 1; /* single-file NIfTI */
+
+    nifti_image_write(nim);
+
+    nim->data = NULL; /* don't free our data */
+    nifti_image_free(nim);
+    return 0;
+}
+
 int image_skullstrip_save(const char *out_path, const char *src_path,
                            const float *mask, float thresh, int nvox) {
     /* Load the original NIfTI (with full header and native datatype) */

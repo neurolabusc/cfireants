@@ -729,7 +729,8 @@ int main(int argc, char **argv) {
         }
         if (ensure_parent_dir(warped_path) != 0) { tensor_free(&final_moved); goto cleanup; }
         fprintf(stderr, "Saving: %s\n", warped_path);
-        image_save(warped_path, &final_moved, &fixed.meta);
+        int fN = fD * fixed.data.shape[3] * fixed.data.shape[4];
+        image_save_like(warped_path, cfg.fixed_path, tensor_data_f32(&final_moved), fN);
         tensor_free(&final_moved);
     } else {
         /* Affine-only output: resample moving with affine and save */
@@ -754,7 +755,8 @@ int main(int argc, char **argv) {
             tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved); goto cleanup;
         }
         fprintf(stderr, "Saving: %s\n", warped_path);
-        image_save(warped_path, &moved, &fixed.meta);
+        image_save_like(warped_path, cfg.fixed_path, tensor_data_f32(&moved),
+                         fD * fixed.data.shape[3] * fixed.data.shape[4]);
 
         tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved);
     }

@@ -91,6 +91,12 @@ void mat44d_print(const mat44d *m, const char *name);
    Returns 0 on success. */
 int image_save(const char *path, const tensor_t *data, const image_meta_t *meta);
 
+/* Save float32 tensor using the NIfTI header from an existing file.
+ * Clones sform, qform, pixdim, units, codes from ref_path exactly.
+ * Data is written as float32. Dimensions must match. */
+int image_save_like(const char *out_path, const char *ref_path,
+                     const float *data, int nvox);
+
 /* Apply a float32 mask to a NIfTI image at its native datatype.
  * Loads the source NIfTI, applies mask (threshold at thresh), sets
  * masked voxels to the minimum intensity, saves result.
