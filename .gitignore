@@ -63,3 +63,4 @@ third_party/wgpu/
 # Python
 __pycache__/
 *.pyc
+test/
