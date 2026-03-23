@@ -719,36 +719,26 @@ int main(int argc, char **argv) {
             tensor_t grid2; affine_grid_3d(&aff2, gs2, &grid2);
             tensor_t warped_mask; cpu_grid_sample_3d_forward(&mask_img.data, &grid2, &warped_mask, 1);
 
-            /* Find darkest voxel in subject image */
-            int fN = fD * fH * fW;
-            const float *subj = tensor_data_f32(&fixed.data);
-            float darkest = subj[0];
-            for (int i = 1; i < fN; i++)
-                if (subj[i] < darkest) darkest = subj[i];
-
-            /* Apply mask: copy subject, zero outside mask */
-            tensor_t stripped;
-            int ss[5] = {1, 1, fD, fH, fW};
-            tensor_alloc(&stripped, 5, ss, DTYPE_FLOAT32, DEVICE_CPU);
-            float *out = tensor_data_f32(&stripped);
+            int fN = fD * fixed.data.shape[3] * fixed.data.shape[4];
             const float *mask_data = tensor_data_f32(&warped_mask);
-            for (int i = 0; i < fN; i++)
-                out[i] = (mask_data[i] >= cfg.skullstrip_threshold) ? subj[i] : darkest;
 
+            /* Save skull-stripped image in native datatype (UINT16, INT16, etc.)
+             * by re-loading the original NIfTI and applying the mask directly */
             char strip_path[512];
             snprintf(strip_path, sizeof(strip_path), "%sSkullstrip.nii.gz", cfg.output_prefix);
-            fprintf(stderr, "Saving skullstrip: %s (threshold=%.2f, darkest=%.1f)\n",
-                    strip_path, cfg.skullstrip_threshold, darkest);
-            image_save(strip_path, &stripped, &fixed.meta);
+            fprintf(stderr, "Saving skullstrip: %s (threshold=%.2f, native datatype)\n",
+                    strip_path, cfg.skullstrip_threshold);
+            image_skullstrip_save(strip_path, cfg.fixed_path,
+                                   mask_data, cfg.skullstrip_threshold, fN);
 
-            /* Also save the warped mask */
+            /* Also save the warped mask as float32 */
             char mask_path[512];
             snprintf(mask_path, sizeof(mask_path), "%sMask.nii.gz", cfg.output_prefix);
             fprintf(stderr, "Saving warped mask: %s\n", mask_path);
             image_save(mask_path, &warped_mask, &fixed.meta);
 
             tensor_free(&aff2); tensor_free(&grid2);
-            tensor_free(&warped_mask); tensor_free(&stripped);
+            tensor_free(&warped_mask);
             image_free(&mask_img);
         }
     }

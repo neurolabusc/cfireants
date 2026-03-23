@@ -192,6 +192,12 @@ void image_compute_meta(image_meta_t *meta, const nifti_image *nim) {
     if (mat44d_inverse(&meta->phy2torch, &meta->torch2phy) != 0) {
         fprintf(stderr, "image_compute_meta: singular torch2phy matrix\n");
     }
+
+    /* Store original NIfTI datatype for round-trip saving */
+    meta->nifti_datatype = nim->datatype;
+    meta->nifti_nbyper = nim->nbyper;
+    meta->scl_slope = nim->scl_slope;
+    meta->scl_inter = nim->scl_inter;
 }
 
 /* ------------------------------------------------------------------ */
@@ -464,6 +470,76 @@ int image_save(const char *path, const tensor_t *data, const image_meta_t *meta)
     free(nim.fname);
     free(nim.iname);
     nim.data = NULL; /* Don't let nifti_image_free touch our tensor data */
+
+    return 0;
+}
+
+int image_skullstrip_save(const char *out_path, const char *src_path,
+                           const float *mask, float thresh, int nvox) {
+    /* Load the original NIfTI (with full header and native datatype) */
+    nifti_image *nim = nifti_image_read(src_path, 1);
+    if (!nim) {
+        fprintf(stderr, "image_skullstrip_save: failed to load %s\n", src_path);
+        return -1;
+    }
+    if ((int)nim->nvox != nvox) {
+        fprintf(stderr, "image_skullstrip_save: nvox mismatch (%zu vs %d)\n", nim->nvox, nvox);
+        nifti_image_free(nim);
+        return -1;
+    }
+
+    /* Find minimum value at native type, then apply mask */
+    void *data = nim->data;
+    switch (nim->datatype) {
+        case DT_UINT8: {
+            uint8_t *d = (uint8_t *)data;
+            uint8_t mn = d[0]; for (int i=1;i<nvox;i++) if(d[i]<mn) mn=d[i];
+            for (int i=0;i<nvox;i++) if(mask[i]<thresh) d[i]=mn;
+            break;
+        }
+        case DT_INT16: {
+            int16_t *d = (int16_t *)data;
+            int16_t mn = d[0]; for (int i=1;i<nvox;i++) if(d[i]<mn) mn=d[i];
+            for (int i=0;i<nvox;i++) if(mask[i]<thresh) d[i]=mn;
+            break;
+        }
+        case DT_UINT16: {
+            uint16_t *d = (uint16_t *)data;
+            uint16_t mn = d[0]; for (int i=1;i<nvox;i++) if(d[i]<mn) mn=d[i];
+            for (int i=0;i<nvox;i++) if(mask[i]<thresh) d[i]=mn;
+            break;
+        }
+        case DT_INT32: {
+            int32_t *d = (int32_t *)data;
+            int32_t mn = d[0]; for (int i=1;i<nvox;i++) if(d[i]<mn) mn=d[i];
+            for (int i=0;i<nvox;i++) if(mask[i]<thresh) d[i]=mn;
+            break;
+        }
+        case DT_FLOAT32: {
+            float *d = (float *)data;
+            float mn = d[0]; for (int i=1;i<nvox;i++) if(d[i]<mn) mn=d[i];
+            for (int i=0;i<nvox;i++) if(mask[i]<thresh) d[i]=mn;
+            break;
+        }
+        case DT_FLOAT64: {
+            double *d = (double *)data;
+            double mn = d[0]; for (int i=1;i<nvox;i++) if(d[i]<mn) mn=d[i];
+            for (int i=0;i<nvox;i++) if(mask[i]<thresh) d[i]=mn;
+            break;
+        }
+        default:
+            fprintf(stderr, "image_skullstrip_save: unsupported datatype %d\n", nim->datatype);
+            nifti_image_free(nim);
+            return -1;
+    }
+
+    /* Save with original header (preserves datatype, sform, everything) */
+    free(nim->fname); nim->fname = strdup(out_path);
+    free(nim->iname); nim->iname = strdup(out_path);
+    /* Ensure single-file NIfTI */
+    if (nim->nifti_type == 0) nim->nifti_type = 1;
+    nifti_image_write(nim);
+    nifti_image_free(nim);
 
     return 0;
 }

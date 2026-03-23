@@ -35,6 +35,10 @@ typedef struct {
     mat44d torch2px;         /* normalized [-1,1] → pixel index */
     mat44d torch2phy;        /* normalized → physical (px2phy @ torch2px) */
     mat44d phy2torch;        /* physical → normalized (inverse of torch2phy) */
+    int    nifti_datatype;   /* original NIfTI datatype (DT_FLOAT32, DT_UINT16, etc.) */
+    int    nifti_nbyper;     /* bytes per voxel in original format */
+    float  scl_slope;        /* NIfTI intensity scaling: val = slope * raw + inter */
+    float  scl_inter;
 } image_meta_t;
 
 /* Loaded image: tensor data + spatial metadata */
@@ -86,6 +90,13 @@ void mat44d_print(const mat44d *m, const char *name);
    The data tensor shape should be [1, C, D, H, W].
    Returns 0 on success. */
 int image_save(const char *path, const tensor_t *data, const image_meta_t *meta);
+
+/* Apply a float32 mask to a NIfTI image at its native datatype.
+ * Loads the source NIfTI, applies mask (threshold at thresh), sets
+ * masked voxels to the minimum intensity, saves result.
+ * Preserves original datatype (UINT16, INT16, FLOAT32, etc.). */
+int image_skullstrip_save(const char *out_path, const char *src_path,
+                           const float *mask, float thresh, int nvox);
 
 #ifdef __cplusplus
 }
