@@ -319,7 +319,7 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         float *d_cc_interm = syn_metal_alloc_buf(5L * spatial * sizeof(float), &cc_interm_buf);
         float *d_cc_scratch = syn_metal_alloc_buf(spatial * sizeof(float), &cc_scratch_buf);
 
-        fprintf(stderr, "  SyN Metal scale %d: [%d,%d,%d] x %d iters\n", scale, dD, dH, dW, iters);
+        if (cfireants_verbose >= 2) fprintf(stderr, "  SyN Metal scale %d: [%d,%d,%d] x %d iters\n", scale, dD, dH, dW, iters);
 
         float prev_loss = 1e30f;
         int converge_count = 0;
@@ -369,11 +369,11 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
                                d_warp_kernel, warp_klen);
 
             if (it % 50 == 0 || it == iters - 1)
-                fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
+                if (cfireants_verbose >= 2) fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
             if (fabsf(loss - prev_loss) < opts.tolerance) {
                 converge_count++;
                 if (converge_count >= opts.max_tolerance_iters) {
-                    fprintf(stderr, "    Converged at iter %d\n", it);
+                    if (cfireants_verbose >= 2) fprintf(stderr, "    Converged at iter %d\n", it);
                     break;
                 }
             } else converge_count = 0;

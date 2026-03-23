@@ -181,10 +181,12 @@ int cfireants_init_metal(void) {
         return -1;
     }
 
-    @autoreleasepool {
-        fprintf(stderr, "Metal backend: %s (%.0f MB)\n",
-                [[g_metal.device name] UTF8String],
-                [g_metal.device recommendedMaxWorkingSetSize] / (1024.0 * 1024.0));
+    if (cfireants_verbose >= 1) {
+        @autoreleasepool {
+            fprintf(stderr, "Metal backend: %s (%.0f MB)\n",
+                    [[g_metal.device name] UTF8String],
+                    [g_metal.device recommendedMaxWorkingSetSize] / (1024.0 * 1024.0));
+        }
     }
 
     g_backend = &metal_backend;

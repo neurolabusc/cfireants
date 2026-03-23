@@ -6,6 +6,10 @@
  */
 
 #include "cfireants/backend.h"
+
+/* Global verbosity: default 2 for backward compat with test programs */
+int cfireants_verbose = 2;
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

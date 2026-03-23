@@ -10,6 +10,7 @@
  */
 
 #include "cfireants/registration.h"
+#include "cfireants/backend.h"
 #include "cfireants/interpolator.h"
 #include "cfireants/losses.h"
 #include "cfireants/utils.h"
@@ -336,8 +337,8 @@ int moments_register(const image_t *fixed, const image_t *moving,
     compute_com(fixed_data, coords_f, nvox_f, com_f);
     compute_com(moving_data, coords_m, nvox_m, com_m);
 
-    fprintf(stderr, "  COM fixed:  [%.4f, %.4f, %.4f]\n", com_f[0], com_f[1], com_f[2]);
-    fprintf(stderr, "  COM moving: [%.4f, %.4f, %.4f]\n", com_m[0], com_m[1], com_m[2]);
+    if (cfireants_verbose >= 2) fprintf(stderr, "  COM fixed:  [%.4f, %.4f, %.4f]\n", com_f[0], com_f[1], com_f[2]);
+    if (cfireants_verbose >= 2) fprintf(stderr, "  COM moving: [%.4f, %.4f, %.4f]\n", com_m[0], com_m[1], com_m[2]);
 
     if (opts.moments == 1) {
         /* Translation only */
@@ -442,7 +443,7 @@ int moments_register(const image_t *fixed, const image_t *moving,
             }
 
             float loss = eval_candidate_cc(fixed, moving, aff, opts.cc_kernel_size, gpu_state);
-            fprintf(stderr, "  Candidate %d: CC loss = %.6f\n", c, loss);
+            if (cfireants_verbose >= 2) fprintf(stderr, "  Candidate %d: CC loss = %.6f\n", c, loss);
 
             if (loss < best_loss) {
                 best_loss = loss;
@@ -453,7 +454,7 @@ int moments_register(const image_t *fixed, const image_t *moving,
 #ifdef CFIREANTS_HAS_CUDA
         if (gpu_state) moments_gpu_free(gpu_state);
 #endif
-        fprintf(stderr, "  Best candidate: %d (loss=%.6f)\n", best_idx, best_loss);
+        if (cfireants_verbose >= 2) fprintf(stderr, "  Best candidate: %d (loss=%.6f)\n", best_idx, best_loss);
 
         /* Compute final R with best candidate */
         float tmp1[3][3], R_final[3][3];

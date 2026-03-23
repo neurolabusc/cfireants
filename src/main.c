@@ -12,6 +12,8 @@
  *     -o output_
  */
 
+#define CFIREANTS_VERSION "0.1.0"
+
 #include "cfireants/tensor.h"
 #include "cfireants/image.h"
 #include "cfireants/backend.h"
@@ -75,8 +77,11 @@ typedef struct {
     backend_t backend;
     int downsample_mode;
     int initial_moving_transform;  /* 0=none, 1=moments */
-    int verbose;
+    int verbose;  /* 0=silent (errors only), 1=summary, 2=debug (per-iter) */
 } cli_config_t;
+
+/* Use the global cfireants_verbose from backend.h */
+#define g_verbose cfireants_verbose
 
 /* Ensure parent directory of path exists, creating if needed.
  * Returns 0 on success, -1 on failure. */
@@ -268,7 +273,8 @@ static void print_usage(const char *prog) {
         "  --syn                       Shorthand for Rigid + Affine + SyN (default)\n"
         "  --greedy                    Shorthand for Rigid + Affine + Greedy\n"
         "\n"
-        "  -v, --verbose               Print per-iteration loss\n"
+        "  -v, --verbose [level]       0=silent (default), 1=summary, 2=per-iteration\n"
+        "  --version                   Print version and exit\n"
         "  -h, --help                  Show this help\n"
         "\n"
         "Examples:\n"
@@ -379,7 +385,13 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
         } else if (strcmp(arg, "-w") == 0 || strcmp(arg, "--warped") == 0) {
             NEED_ARG(); cfg->output_warped = argv[++i];
         } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
-            cfg->verbose = 1;
+            if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
+                cfg->verbose = atoi(argv[++i]);
+            else
+                cfg->verbose = 1;  /* -v without number = 1 */
+        } else if (strcmp(arg, "--version") == 0) {
+            printf("cfireants_reg %s\n", CFIREANTS_VERSION);
+            exit(0);
         } else if (strcmp(arg, "--trilinear") == 0) {
             cfg->downsample_mode = DOWNSAMPLE_TRILINEAR;
         } else if (strcmp(arg, "--moments") == 0) {
@@ -461,6 +473,7 @@ static const char *stage_name(stage_type_t t) {
 int main(int argc, char **argv) {
     cli_config_t cfg;
     if (parse_args(argc, argv, &cfg) != 0) return 1;
+    cfireants_verbose = cfg.verbose;
 
     /* Initialize backend */
     cfireants_init_cpu();
@@ -494,14 +507,16 @@ int main(int argc, char **argv) {
     }
 
     int fD = fixed.data.shape[2], fH = fixed.data.shape[3], fW = fixed.data.shape[4];
-    fprintf(stderr, "Fixed:  %s [%d x %d x %d]\n", cfg.fixed_path, fD, fH, fW);
-    fprintf(stderr, "Moving: %s [%d x %d x %d]\n", cfg.moving_path,
-            moving.data.shape[2], moving.data.shape[3], moving.data.shape[4]);
-    fprintf(stderr, "Backend: %s\n",
-            cfg.backend == BACKEND_METAL ? "Metal" :
-            cfg.backend == BACKEND_WEBGPU ? "WebGPU" :
-            cfg.backend == BACKEND_CUDA ? "CUDA" : "CPU");
-    fprintf(stderr, "Stages: %d\n", cfg.n_stages);
+    if (g_verbose >= 1) {
+        fprintf(stderr, "Fixed:  %s [%d x %d x %d]\n", cfg.fixed_path, fD, fH, fW);
+        fprintf(stderr, "Moving: %s [%d x %d x %d]\n", cfg.moving_path,
+                moving.data.shape[2], moving.data.shape[3], moving.data.shape[4]);
+        fprintf(stderr, "Backend: %s\n",
+                cfg.backend == BACKEND_METAL ? "Metal" :
+                cfg.backend == BACKEND_WEBGPU ? "WebGPU" :
+                cfg.backend == BACKEND_CUDA ? "CUDA" : "CPU");
+        fprintf(stderr, "Stages: %d\n", cfg.n_stages);
+    }
 
     double t_total = get_time();
 
@@ -516,7 +531,8 @@ int main(int argc, char **argv) {
         double t0 = get_time();
         moments_opts_t mopts = moments_opts_default();
         moments_register(&fixed, &moving, mopts, &mom);
-        fprintf(stderr, "Moments: %.1fs (NCC %.4f)\n", get_time() - t0, mom.ncc_loss);
+        if (g_verbose >= 1)
+            fprintf(stderr, "Moments: %.1fs (NCC %.4f)\n", get_time() - t0, mom.ncc_loss);
     }
 
     /* Run stages */
@@ -539,7 +555,7 @@ int main(int argc, char **argv) {
         stage_config_t *s = &cfg.stages[si];
         double t0 = get_time();
 
-        fprintf(stderr, "\n--- Stage %d: %s (lr=%.4f, %s%s%d, %d levels) ---\n",
+        if (g_verbose >= 1) fprintf(stderr, "\n--- Stage %d: %s (lr=%.4f, %s%s%d, %d levels) ---\n",
                 si + 1, stage_name(s->type), s->lr,
                 s->metric_type == LOSS_MI ? "MI bins=" : "CC k=",
                 "", s->metric_param, s->n_levels);
@@ -574,7 +590,7 @@ int main(int argc, char **argv) {
             (void)rc;
             memcpy(rigid_mat, result.rigid_mat, sizeof(rigid_mat));
             memcpy(affine_mat, result.rigid_mat, sizeof(affine_mat));
-            fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            if (g_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
 
         } else if (s->type == STAGE_AFFINE) {
             affine_opts_t opts = {
@@ -610,7 +626,7 @@ int main(int argc, char **argv) {
                 for (int j = 0; j < 4; j++)
                     affine_44[i][j] = affine_mat[i][j];
             affine_44[3][3] = 1.0f;
-            fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            if (g_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
 
         } else if (s->type == STAGE_SYN) {
             syn_opts_t opts = {
@@ -643,7 +659,7 @@ int main(int argc, char **argv) {
             if (final_moved.data) tensor_free(&final_moved);
             final_moved = result.moved;
             final_ncc = result.ncc_loss;
-            fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            if (g_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
 
         } else if (s->type == STAGE_GREEDY) {
             greedy_opts_t opts = {
@@ -676,11 +692,11 @@ int main(int argc, char **argv) {
             if (final_moved.data) tensor_free(&final_moved);
             final_moved = result.moved;
             final_ncc = result.ncc_loss;
-            fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            if (g_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
         }
     }
 
-    fprintf(stderr, "\nTotal: %.1fs\n", get_time() - t_total);
+    if (g_verbose >= 1) fprintf(stderr, "\nTotal: %.1fs\n", get_time() - t_total);
 
     /* Skullstrip mode: -o is the output filename, only produce skull-stripped image */
     if (cfg.skullstrip_mask) {
@@ -709,7 +725,7 @@ int main(int argc, char **argv) {
             /* -o is the skull-stripped output file */
             const char *out = cfg.output_prefix;
             if (ensure_parent_dir(out) != 0) { image_free(&mask_img); goto cleanup; }
-            fprintf(stderr, "Saving: %s (native datatype, threshold=%.2f)\n",
+            if (g_verbose >= 1) fprintf(stderr, "Saving: %s (native datatype, threshold=%.2f)\n",
                     out, cfg.skullstrip_threshold);
             image_skullstrip_save(out, cfg.fixed_path,
                                    mask_data, cfg.skullstrip_threshold, fN);
@@ -728,7 +744,7 @@ int main(int argc, char **argv) {
             snprintf(warped_path, sizeof(warped_path), "%sWarped.nii.gz", cfg.output_prefix);
         }
         if (ensure_parent_dir(warped_path) != 0) { tensor_free(&final_moved); goto cleanup; }
-        fprintf(stderr, "Saving: %s\n", warped_path);
+        if (g_verbose >= 1) fprintf(stderr, "Saving: %s\n", warped_path);
         int fN = fD * fixed.data.shape[3] * fixed.data.shape[4];
         image_save_like(warped_path, cfg.fixed_path, tensor_data_f32(&final_moved), fN);
         tensor_free(&final_moved);
@@ -754,7 +770,7 @@ int main(int argc, char **argv) {
         if (ensure_parent_dir(warped_path) != 0) {
             tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved); goto cleanup;
         }
-        fprintf(stderr, "Saving: %s\n", warped_path);
+        if (g_verbose >= 1) fprintf(stderr, "Saving: %s\n", warped_path);
         image_save_like(warped_path, cfg.fixed_path, tensor_data_f32(&moved),
                          fD * fixed.data.shape[3] * fixed.data.shape[4]);
 

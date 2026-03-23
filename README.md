@@ -83,7 +83,8 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
 | `--affine` | Preset: Rigid + Affine |
 | `--syn` | Preset: Rigid + Affine + SyN (default) |
 | `--greedy` | Preset: Rigid + Affine + Greedy |
-| `-v, --verbose` | Print per-iteration loss |
+| `-v [level]` | Verbosity: 0=silent (default), 1=summary, 2=per-iteration |
+| `--version` | Print version and exit |
 | `--skullstrip <mask>` | Brain mask in template space — warps to subject, applies threshold |
 
 ### Per-stage options

@@ -7,6 +7,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include "cfireants/backend.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -26,7 +27,7 @@ int metal_context_init(void) {
             return -1;
         }
 
-        fprintf(stderr, "Metal backend: %s\n",
+        if (cfireants_verbose >= 1) fprintf(stderr, "Metal backend: %s\n",
                 [[g_metal.device name] UTF8String]);
 
         /* Create command queue */
@@ -55,7 +56,7 @@ int metal_context_init(void) {
         for (NSString *path in paths) {
             g_metal.library = [g_metal.device newLibraryWithFile:path error:&error];
             if (g_metal.library) {
-                fprintf(stderr, "Metal shaders: loaded from %s\n", [path UTF8String]);
+                if (cfireants_verbose >= 1) fprintf(stderr, "Metal shaders: loaded from %s\n", [path UTF8String]);
                 break;
             }
         }
@@ -64,7 +65,7 @@ int metal_context_init(void) {
             /* Try default library (compiled into app bundle) */
             g_metal.library = [g_metal.device newDefaultLibrary];
             if (g_metal.library) {
-                fprintf(stderr, "Metal shaders: loaded default library\n");
+                if (cfireants_verbose >= 1) fprintf(stderr, "Metal shaders: loaded default library\n");
             }
         }
 

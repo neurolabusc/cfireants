@@ -13,6 +13,10 @@
 
 #include "cfireants/tensor.h"
 
+/* Global verbosity level: 0=silent, 1=summary, 2=per-iteration debug.
+ * Set by the CLI tool; registration functions should check before printing. */
+extern int cfireants_verbose;
+
 #ifdef __cplusplus
 extern "C" {
 #endif

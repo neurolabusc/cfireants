@@ -225,7 +225,7 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         float half_resolution = 1.0f / (float)(
             (dD > dH ? (dD > dW ? dD : dW) : (dH > dW ? dH : dW)) - 1);
 
-        fprintf(stderr, "  Greedy Metal scale %d: fixed[%d,%d,%d] moving[%d,%d,%d] x %d iters\n",
+        if (cfireants_verbose >= 2) fprintf(stderr, "  Greedy Metal scale %d: fixed[%d,%d,%d] moving[%d,%d,%d] x %d iters\n",
                 scale, dD, dH, dW, mdD, mdH, mdW, iters);
 
         /* Generate affine base grid for forward pass */
@@ -308,12 +308,12 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
             memcpy(d_warp, d_adam_dir, n3 * sizeof(float));
 
             if (it % 50 == 0 || it == iters - 1)
-                fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
+                if (cfireants_verbose >= 2) fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
 
             if (fabsf(loss - prev_loss) < opts.tolerance) {
                 converge_count++;
                 if (converge_count >= opts.max_tolerance_iters) {
-                    fprintf(stderr, "    Converged at iter %d\n", it);
+                    if (cfireants_verbose >= 2) fprintf(stderr, "    Converged at iter %d\n", it);
                     break;
                 }
             } else { converge_count = 0; }

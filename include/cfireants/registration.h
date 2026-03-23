@@ -12,6 +12,9 @@
 extern "C" {
 #endif
 
+/* Global verbosity: 0=silent, 1=summary, 2=per-iteration */
+extern int cfireants_verbose;
+
 /* Result from moments registration */
 typedef struct {
     float Rf[3][3];     /* Rotation matrix (physical space) */
