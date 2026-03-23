@@ -59,12 +59,12 @@ Each registration stage is specified with `--transform`, `--metric`, `--converge
 
 ```bash
 cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
-  --transform Rigid[0.003] --metric MI[32] \
-    --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \
-  --transform Affine[0.001] --metric MI[32] \
-    --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \
-  --transform SyN[0.1,0.5,1.0] --metric CC[5] \
-    --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \
+  --transform 'Rigid[0.003]' --metric 'MI[32]' \
+    --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
+  --transform 'Affine[0.001]' --metric 'MI[32]' \
+    --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
+  --transform 'SyN[0.1,0.5,1.0]' --metric 'CC[5]' \
+    --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
   -o output_
 ```
 
@@ -118,42 +118,42 @@ Run all validation tests from the repo root (requires datasets in `validate/`):
 
 ```bash
 # Registration — small dataset (2mm full-head, MI+SyN)
-build/cfireants_reg \
+cfireants_reg \
   -f validate/small/MNI152_T1_2mm.nii.gz \
   -m validate/small/T1_head_2mm.nii.gz \
-  --trilinear -o validate/small/output/syn_
+  --trilinear -o ./test/small_syn_
 
 # Registration — small dataset, greedy (faster)
-build/cfireants_reg \
+cfireants_reg \
   -f validate/small/MNI152_T1_2mm.nii.gz \
   -m validate/small/T1_head_2mm.nii.gz \
-  --greedy --trilinear -o validate/small/output/greedy_
+  --greedy --trilinear -o ./test/small_greedy_
 
 # Registration — medium dataset (1mm brain-extracted, CC throughout)
-build/cfireants_reg \
+cfireants_reg \
   -f validate/medium/MNI152_T1_1mm_brain.nii.gz \
   -m validate/medium/t1_brain.nii.gz \
-  --transform Rigid[0.003] --metric CC[5] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \
-  --transform Affine[0.001] --metric CC[5] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \
-  --transform SyN[0.1,0.5,1.0] --metric CC[5] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \
-  --trilinear -o validate/medium/output/syn_
+  --transform 'Rigid[0.003]' --metric 'CC[5]' --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
+  --transform 'Affine[0.001]' --metric 'CC[5]' --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
+  --transform 'SyN[0.1,0.5,1.0]' --metric 'CC[5]' --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
+  --trilinear -o ./test/medium_syn_
 
 # Registration — large dataset (1mm full-head, MI+SyN, 4 scales for linear)
-build/cfireants_reg \
+cfireants_reg \
   -f validate/large/MNI152_T1_1mm.nii.gz \
   -m validate/large/chris_t1.nii.gz \
-  --transform Rigid[0.003] --metric MI[32] --convergence [200x200x100x50,1e-6,10] --shrink-factors 8x4x2x1 \
-  --transform Affine[0.001] --metric MI[32] --convergence [200x200x100x50,1e-6,10] --shrink-factors 8x4x2x1 \
-  --transform SyN[0.1,0.5,1.0] --metric CC[5] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \
-  --trilinear -o validate/large/output/syn_
+  --transform 'Rigid[0.003]' --metric 'MI[32]' --convergence '[200x200x100x50,1e-6,10]' --shrink-factors 8x4x2x1 \
+  --transform 'Affine[0.001]' --metric 'MI[32]' --convergence '[200x200x100x50,1e-6,10]' --shrink-factors 8x4x2x1 \
+  --transform 'SyN[0.1,0.5,1.0]' --metric 'CC[5]' --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
+  --trilinear -o ./test/large_syn_
 
 # Skull stripping — warp MNI brain mask to subject space
-build/cfireants_reg \
+cfireants_reg \
   -f validate/skulllstrip/T1_head_2mm.nii.gz \
   -m validate/skulllstrip/MNI152_T1_2mm.nii.gz \
   --affine --trilinear \
   --skullstrip validate/skulllstrip/mniMask.nii.gz \
-  -o validate/skulllstrip/out/bT1_head_2mm.nii.gz
+  -o ./test/bT1_head_2mm.nii.gz
 ```
 
 See [validate/README.md](validate/README.md) for expected NCC values, timing, and memory usage.
