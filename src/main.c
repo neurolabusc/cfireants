@@ -9,10 +9,10 @@
  *     --shrink-factors 4x2x1 --smoothing-sigmas 2x1x0 \
  *     --transform SyN[0.1,0.5,1.0] --metric CC[5] --convergence [200x100x50,1e-6,10] \
  *     --shrink-factors 4x2x1 --smoothing-sigmas 2x1x0 \
- *     -o output_
+ *     -o output.nii.gz
  */
 
-#define CFIREANTS_VERSION "0.1.20260323"
+#define CFIREANTS_VERSION "0.1.20260324"
 
 #include "cfireants/tensor.h"
 #include "cfireants/image.h"
@@ -66,8 +66,7 @@ typedef struct {
 typedef struct {
     const char *fixed_path;
     const char *moving_path;
-    const char *output_prefix;
-    const char *output_warped;
+    const char *output_path;       /* output filename (e.g. warped.nii.gz) */
     const char *skullstrip_mask;   /* mask in moving/template space */
     float skullstrip_threshold;    /* threshold for warped mask (default 0.5) */
 
@@ -240,8 +239,7 @@ static void print_usage(const char *prog) {
         "  -m, --moving <file>         Moving image to register\n"
         "\n"
         "Output:\n"
-        "  -o, --output <prefix>       Output prefix (default: output_)\n"
-        "  -w, --warped <file>         Warped output NIfTI (default: <prefix>Warped.nii.gz)\n"
+        "  -o, --output <file>         Output NIfTI filename (default: output.nii.gz)\n"
         "\n"
         "Backend:\n"
         "  --backend <name>            cpu, metal, webgpu, cuda (default: best available)\n"
@@ -253,9 +251,8 @@ static void print_usage(const char *prog) {
         "\n"
         "Skull stripping:\n"
         "  --skullstrip <mask.nii.gz>  Brain mask in template/moving space. Warps mask to subject\n"
-        "                              space, thresholds at 0.5, applies to fixed image. When used,\n"
-        "                              -o is the output filename (not a prefix). Preserves native\n"
-        "                              datatype. Non-brain voxels set to darkest intensity.\n"
+        "                              space, thresholds at 0.5, applies to fixed image. Preserves\n"
+        "                              native datatype. Non-brain voxels set to darkest intensity.\n"
         "\n"
         "Registration stages (repeat for each stage):\n"
         "  --transform <Type[params]>  Rigid[lr], Affine[lr], SyN[lr,warp_sigma,grad_sigma],\n"
@@ -278,17 +275,17 @@ static void print_usage(const char *prog) {
         "\n"
         "Examples:\n"
         "  # Default full pipeline (Moments + Rigid MI + Affine MI + SyN CC)\n"
-        "  %s -f mni.nii.gz -m subject.nii.gz -o reg_\n"
+        "  %s -f mni.nii.gz -m subject.nii.gz -o wsubject.nii.gz\n"
         "\n"
         "  # Affine only (no deformable)\n"
-        "  %s -f mni.nii.gz -m subject.nii.gz --affine -o reg_\n"
+        "  %s -f mni.nii.gz -m subject.nii.gz --affine -o wsubject.nii.gz\n"
         "\n"
         "  # Custom stages\n"
         "  %s -f mni.nii.gz -m subject.nii.gz \\\n"
         "    --transform Rigid[0.003] --metric MI[32] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \\\n"
         "    --transform Affine[0.001] --metric MI[32] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \\\n"
         "    --transform SyN[0.1,0.5,1.0] --metric CC[5] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \\\n"
-        "    -o reg_\n",
+        "    -o wsubject.nii.gz\n",
         prog, prog, prog, prog);
 }
 
@@ -351,7 +348,7 @@ static void set_preset(cli_config_t *cfg, const char *preset) {
 
 static int parse_args(int argc, char **argv, cli_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
-    cfg->output_prefix = "output_";
+    cfg->output_path = "output.nii.gz";
     cfg->skullstrip_threshold = 0.5f;
     cfg->initial_moving_transform = 1; /* moments by default */
     cfg->backend = BACKEND_CPU;
@@ -380,9 +377,7 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
         } else if (strcmp(arg, "-m") == 0 || strcmp(arg, "--moving") == 0) {
             NEED_ARG(); cfg->moving_path = argv[++i];
         } else if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
-            NEED_ARG(); cfg->output_prefix = argv[++i];
-        } else if (strcmp(arg, "-w") == 0 || strcmp(arg, "--warped") == 0) {
-            NEED_ARG(); cfg->output_warped = argv[++i];
+            NEED_ARG(); cfg->output_path = argv[++i];
         } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
                 cfg->verbose = atoi(argv[++i]);
@@ -627,6 +622,12 @@ int main(int argc, char **argv) {
                     affine_44[i][j] = affine_mat[i][j];
             affine_44[3][3] = 1.0f;
             if (cfireants_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            if (cfireants_verbose >= 2) {
+                fprintf(stderr, "  Affine (physical space):\n");
+                for (int i = 0; i < 3; i++)
+                    fprintf(stderr, "    [%10.6f %10.6f %10.6f %10.4f]\n",
+                            affine_mat[i][0], affine_mat[i][1], affine_mat[i][2], affine_mat[i][3]);
+            }
 
         } else if (s->type == STAGE_SYN) {
             syn_opts_t opts = {
@@ -698,7 +699,7 @@ int main(int argc, char **argv) {
 
     if (cfireants_verbose >= 1) fprintf(stderr, "\nTotal: %.1fs\n", get_time() - t_total);
 
-    /* Skullstrip mode: -o is the output filename, only produce skull-stripped image */
+    /* Skullstrip mode: only produce skull-stripped image */
     if (cfg.skullstrip_mask) {
         image_t mask_img;
         if (image_load(&mask_img, cfg.skullstrip_mask, DEVICE_CPU) != 0) {
@@ -722,9 +723,12 @@ int main(int argc, char **argv) {
             int fN = fD * fH * fW;
             const float *mask_data = tensor_data_f32(&warped_mask);
 
-            /* -o is the skull-stripped output file */
-            const char *out = cfg.output_prefix;
-            if (ensure_parent_dir(out) != 0) { image_free(&mask_img); goto cleanup; }
+            const char *out = cfg.output_path;
+            if (ensure_parent_dir(out) != 0) {
+                tensor_free(&aff2); tensor_free(&grid2);
+                tensor_free(&warped_mask); image_free(&mask_img);
+                goto cleanup;
+            }
             if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s (native datatype, threshold=%.2f)\n",
                     out, cfg.skullstrip_threshold);
             image_skullstrip_save(out, cfg.fixed_path,
@@ -737,16 +741,10 @@ int main(int argc, char **argv) {
         if (final_moved.data) tensor_free(&final_moved);
     } else if (final_moved.data) {
         /* Deformable output: save warped moving image */
-        char warped_path[512];
-        if (cfg.output_warped) {
-            snprintf(warped_path, sizeof(warped_path), "%s", cfg.output_warped);
-        } else {
-            snprintf(warped_path, sizeof(warped_path), "%sWarped.nii.gz", cfg.output_prefix);
-        }
-        if (ensure_parent_dir(warped_path) != 0) { tensor_free(&final_moved); goto cleanup; }
-        if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", warped_path);
+        if (ensure_parent_dir(cfg.output_path) != 0) { tensor_free(&final_moved); goto cleanup; }
+        if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", cfg.output_path);
         int fN = fD * fixed.data.shape[3] * fixed.data.shape[4];
-        image_save_like(warped_path, cfg.fixed_path, tensor_data_f32(&final_moved), fN);
+        image_save_like(cfg.output_path, cfg.fixed_path, tensor_data_f32(&final_moved), fN);
         tensor_free(&final_moved);
     } else {
         /* Affine-only output: resample moving with affine and save */
@@ -764,14 +762,11 @@ int main(int argc, char **argv) {
         tensor_t grid; affine_grid_3d(&aff_t, gs, &grid);
         tensor_t moved; cpu_grid_sample_3d_forward(&moving.data, &grid, &moved, 1);
 
-        char warped_path[512];
-        if (cfg.output_warped) snprintf(warped_path,sizeof(warped_path),"%s",cfg.output_warped);
-        else snprintf(warped_path,sizeof(warped_path),"%sWarped.nii.gz",cfg.output_prefix);
-        if (ensure_parent_dir(warped_path) != 0) {
+        if (ensure_parent_dir(cfg.output_path) != 0) {
             tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved); goto cleanup;
         }
-        if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", warped_path);
-        image_save_like(warped_path, cfg.fixed_path, tensor_data_f32(&moved),
+        if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", cfg.output_path);
+        image_save_like(cfg.output_path, cfg.fixed_path, tensor_data_f32(&moved),
                          fD * fixed.data.shape[3] * fixed.data.shape[4]);
 
         tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved);

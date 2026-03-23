@@ -301,7 +301,10 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
     separable_box_filter_3d(b_J2, b_J2, D, H, W, kernel_size, tmp);
     separable_box_filter_3d(b_IJ, b_IJ, D, H, W, kernel_size, tmp);
 
-    /* Step 3: Forward NCC */
+    /* Step 3: Forward NCC
+     * Box filter produces local means. The kv scaling converts to sum-based
+     * quantities, matching the original CUDA fused_cc.cu implementation.
+     * This is intentional — lr and optimizer are tuned for this scale. */
     if (loss_out) {
         double ncc_sum = 0;
         for (size_t i = 0; i < n; i++) {

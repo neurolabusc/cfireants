@@ -357,6 +357,11 @@ int moments_register(const image_t *fixed, const image_t *moving,
         symmetric_3x3_svd(M_f, U_f, S_f, Vt_f);
         symmetric_3x3_svd(M_m, U_m, S_m, Vt_m);
 
+        if (cfireants_verbose >= 2) {
+            fprintf(stderr, "  S_f: [%.2f, %.2f, %.2f]  S_m: [%.2f, %.2f, %.2f]\n",
+                    S_f[0], S_f[1], S_f[2], S_m[0], S_m[1], S_m[2]);
+        }
+
         /* Transpose U_m for the formula R = (U_f @ D @ U_m^T)^T */
         float U_m_t[3][3];
         mat3_transpose(U_m_t, U_m);
@@ -422,6 +427,8 @@ int moments_register(const image_t *fixed, const image_t *moving,
 #endif
         float best_loss = 1e30f;
         int best_idx = 0;
+        float best_R[3][3];
+        mat3_identity(best_R);
 
         for (int c = 0; c < n_cand; c++) {
             /* R = (U_f_corr @ candidate @ I @ U_m^T)^T */
@@ -448,31 +455,79 @@ int moments_register(const image_t *fixed, const image_t *moving,
             if (loss < best_loss) {
                 best_loss = loss;
                 best_idx = c;
+                memcpy(best_R, Rt, sizeof(best_R));
+            }
+        }
+
+        /* Evaluate two additional candidates beyond SVD:
+         * 1. Identity + COM translation: correct when images need only translation
+         * 2. Pure identity (R=I, t=0): correct when sforms already align images
+         * These prevent SVD from introducing spurious rotations. */
+        int best_extra = 0; /* 0=SVD, 1=COM identity, 2=pure identity */
+        {
+            /* Identity + COM translation */
+            float com_aff[3][4];
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 3; j++)
+                    com_aff[i][j] = (i == j) ? 1.0f : 0.0f;
+                com_aff[i][3] = com_m[i] - com_f[i];
+            }
+            float com_loss = eval_candidate_cc(fixed, moving, com_aff, opts.cc_kernel_size, gpu_state);
+            if (cfireants_verbose >= 2) fprintf(stderr, "  Identity+COM candidate: CC loss = %.6f\n", com_loss);
+            if (com_loss < best_loss) {
+                best_loss = com_loss;
+                best_idx = -1;
+                best_extra = 1;
+                mat3_identity(best_R);
+            }
+
+            /* Pure identity (no translation) — best when sforms already align */
+            float pure_aff[3][4] = {{1,0,0,0},{0,1,0,0},{0,0,1,0}};
+            float pure_loss = eval_candidate_cc(fixed, moving, pure_aff, opts.cc_kernel_size, gpu_state);
+            if (cfireants_verbose >= 2) fprintf(stderr, "  Pure identity candidate: CC loss = %.6f\n", pure_loss);
+            if (pure_loss < best_loss) {
+                best_loss = pure_loss;
+                best_idx = -2;
+                best_extra = 2;
+                mat3_identity(best_R);
             }
         }
 
 #ifdef CFIREANTS_HAS_CUDA
         if (gpu_state) moments_gpu_free(gpu_state);
 #endif
-        if (cfireants_verbose >= 2) fprintf(stderr, "  Best candidate: %d (loss=%.6f)\n", best_idx, best_loss);
+        if (cfireants_verbose >= 2) {
+            const char *labels[] = {"SVD candidate", "identity+COM", "pure identity"};
+            fprintf(stderr, "  Best: %s (loss=%.6f)\n",
+                    best_idx >= 0 ? labels[0] : labels[best_extra], best_loss);
+        }
 
-        /* Compute final R with best candidate */
-        float tmp1[3][3], R_final[3][3];
-        mat3_mul(tmp1, U_f_corr, candidates[best_idx]);
-        mat3_mul(R_final, tmp1, U_m_t);
-        /* Transpose to get the inverse mapping */
-        mat3_transpose(result->Rf, R_final);
+        /* Use best rotation */
+        memcpy(result->Rf, best_R, sizeof(result->Rf));
 
-        /* Translation: tf = com_m - Rf @ com_f
-         * Python: self.tf = com_m - (com_f @ Rf^T)  (row-vector @ matrix)
-         *       = com_m - Rf @ com_f  (as column vector operation) */
-        for (int i = 0; i < 3; i++) {
-            result->tf[i] = com_m[i];
-            for (int j = 0; j < 3; j++)
-                result->tf[i] -= result->Rf[i][j] * com_f[j];
+        /* Translation depends on which candidate won */
+        if (best_extra == 2) {
+            /* Pure identity: no translation */
+            result->tf[0] = result->tf[1] = result->tf[2] = 0.0f;
+        } else {
+            /* SVD or COM identity: tf = com_m - Rf @ com_f */
+            for (int i = 0; i < 3; i++) {
+                result->tf[i] = com_m[i];
+                for (int j = 0; j < 3; j++)
+                    result->tf[i] -= result->Rf[i][j] * com_f[j];
+            }
         }
 
         result->ncc_loss = best_loss;
+
+        if (cfireants_verbose >= 2) {
+            fprintf(stderr, "  Moments Rf:\n");
+            for (int i = 0; i < 3; i++)
+                fprintf(stderr, "    [%8.4f %8.4f %8.4f]\n",
+                        result->Rf[i][0], result->Rf[i][1], result->Rf[i][2]);
+            fprintf(stderr, "  Moments tf: [%.4f, %.4f, %.4f]\n",
+                    result->tf[0], result->tf[1], result->tf[2]);
+        }
     }
 
     /* Build combined affine [3, 4] = [Rf | tf] */

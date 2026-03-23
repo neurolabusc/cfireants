@@ -345,3 +345,7 @@ if(CFIREANTS_METAL)
         src/registration/syn.c)
     target_link_libraries(test_cpu_vs_metal cfireants cfireants_gpu)
 endif()
+
+
+add_executable(test_cc_compare tests/test_cc_compare.c)
+target_link_libraries(test_cc_compare cfireants cfireants_gpu)

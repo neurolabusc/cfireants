@@ -31,7 +31,7 @@ The pipeline:
 6. Apply: voxels outside mask set to the darkest intensity in the subject image
 
 Notes:
-- When `--skullstrip` is used, `-o` specifies the output filename directly (not a prefix)
+- `-o` specifies the output filename
 - Output preserves the native datatype of the input image (UINT16, INT16, FLOAT32, etc.)
 - For MRI magnitude images, the darkest voxel is typically 0 (air background)
 - For CT scans, the darkest voxel is typically ~-1024 (air in Hounsfield units)

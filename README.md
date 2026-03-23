@@ -34,23 +34,23 @@ The `cfireants_reg` tool uses ANTs-style command-line arguments:
 
 ```bash
 # Default: Moments → Rigid (MI) → Affine (MI) → SyN (CC)
-cfireants_reg -f fixed.nii.gz -m moving.nii.gz -o output_
+cfireants_reg -f fixed.nii.gz -m moving.nii.gz -o warped.nii.gz
 
 # Affine only (no deformable)
-cfireants_reg -f fixed.nii.gz -m moving.nii.gz --affine -o output_
+cfireants_reg -f fixed.nii.gz -m moving.nii.gz --affine -o warped.nii.gz
 
 # Rigid only
-cfireants_reg -f fixed.nii.gz -m moving.nii.gz --rigid -o output_
+cfireants_reg -f fixed.nii.gz -m moving.nii.gz --rigid -o warped.nii.gz
 
 # Greedy deformable (faster than SyN, ~1% lower accuracy)
-cfireants_reg -f fixed.nii.gz -m moving.nii.gz --greedy -o output_
+cfireants_reg -f fixed.nii.gz -m moving.nii.gz --greedy -o warped.nii.gz
 
 # Trilinear downsample (GPU-native, no FFT dependency)
-cfireants_reg -f fixed.nii.gz -m moving.nii.gz --trilinear -o output_
+cfireants_reg -f fixed.nii.gz -m moving.nii.gz --trilinear -o warped.nii.gz
 
 # Choose backend explicitly
-cfireants_reg -f fixed.nii.gz -m moving.nii.gz --backend metal -o output_
-cfireants_reg -f fixed.nii.gz -m moving.nii.gz --backend cpu -o output_
+cfireants_reg -f fixed.nii.gz -m moving.nii.gz --backend metal -o warped.nii.gz
+cfireants_reg -f fixed.nii.gz -m moving.nii.gz --backend cpu -o warped.nii.gz
 ```
 
 ### Custom stages
@@ -65,7 +65,7 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
     --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
   --transform 'SyN[0.1,0.5,1.0]' --metric 'CC[5]' \
     --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
-  -o output_
+  -o warped.nii.gz
 ```
 
 ### Arguments
@@ -74,8 +74,7 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
 |----------|-------------|
 | `-f, --fixed <file>` | Fixed (stationary) NIfTI image |
 | `-m, --moving <file>` | Moving image to register |
-| `-o, --output <prefix>` | Output prefix (default: `output_`) |
-| `-w, --warped <file>` | Explicit warped output path |
+| `-o, --output <file>` | Output NIfTI filename (default: `output.nii.gz`) |
 | `--backend <name>` | `cpu`, `metal`, `webgpu`, `cuda` (default: best available) |
 | `--trilinear` | Use GPU-native trilinear downsample instead of FFT |
 | `--moments` / `--no-moments` | Enable/disable center-of-mass initialization |
@@ -99,8 +98,7 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
 
 ### Output
 
-- `<prefix>Warped.nii.gz` — Moving image resampled into fixed space (registration mode)
-- `-o <file>` — Skull-stripped fixed image in native datatype (when `--skullstrip` used)
+- `-o <file>` — Moving image resampled into fixed space (registration mode), or skull-stripped fixed image (when `--skullstrip` used)
 
 ### Skull stripping
 
@@ -111,7 +109,7 @@ cfireants_reg -f subject.nii.gz -m template.nii.gz --affine --trilinear \
   --skullstrip brain_mask.nii.gz -o brain_extracted.nii.gz
 ```
 
-When `--skullstrip` is used, `-o` is the output filename (not a prefix). The mask (in template space) is warped into subject space, thresholded at 0.5, and applied — voxels outside the mask are set to the darkest intensity. Output preserves the native datatype (UINT16 in → UINT16 out).
+The mask (in template space) is warped into subject space, thresholded at 0.5, and applied — voxels outside the mask are set to the darkest intensity. Output preserves the native datatype (UINT16 in → UINT16 out).
 
 ## Validation
 
@@ -122,13 +120,13 @@ Run all validation tests from the repo root (requires datasets in `validate/`):
 cfireants_reg \
   -f validate/small/MNI152_T1_2mm.nii.gz \
   -m validate/small/T1_head_2mm.nii.gz \
-  --trilinear -o ./test/small_syn_
+  -o ./test/small_syn.nii.gz
 
 # Registration — small dataset, greedy (faster)
 cfireants_reg \
   -f validate/small/MNI152_T1_2mm.nii.gz \
   -m validate/small/T1_head_2mm.nii.gz \
-  --greedy --trilinear -o ./test/small_greedy_
+  --greedy -o ./test/small_greedy.nii.gz
 
 # Registration — medium dataset (1mm brain-extracted, CC throughout)
 cfireants_reg \
@@ -137,7 +135,7 @@ cfireants_reg \
   --transform 'Rigid[0.003]' --metric 'CC[5]' --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
   --transform 'Affine[0.001]' --metric 'CC[5]' --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
   --transform 'SyN[0.1,0.5,1.0]' --metric 'CC[5]' --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
-  --trilinear -o ./test/medium_syn_
+  -o ./test/medium_syn.nii.gz
 
 # Registration — large dataset (1mm full-head, MI+SyN, 4 scales for linear)
 cfireants_reg \
@@ -146,13 +144,13 @@ cfireants_reg \
   --transform 'Rigid[0.003]' --metric 'MI[32]' --convergence '[200x200x100x50,1e-6,10]' --shrink-factors 8x4x2x1 \
   --transform 'Affine[0.001]' --metric 'MI[32]' --convergence '[200x200x100x50,1e-6,10]' --shrink-factors 8x4x2x1 \
   --transform 'SyN[0.1,0.5,1.0]' --metric 'CC[5]' --convergence '[200x100x50,1e-6,10]' --shrink-factors 4x2x1 \
-  --trilinear -o ./test/large_syn_
+  -o ./test/wchris_t1.nii.gz
 
 # Skull stripping — warp MNI brain mask to subject space
 cfireants_reg \
   -f validate/skulllstrip/T1_head_2mm.nii.gz \
   -m validate/skulllstrip/MNI152_T1_2mm.nii.gz \
-  --affine --trilinear \
+  --affine \
   --skullstrip validate/skulllstrip/mniMask.nii.gz \
   -o ./test/bT1_head_2mm.nii.gz
 ```

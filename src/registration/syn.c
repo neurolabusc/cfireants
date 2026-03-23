@@ -516,10 +516,10 @@ int syn_evaluate(const image_t *fixed, const image_t *moving,
         int dz[8]={z0,z0,z0,z0,z0+1,z0+1,z0+1,z0+1};
         int dy[8]={y0,y0,y0+1,y0+1,y0,y0,y0+1,y0+1};
         int dx[8]={x0,x0+1,x0,x0+1,x0,x0+1,x0,x0+1};
+        float u[3] = {ux, uy, uz};
         for (int c=0;c<3;c++) {
             float v=0; for(int k=0;k<8;k++) v+=wt[k]*FW(dz[k],dy[k],dx[k],c);
-            composed[s*3+c] = ux + v; /* inv_rev + interp(fwd, ...) */
-            if (c==0) composed[s*3+c] = ux + v;
+            composed[s*3+c] = u[c] + v;
         }
         #undef FW
     }
