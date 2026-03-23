@@ -64,3 +64,4 @@ third_party/wgpu/
 __pycache__/
 *.pyc
 test/
+build_release/
