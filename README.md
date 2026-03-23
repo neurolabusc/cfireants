@@ -98,9 +98,8 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
 
 ### Output
 
-- `<prefix>Warped.nii.gz` — Moving image resampled into fixed space
-- `<prefix>Skullstrip.nii.gz` — Fixed image with non-brain voxels masked (when `--skullstrip` used)
-- `<prefix>Mask.nii.gz` — Brain mask warped into fixed space (when `--skullstrip` used)
+- `<prefix>Warped.nii.gz` — Moving image resampled into fixed space (registration mode)
+- `-o <file>` — Skull-stripped fixed image in native datatype (when `--skullstrip` used)
 
 ### Skull stripping
 
@@ -108,10 +107,10 @@ Register a template to a subject, then warp a brain mask to strip non-brain tiss
 
 ```bash
 cfireants_reg -f subject.nii.gz -m template.nii.gz --affine --trilinear \
-  --skullstrip brain_mask.nii.gz -o stripped_
+  --skullstrip brain_mask.nii.gz -o brain_extracted.nii.gz
 ```
 
-The mask (in template/moving space) is warped into subject space using the computed affine, thresholded at 0.5, and applied to the subject image. Voxels outside the mask are set to the darkest intensity in the image (0 for MRI, ~-1024 for CT).
+When `--skullstrip` is used, `-o` is the output filename (not a prefix). The mask (in template space) is warped into subject space, thresholded at 0.5, and applied — voxels outside the mask are set to the darkest intensity. Output preserves the native datatype (UINT16 in → UINT16 out).
 
 ## Why C?
 

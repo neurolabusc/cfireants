@@ -653,23 +653,55 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "\nTotal: %.1fs\n", get_time() - t_total);
 
-    /* Save output */
-    if (final_moved.data) {
-        /* Build output warped path */
+    /* Skullstrip mode: -o is the output filename, only produce skull-stripped image */
+    if (cfg.skullstrip_mask) {
+        image_t mask_img;
+        if (image_load(&mask_img, cfg.skullstrip_mask, DEVICE_CPU) != 0) {
+            fprintf(stderr, "Failed to load mask: %s\n", cfg.skullstrip_mask);
+        } else {
+            mat44d pd2, tm2, cb2;
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) pd2.m[i][j] = affine_44[i][j];
+            mat44d_mul(&tm2, &pd2, &fixed.meta.torch2phy);
+            mat44d_mul(&cb2, &mask_img.meta.phy2torch, &tm2);
+            float ha2[12]; for (int i=0;i<3;i++) for(int j=0;j<4;j++) ha2[i*4+j]=(float)cb2.m[i][j];
+
+            tensor_t aff2; int as2[3]={1,3,4};
+            tensor_alloc(&aff2,3,as2,DTYPE_FLOAT32,DEVICE_CPU);
+            memcpy(tensor_data_f32(&aff2), ha2, 48);
+            int fH = fixed.data.shape[3], fW = fixed.data.shape[4];
+            int gs2[3]={fD,fH,fW};
+            tensor_t grid2; affine_grid_3d(&aff2, gs2, &grid2);
+            tensor_t warped_mask; cpu_grid_sample_3d_forward(&mask_img.data, &grid2, &warped_mask, 1);
+
+            int fN = fD * fH * fW;
+            const float *mask_data = tensor_data_f32(&warped_mask);
+
+            /* -o is the skull-stripped output file */
+            const char *out = cfg.output_prefix; /* used as direct filename in skullstrip mode */
+            fprintf(stderr, "Saving: %s (native datatype, threshold=%.2f)\n",
+                    out, cfg.skullstrip_threshold);
+            image_skullstrip_save(out, cfg.fixed_path,
+                                   mask_data, cfg.skullstrip_threshold, fN);
+
+            tensor_free(&aff2); tensor_free(&grid2);
+            tensor_free(&warped_mask);
+            image_free(&mask_img);
+        }
+        if (final_moved.data) tensor_free(&final_moved);
+    } else if (final_moved.data) {
+        /* Deformable output: save warped moving image */
         char warped_path[512];
         if (cfg.output_warped) {
             snprintf(warped_path, sizeof(warped_path), "%s", cfg.output_warped);
         } else {
             snprintf(warped_path, sizeof(warped_path), "%sWarped.nii.gz", cfg.output_prefix);
         }
-
         fprintf(stderr, "Saving: %s\n", warped_path);
-        if (image_save(warped_path, &final_moved, &fixed.meta) != 0) {
-            fprintf(stderr, "Failed to save %s\n", warped_path);
-        }
+        image_save(warped_path, &final_moved, &fixed.meta);
         tensor_free(&final_moved);
     } else {
-        /* No deformable stage — resample moving with affine and save */
+        /* Affine-only output: resample moving with affine and save */
         mat44d pd, tm, cb;
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++) pd.m[i][j] = affine_44[i][j];
@@ -691,56 +723,6 @@ int main(int argc, char **argv) {
         image_save(warped_path, &moved, &fixed.meta);
 
         tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved);
-    }
-
-    /* Skullstrip: warp mask from template space into subject space */
-    if (cfg.skullstrip_mask) {
-        image_t mask_img;
-        if (image_load(&mask_img, cfg.skullstrip_mask, DEVICE_CPU) != 0) {
-            fprintf(stderr, "Failed to load mask: %s\n", cfg.skullstrip_mask);
-        } else {
-            /* Build affine: template(moving) space → subject(fixed) space.
-             * The registration computed affine_44 mapping fixed→moving in physical space.
-             * To warp the mask FROM moving space INTO fixed space, we use the same
-             * combined affine that maps fixed torch coords to moving torch coords,
-             * which is exactly what grid_sample uses to resample moving into fixed. */
-            mat44d pd2, tm2, cb2;
-            for (int i = 0; i < 4; i++)
-                for (int j = 0; j < 4; j++) pd2.m[i][j] = affine_44[i][j];
-            mat44d_mul(&tm2, &pd2, &fixed.meta.torch2phy);
-            mat44d_mul(&cb2, &mask_img.meta.phy2torch, &tm2);
-            float ha2[12]; for (int i=0;i<3;i++) for(int j=0;j<4;j++) ha2[i*4+j]=(float)cb2.m[i][j];
-
-            tensor_t aff2; int as2[3]={1,3,4};
-            tensor_alloc(&aff2,3,as2,DTYPE_FLOAT32,DEVICE_CPU);
-            memcpy(tensor_data_f32(&aff2), ha2, 48);
-            int fH = fixed.data.shape[3], fW = fixed.data.shape[4];
-            int gs2[3]={fD,fH,fW};
-            tensor_t grid2; affine_grid_3d(&aff2, gs2, &grid2);
-            tensor_t warped_mask; cpu_grid_sample_3d_forward(&mask_img.data, &grid2, &warped_mask, 1);
-
-            int fN = fD * fixed.data.shape[3] * fixed.data.shape[4];
-            const float *mask_data = tensor_data_f32(&warped_mask);
-
-            /* Save skull-stripped image in native datatype (UINT16, INT16, etc.)
-             * by re-loading the original NIfTI and applying the mask directly */
-            char strip_path[512];
-            snprintf(strip_path, sizeof(strip_path), "%sSkullstrip.nii.gz", cfg.output_prefix);
-            fprintf(stderr, "Saving skullstrip: %s (threshold=%.2f, native datatype)\n",
-                    strip_path, cfg.skullstrip_threshold);
-            image_skullstrip_save(strip_path, cfg.fixed_path,
-                                   mask_data, cfg.skullstrip_threshold, fN);
-
-            /* Also save the warped mask as float32 */
-            char mask_path[512];
-            snprintf(mask_path, sizeof(mask_path), "%sMask.nii.gz", cfg.output_prefix);
-            fprintf(stderr, "Saving warped mask: %s\n", mask_path);
-            image_save(mask_path, &warped_mask, &fixed.meta);
-
-            tensor_free(&aff2); tensor_free(&grid2);
-            tensor_free(&warped_mask);
-            image_free(&mask_img);
-        }
     }
 
     image_free(&fixed);

@@ -16,13 +16,11 @@ cfireants_reg \
   -m MNI152_T1_2mm.nii.gz \
   --affine --trilinear \
   --skullstrip mniMask.nii.gz \
-  -o out/T1_
+  -o out/bT1_head_2mm.nii.gz
 ```
 
 This produces:
-- `out/T1_Warped.nii.gz` — MNI template resampled into subject space (for QC)
-- `out/T1_Skullstrip.nii.gz` — Subject image with non-brain voxels set to darkest intensity
-- `out/T1_Mask.nii.gz` — Brain mask warped into subject space (thresholded at 0.5)
+- `out/bT1_head_2mm.nii.gz` — Subject image with non-brain voxels set to darkest intensity (e.g. brain extracted)
 
 The pipeline:
 1. Moments initialization (center-of-mass + orientation matching)
@@ -33,6 +31,8 @@ The pipeline:
 6. Apply: voxels outside mask set to the darkest intensity in the subject image
 
 Notes:
+- When `--skullstrip` is used, `-o` specifies the output filename directly (not a prefix)
+- Output preserves the native datatype of the input image (UINT16, INT16, FLOAT32, etc.)
 - For MRI magnitude images, the darkest voxel is typically 0 (air background)
 - For CT scans, the darkest voxel is typically ~-1024 (air in Hounsfield units)
 - The `--affine` preset is appropriate since skull stripping doesn't need deformable registration
