@@ -7,6 +7,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(CFIREANTS_CUDA "Build with CUDA backend" ON)
 option(CFIREANTS_WEBGPU "Build with WebGPU backend (future)" OFF)
 option(CFIREANTS_METAL "Build with Metal backend (macOS/Apple Silicon)" OFF)
+option(CFIREANTS_EMBED_METALLIB "Embed Metal shaders in executable (for distribution)" OFF)
 
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter")
@@ -241,7 +242,17 @@ if(CFIREANTS_METAL)
         COMMENT "Linking Metal shaders into cfireants.metallib"
     )
 
-    add_custom_target(metal_shaders DEPENDS ${METAL_LIB_PATH})
+    # Convert metallib to embeddable C header (byte array)
+    set(METAL_EMBED_HEADER "${CMAKE_CURRENT_BINARY_DIR}/metallib_embedded.h")
+    add_custom_command(
+        OUTPUT ${METAL_EMBED_HEADER}
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_metallib.py
+                ${METAL_LIB_PATH} ${METAL_EMBED_HEADER}
+        DEPENDS ${METAL_LIB_PATH}
+        COMMENT "Embedding Metal shaders into metallib_embedded.h"
+    )
+
+    add_custom_target(metal_shaders DEPENDS ${METAL_LIB_PATH} ${METAL_EMBED_HEADER})
 
     add_library(cfireants_metal STATIC
         backend/metal/metal_context.m
@@ -260,6 +271,7 @@ if(CFIREANTS_METAL)
 
     target_include_directories(cfireants_metal PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal
+        ${CMAKE_CURRENT_BINARY_DIR}
     )
     target_include_directories(cfireants_metal PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -269,6 +281,9 @@ if(CFIREANTS_METAL)
     target_compile_definitions(cfireants_metal PRIVATE
         METAL_LIBRARY_PATH="${METAL_LIB_PATH}"
     )
+    if(CFIREANTS_EMBED_METALLIB)
+        target_compile_definitions(cfireants_metal PRIVATE CFIREANTS_EMBED_METALLIB)
+    endif()
 
     target_link_libraries(cfireants_metal PUBLIC
         cfireants

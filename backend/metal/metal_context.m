@@ -38,31 +38,45 @@ int metal_context_init(void) {
         }
 
         /* Load shader library.
-         * Try paths in order:
-         *   1. build/backend/metal/cfireants.metallib (in-tree build)
-         *   2. cfireants.metallib (next to executable)
-         *   3. Default library (compiled into app bundle)
-         */
+         * Priority: 1. Embedded metallib (compiled into binary)
+         *           2. External file paths (development)
+         *           3. Default library (app bundle) */
         NSError *error = nil;
-        NSArray<NSString *> *paths = @[
-            @"build/cfireants.metallib",
-            @"cfireants.metallib",
-#ifdef METAL_LIBRARY_PATH
-            @METAL_LIBRARY_PATH,
-#endif
-        ];
-
         g_metal.library = nil;
-        for (NSString *path in paths) {
-            g_metal.library = [g_metal.device newLibraryWithFile:path error:&error];
+
+        /* Try embedded metallib first (standalone deployment) */
+#ifdef CFIREANTS_EMBED_METALLIB
+        {
+#include "metallib_embedded.h"
+            dispatch_data_t data = dispatch_data_create(metallib_data, metallib_size,
+                                                         NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+            g_metal.library = [g_metal.device newLibraryWithData:data error:&error];
             if (g_metal.library) {
-                if (cfireants_verbose >= 1) fprintf(stderr, "Metal shaders: loaded from %s\n", [path UTF8String]);
-                break;
+                if (cfireants_verbose >= 1) fprintf(stderr, "Metal shaders: embedded (%lu bytes)\n", metallib_size);
+            }
+        }
+#endif
+
+        /* Fall back to external files (for development builds) */
+        if (!g_metal.library) {
+            NSArray<NSString *> *paths = @[
+                @"build/cfireants.metallib",
+                @"cfireants.metallib",
+#ifdef METAL_LIBRARY_PATH
+                @METAL_LIBRARY_PATH,
+#endif
+            ];
+            for (NSString *path in paths) {
+                g_metal.library = [g_metal.device newLibraryWithFile:path error:&error];
+                if (g_metal.library) {
+                    if (cfireants_verbose >= 1) fprintf(stderr, "Metal shaders: loaded from %s\n", [path UTF8String]);
+                    break;
+                }
             }
         }
 
+        /* Try default library (app bundle) */
         if (!g_metal.library) {
-            /* Try default library (compiled into app bundle) */
             g_metal.library = [g_metal.device newDefaultLibrary];
             if (g_metal.library) {
                 if (cfireants_verbose >= 1) fprintf(stderr, "Metal shaders: loaded default library\n");
@@ -70,10 +84,7 @@ int metal_context_init(void) {
         }
 
         if (!g_metal.library) {
-            fprintf(stderr, "metal_context_init: warning: no shader library found "
-                    "(kernels will fail to load)\n");
-            /* Don't fail — context is still usable for buffer management.
-             * Kernel dispatches will fail when pipelines can't be created. */
+            fprintf(stderr, "metal_context_init: warning: no shader library found\n");
         }
 
         g_metal.n_pipelines = 0;
