@@ -450,6 +450,10 @@ int image_save(const char *path, const tensor_t *data, const image_meta_t *meta)
     nim.qto_xyz = nim.sto_xyz;
     nim.qto_ijk = nim.sto_ijk;
 
+    /* Single-file NIfTI-1 format (.nii or .nii.gz) */
+    nim.nifti_type = 1; /* NIFTI_FTYPE_NIFTI1_1 */
+    nim.iname_offset = 352;
+
     /* Point data at tensor (we won't free it) */
     nim.data = data->data;
     nim.fname = strdup(path);
