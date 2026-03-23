@@ -23,6 +23,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #ifdef CFIREANTS_HAS_METAL
 extern int cfireants_init_metal(void);
@@ -75,6 +77,33 @@ typedef struct {
     int initial_moving_transform;  /* 0=none, 1=moments */
     int verbose;
 } cli_config_t;
+
+/* Ensure parent directory of path exists, creating if needed.
+ * Returns 0 on success, -1 on failure. */
+static int ensure_parent_dir(const char *path) {
+    char buf[512];
+    strncpy(buf, path, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+    /* Find last / or \ */
+    char *sep = strrchr(buf, '/');
+    if (!sep) sep = strrchr(buf, '\\');
+    if (!sep) return 0; /* no directory component */
+    *sep = 0;
+    if (buf[0] == 0) return 0; /* root */
+
+    /* Try mkdir -p by walking the path */
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            *p = 0;
+            mkdir(buf, 0755);
+            *p = '/';
+        }
+    }
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Error: cannot create directory '%s': %s\n", buf, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
 
 static double get_time(void) {
     struct timespec ts;
@@ -678,7 +707,8 @@ int main(int argc, char **argv) {
             const float *mask_data = tensor_data_f32(&warped_mask);
 
             /* -o is the skull-stripped output file */
-            const char *out = cfg.output_prefix; /* used as direct filename in skullstrip mode */
+            const char *out = cfg.output_prefix;
+            if (ensure_parent_dir(out) != 0) { image_free(&mask_img); goto cleanup; }
             fprintf(stderr, "Saving: %s (native datatype, threshold=%.2f)\n",
                     out, cfg.skullstrip_threshold);
             image_skullstrip_save(out, cfg.fixed_path,
@@ -697,6 +727,7 @@ int main(int argc, char **argv) {
         } else {
             snprintf(warped_path, sizeof(warped_path), "%sWarped.nii.gz", cfg.output_prefix);
         }
+        if (ensure_parent_dir(warped_path) != 0) { tensor_free(&final_moved); goto cleanup; }
         fprintf(stderr, "Saving: %s\n", warped_path);
         image_save(warped_path, &final_moved, &fixed.meta);
         tensor_free(&final_moved);
@@ -719,12 +750,16 @@ int main(int argc, char **argv) {
         char warped_path[512];
         if (cfg.output_warped) snprintf(warped_path,sizeof(warped_path),"%s",cfg.output_warped);
         else snprintf(warped_path,sizeof(warped_path),"%sWarped.nii.gz",cfg.output_prefix);
+        if (ensure_parent_dir(warped_path) != 0) {
+            tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved); goto cleanup;
+        }
         fprintf(stderr, "Saving: %s\n", warped_path);
         image_save(warped_path, &moved, &fixed.meta);
 
         tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved);
     }
 
+cleanup:
     image_free(&fixed);
     image_free(&moving);
     return 0;
