@@ -64,6 +64,8 @@ typedef struct {
     const char *moving_path;
     const char *output_prefix;
     const char *output_warped;
+    const char *skullstrip_mask;   /* mask in moving/template space */
+    float skullstrip_threshold;    /* threshold for warped mask (default 0.5) */
 
     int n_stages;
     stage_config_t stages[MAX_STAGES];
@@ -216,6 +218,12 @@ static void print_usage(const char *prog) {
         "  --moments                   Initialize with center-of-mass + orientation (default)\n"
         "  --no-moments                Skip moments initialization\n"
         "\n"
+        "Skull stripping:\n"
+        "  --skullstrip <mask.nii.gz>  Brain mask in template/moving space. After registration,\n"
+        "                              warps mask into subject space, thresholds at 0.5, and saves\n"
+        "                              <prefix>Skullstrip.nii.gz with non-brain voxels set to darkest\n"
+        "                              intensity. Also saves <prefix>Mask.nii.gz (warped mask).\n"
+        "\n"
         "Registration stages (repeat for each stage):\n"
         "  --transform <Type[params]>  Rigid[lr], Affine[lr], SyN[lr,warp_sigma,grad_sigma],\n"
         "                              Greedy[lr,warp_sigma,grad_sigma]\n"
@@ -310,6 +318,7 @@ static void set_preset(cli_config_t *cfg, const char *preset) {
 static int parse_args(int argc, char **argv, cli_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->output_prefix = "output_";
+    cfg->skullstrip_threshold = 0.5f;
     cfg->initial_moving_transform = 1; /* moments by default */
     cfg->backend = BACKEND_CPU;
 
@@ -348,6 +357,8 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
             cfg->initial_moving_transform = 1;
         } else if (strcmp(arg, "--no-moments") == 0) {
             cfg->initial_moving_transform = 0;
+        } else if (strcmp(arg, "--skullstrip") == 0) {
+            NEED_ARG(); cfg->skullstrip_mask = argv[++i];
         } else if (strcmp(arg, "--backend") == 0) {
             NEED_ARG(); const char *b = argv[++i];
             if (strcmp(b, "cpu") == 0) cfg->backend = BACKEND_CPU;
@@ -680,6 +691,66 @@ int main(int argc, char **argv) {
         image_save(warped_path, &moved, &fixed.meta);
 
         tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved);
+    }
+
+    /* Skullstrip: warp mask from template space into subject space */
+    if (cfg.skullstrip_mask) {
+        image_t mask_img;
+        if (image_load(&mask_img, cfg.skullstrip_mask, DEVICE_CPU) != 0) {
+            fprintf(stderr, "Failed to load mask: %s\n", cfg.skullstrip_mask);
+        } else {
+            /* Build affine: template(moving) space → subject(fixed) space.
+             * The registration computed affine_44 mapping fixed→moving in physical space.
+             * To warp the mask FROM moving space INTO fixed space, we use the same
+             * combined affine that maps fixed torch coords to moving torch coords,
+             * which is exactly what grid_sample uses to resample moving into fixed. */
+            mat44d pd2, tm2, cb2;
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) pd2.m[i][j] = affine_44[i][j];
+            mat44d_mul(&tm2, &pd2, &fixed.meta.torch2phy);
+            mat44d_mul(&cb2, &mask_img.meta.phy2torch, &tm2);
+            float ha2[12]; for (int i=0;i<3;i++) for(int j=0;j<4;j++) ha2[i*4+j]=(float)cb2.m[i][j];
+
+            tensor_t aff2; int as2[3]={1,3,4};
+            tensor_alloc(&aff2,3,as2,DTYPE_FLOAT32,DEVICE_CPU);
+            memcpy(tensor_data_f32(&aff2), ha2, 48);
+            int fH = fixed.data.shape[3], fW = fixed.data.shape[4];
+            int gs2[3]={fD,fH,fW};
+            tensor_t grid2; affine_grid_3d(&aff2, gs2, &grid2);
+            tensor_t warped_mask; cpu_grid_sample_3d_forward(&mask_img.data, &grid2, &warped_mask, 1);
+
+            /* Find darkest voxel in subject image */
+            int fN = fD * fH * fW;
+            const float *subj = tensor_data_f32(&fixed.data);
+            float darkest = subj[0];
+            for (int i = 1; i < fN; i++)
+                if (subj[i] < darkest) darkest = subj[i];
+
+            /* Apply mask: copy subject, zero outside mask */
+            tensor_t stripped;
+            int ss[5] = {1, 1, fD, fH, fW};
+            tensor_alloc(&stripped, 5, ss, DTYPE_FLOAT32, DEVICE_CPU);
+            float *out = tensor_data_f32(&stripped);
+            const float *mask_data = tensor_data_f32(&warped_mask);
+            for (int i = 0; i < fN; i++)
+                out[i] = (mask_data[i] >= cfg.skullstrip_threshold) ? subj[i] : darkest;
+
+            char strip_path[512];
+            snprintf(strip_path, sizeof(strip_path), "%sSkullstrip.nii.gz", cfg.output_prefix);
+            fprintf(stderr, "Saving skullstrip: %s (threshold=%.2f, darkest=%.1f)\n",
+                    strip_path, cfg.skullstrip_threshold, darkest);
+            image_save(strip_path, &stripped, &fixed.meta);
+
+            /* Also save the warped mask */
+            char mask_path[512];
+            snprintf(mask_path, sizeof(mask_path), "%sMask.nii.gz", cfg.output_prefix);
+            fprintf(stderr, "Saving warped mask: %s\n", mask_path);
+            image_save(mask_path, &warped_mask, &fixed.meta);
+
+            tensor_free(&aff2); tensor_free(&grid2);
+            tensor_free(&warped_mask); tensor_free(&stripped);
+            image_free(&mask_img);
+        }
     }
 
     image_free(&fixed);
