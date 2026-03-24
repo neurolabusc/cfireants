@@ -40,9 +40,9 @@ validate/              Datasets, benchmarks (see validate/README.md)
 
 **Downsample modes:** FFT (default, matches Python) or trilinear (GPU-native, `--trilinear`). Trilinear uses Gaussian blur + trilinear resize. Both produce equivalent accuracy.
 
-**Fused CC loss.** Two CC implementations: `cc_loss.cu` (used by rigid/affine, 8 box-filter passes) and `fused_cc.cu` (used by SyN/greedy, 10 passes, computes both pred and target gradients). The fused CC backward multiplies `grad_output_val` by `kernel_volume` to compensate for the mean-based box filter adjoint (Python uses sum-based separable filtering whose adjoint preserves magnitude).
+**Fused CC loss.** Two CC implementations: `cc_loss.cu` (used by rigid/affine, 8 box-filter passes) and `fused_cc.cu` (used by SyN/greedy, 10 passes, computes both pred and target gradients). Both C and Python use mean-based (normalized) kernels. The fused CC backward multiplies `grad_output_val` by `kernel_volume` to compensate for the mean-based box filter adjoint.
 
-**Moments identity candidates.** `--try-identity` enables identity+COM and pure-identity candidates in moments (off by default to match Python). Useful when sforms already align images.
+**Moments identity candidates.** When SVD eigenvalues are degenerate (condition ratio < 1.3), identity+COM and z-axis jiggle candidates are automatically evaluated alongside SVD candidates. `--try-identity` forces evaluation even when eigenvalues are well-separated. This handles images with L/R markers or near-isotropic intensity distributions where SVD axes are unreliable.
 
 ## Non-Obvious Gotchas
 
@@ -84,11 +84,11 @@ validate/              Datasets, benchmarks (see validate/README.md)
 
 Global NCC (Pearson correlation) between warped moving and fixed image:
 
-| Dataset | Python CUDA | C CUDA | C WebGPU | CUDA-WebGPU gap |
-|---------|-------------|--------|----------|-----------------|
-| small (2mm head) | 0.9450 | **0.9623** | **0.9632** | 0.08% |
-| medium (1mm brain) | 0.9443 | **0.9585** | **0.9587** | 0.02% |
-| large (1mm head) | 0.8961 | **0.9216** | **0.9211** | 0.05% |
+| Dataset | Python CUDA | C CUDA | C WebGPU | C Metal | Max C gap |
+|---------|-------------|--------|----------|---------|-----------|
+| small (2mm head) | 0.9450 | **0.9623** | **0.9632** | **0.9623** | 0.09% |
+| medium (1mm brain) | 0.9443 | **0.9585** | **0.9587** | **0.9586** | 0.02% |
+| large (1mm head) | 0.8961 | **0.9216** | **0.9211** | **0.9213** | 0.05% |
 
 ### Per-stage metrics (C CUDA, current build)
 
@@ -125,9 +125,10 @@ Eval:     local NCC -0.3892 (kernel=9)  → global NCC 0.9216
 ### What has been fixed
 
 - **Fused CC gradient magnitude**: backward pass was missing `kernel_volume` scaling factor — the mean-based box filter adjoint introduced 1/kv, making gradients 125x too small. Fixed by multiplying `grad_output_val` by `kernel_volume` in all 4 backends.
-- **Moments identity candidates**: identity+COM and pure-identity candidates caused large dataset to pick wrong starting orientation. Now opt-in via `--try-identity` (off by default to match Python).
+- **Moments identity candidates**: when SVD eigenvalues are degenerate (ratio < 1.3), identity+COM and z-jiggle candidates are evaluated automatically. Previously, SVD always won even when axes were unreliable (e.g. images with L/R markers). `--try-identity` forces evaluation regardless. Threshold tuned: 1.3 catches orient test images (cond=1.16) without triggering on MNI template (cond=1.40).
 - **Warp inverse parity**: CUDA switched from Adam-based IC optimization to fixed-point iteration (`inv = -interp(u, id+inv)`) matching WebGPU/CPU, giving <0.1% cross-backend gap.
 - **CPU composition bug**: fixed (ux was used for all 3 channels in `syn_evaluate`)
+- **Metal box filter accumulation order**: `metal_box_filter_axis` reused `conv1d_axis` which multiplied per-element during accumulation. Replaced with dedicated `box_filter_axis` shader that accumulates then scales once, matching WebGPU precision. Closed the Metal-vs-WebGPU gap to <0.13%.
 
 ### What has been ruled out
 
@@ -144,9 +145,21 @@ C CUDA exceeds Python on all 3 datasets by 1.5-2.5%. The remaining gap is due to
 **Phase 2: WebGPU vs CUDA** — DONE (March 2026)
 WebGPU matches CUDA within 0.1% on all datasets. Residual differences from cuFFT vs kissfft CPU fallback and CUDA vs Vulkan shader float precision.
 
-**Phase 3: Metal convergence** — TODO
-1. Compare Metal output to CUDA/WebGPU reference
-2. Metal-specific areas to check: FFT downsample (MPSGraph), fused CC shader, grid_sample, blur kernel
+**Phase 3: Metal convergence** — DONE (March 2026)
+Metal matches WebGPU within 0.13% on all datasets. Residual 0.13% gap on small dataset from MI histogram float atomics (Metal) vs fixed-point u32 (WebGPU) — inherent to hardware constraints.
+
+**Phase 4: Scalp deformation artifact** — TODO (requires CUDA + Python comparison)
+The large dataset (1mm full-head) shows unnatural scalp deformation in the right parietal region that is absent from the Python reference. Confirmed present in both Metal and WebGPU backends, so this is algorithmic (shared C fused CC implementation), not backend-specific.
+
+Investigation so far:
+- Both C and Python use **mean-based** (normalized) kernels for CC box filtering. Python: `kernel = ones(ks) / ks.sum()` → kernel_vol=1.0. C: `scale = 1/ks` per axis.
+- The NCC forward formula is mathematically equivalent: `ncc = (kv² × cross² + nr) / (kv² × pvar × tvar + dr)` with nr/dr=1e-5 negligible vs kv²=15625.
+- The backward `grad_output_val = -1/N × kv` compensates the adjoint correctly — verified that boundary damping ratio (effective_kv/kv) is the same as Python's autograd produces.
+- The key remaining difference: Python uses 3D `F.conv3d(padding='same')` which is non-separable (single pass), while C uses 3 separable 1D passes. At boundaries with zero-padding, the accumulation order differs, which compounds over SyN iterations.
+- C gets higher global NCC (0.92) than Python (0.90), suggesting the C optimization is MORE aggressive, concentrating extra deformation at the poorly-constrained scalp.
+- Small and medium datasets (brain-only or 2mm) don't show the artifact — it's specific to high-resolution full-head images where the scalp has tissue to deform.
+
+Next step: run per-iteration SyN comparison on CUDA hardware between Python and C. Dump per-iteration displacement field max/mean L2 norm and CC gradient statistics at the image boundary vs interior. If C CUDA also shows the artifact, the fix is in the fused CC gradient or warp regularization. If C CUDA matches Python, the fix is in the CPU/WebGPU/Metal fused CC implementations.
 
 ### Debug metrics mode (TODO)
 

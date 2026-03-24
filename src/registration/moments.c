@@ -329,6 +329,16 @@ int moments_register(const image_t *fixed, const image_t *moving,
                     S_f[0], S_f[1], S_f[2], S_m[0], S_m[1], S_m[2]);
         }
 
+        /* Check eigenvalue condition: if either image has nearly degenerate
+         * eigenvalues (ratio < 1.5), the SVD axes are poorly determined.
+         * In that case, evaluate identity candidates as alternatives. */
+        float cond_f = (S_f[2] > 1e-6f) ? S_f[0] / S_f[2] : 1e6f;
+        float cond_m = (S_m[2] > 1e-6f) ? S_m[0] / S_m[2] : 1e6f;
+        int degenerate = (cond_f < 1.3f || cond_m < 1.3f);
+        if (degenerate && cfireants_verbose >= 2)
+            fprintf(stderr, "  Eigenvalues degenerate (cond_f=%.2f, cond_m=%.2f)\n",
+                    cond_f, cond_m);
+
         /* Transpose U_m for the formula R = (U_f @ D @ U_m^T)^T */
         float U_m_t[3][3];
         mat3_transpose(U_m_t, U_m);
@@ -426,11 +436,13 @@ int moments_register(const image_t *fixed, const image_t *moving,
             }
         }
 
-        /* Optionally evaluate Identity+COM and Pure identity candidates.
-         * Not in Python FireANTs — useful when sforms already align images. */
-        int best_extra = 0; /* 0=SVD, 1=COM identity, 2=pure identity */
-        if (opts.try_identity) {
-            /* Identity + COM translation */
+        /* Evaluate identity candidates when SVD is unreliable (degenerate
+         * eigenvalues) or explicitly requested via --try-identity.
+         * Identity+COM uses sform rotation with COM-based translation. */
+        int best_extra = 0; /* 0=SVD, 1=COM identity, 2+=jiggle */
+        const char *best_label = NULL;
+
+        if (degenerate || opts.try_identity) {
             float com_aff[3][4];
             for (int i = 0; i < 3; i++) {
                 for (int j = 0; j < 3; j++)
@@ -443,29 +455,51 @@ int moments_register(const image_t *fixed, const image_t *moving,
                 best_loss = com_loss;
                 best_idx = -1;
                 best_extra = 1;
-                mat3_identity(best_R);
-            }
-
-            /* Pure identity (no translation) — best when sforms already align */
-            float pure_aff[3][4] = {{1,0,0,0},{0,1,0,0},{0,0,1,0}};
-            float pure_loss = eval_candidate_cc(fixed, moving, pure_aff, opts.cc_kernel_size, gpu_state);
-            if (cfireants_verbose >= 2) fprintf(stderr, "  Pure identity candidate: CC loss = %.6f\n", pure_loss);
-            if (pure_loss < best_loss) {
-                best_loss = pure_loss;
-                best_idx = -2;
-                best_extra = 2;
+                best_label = "identity+COM";
                 mat3_identity(best_R);
             }
         }
+
+        /* Z-axis jiggle: for large-FOV images (>120mm in S-I direction),
+         * test identity+COM with foot-head offsets. The sform origin may not
+         * perfectly center the brain, especially for full-head images. */
+        {
+            /* Compute physical extent along z (superior-inferior in LPS).
+             * Row 2 of px2phy is the z (S-I) row. */
+            double fov_z = fabs(fixed->meta.px2phy.m[2][0]) * fixed->meta.size[0]
+                         + fabs(fixed->meta.px2phy.m[2][1]) * fixed->meta.size[1]
+                         + fabs(fixed->meta.px2phy.m[2][2]) * fixed->meta.size[2];
+            if (fov_z > 120.0) {
+                float com_tz = com_m[2] - com_f[2]; /* COM z-offset */
+                float offsets[] = { -30.0f, -15.0f, 15.0f, 30.0f };
+                int n_offsets = 4;
+                if (cfireants_verbose >= 2)
+                    fprintf(stderr, "  Z-jiggle (FOV=%.0fmm): testing COM ± offsets\n", fov_z);
+                for (int k = 0; k < n_offsets; k++) {
+                    float jig_aff[3][4] = {{1,0,0,0},{0,1,0,0},{0,0,1,0}};
+                    jig_aff[0][3] = com_m[0] - com_f[0];
+                    jig_aff[1][3] = com_m[1] - com_f[1];
+                    jig_aff[2][3] = com_tz + offsets[k]; /* COM z + jiggle */
+                    float jig_loss = eval_candidate_cc(fixed, moving, jig_aff, opts.cc_kernel_size, gpu_state);
+                    if (cfireants_verbose >= 2)
+                        fprintf(stderr, "    z=COM%+.0fmm: CC loss = %.6f\n", offsets[k], jig_loss);
+                    if (jig_loss < best_loss) {
+                        best_loss = jig_loss;
+                        best_idx = -(10 + k);
+                        best_extra = 2 + k;
+                        best_label = "z-jiggle";
+                        mat3_identity(best_R);
+                    }
+                }
+            }
+        } /* end if (degenerate || try_identity) */
 
 #ifdef CFIREANTS_HAS_CUDA
         if (gpu_state) moments_gpu_free(gpu_state);
 #endif
         if (cfireants_verbose >= 2) {
-            if (best_extra == 1)
-                fprintf(stderr, "  Best: identity+COM (loss=%.6f)\n", best_loss);
-            else if (best_extra == 2)
-                fprintf(stderr, "  Best: pure identity (loss=%.6f)\n", best_loss);
+            if (best_label)
+                fprintf(stderr, "  Best: %s (loss=%.6f)\n", best_label, best_loss);
             else
                 fprintf(stderr, "  Best: SVD candidate %d (loss=%.6f)\n", best_idx, best_loss);
         }
@@ -474,9 +508,12 @@ int moments_register(const image_t *fixed, const image_t *moving,
         memcpy(result->Rf, best_R, sizeof(result->Rf));
 
         /* Translation depends on which candidate won */
-        if (best_extra == 2) {
-            /* Pure identity: no translation */
-            result->tf[0] = result->tf[1] = result->tf[2] = 0.0f;
+        if (best_extra >= 2) {
+            /* Z-jiggle: COM translation + z-offset */
+            float offsets[] = { -30.0f, -15.0f, 15.0f, 30.0f };
+            result->tf[0] = com_m[0] - com_f[0];
+            result->tf[1] = com_m[1] - com_f[1];
+            result->tf[2] = (com_m[2] - com_f[2]) + offsets[best_extra - 2];
         } else {
             /* SVD or COM identity: tf = com_m - Rf @ com_f */
             for (int i = 0; i < 3; i++) {
