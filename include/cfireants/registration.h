@@ -30,6 +30,8 @@ typedef struct {
     int blur;             /* 1=Gaussian blur before downsampling */
     float scale;          /* Downsampling factor (1.0 = no downsampling) */
     int cc_kernel_size;   /* CC kernel size for orientation selection */
+    int try_identity;     /* 1=also evaluate identity+COM and pure identity candidates
+                           * (not in Python FireANTs; useful when sforms already align) */
 } moments_opts_t;
 
 /* Default moments options */
@@ -40,6 +42,7 @@ static inline moments_opts_t moments_opts_default(void) {
     o.blur = 1;
     o.scale = 1.0f;
     o.cc_kernel_size = 5;
+    o.try_identity = 0; /* off by default to match Python */
     return o;
 }
 

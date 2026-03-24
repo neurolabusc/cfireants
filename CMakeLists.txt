@@ -60,6 +60,7 @@ if(CFIREANTS_CUDA)
         backend/cuda/cc_loss.cu
         backend/cuda/fused_cc.cu
         backend/cuda/fused_compose.cu
+        backend/cuda/cuda_common.cu
         backend/cuda/fused_blur.cu
         backend/cuda/warp_inverse.cu
         backend/cuda/mi_loss.cu
@@ -349,3 +350,6 @@ endif()
 
 add_executable(test_cc_compare tests/test_cc_compare.c)
 target_link_libraries(test_cc_compare cfireants cfireants_gpu)
+
+add_executable(test_cc_compare_py tests/test_cc_compare_py.c)
+target_link_libraries(test_cc_compare_py cfireants cfireants_gpu)

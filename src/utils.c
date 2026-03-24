@@ -301,3 +301,45 @@ int cpu_trilinear_resize(const tensor_t *input, tensor_t *output,
     }
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Fixed-point warp inverse                                            */
+/* ------------------------------------------------------------------ */
+
+void cpu_warp_inverse(const float *u, float *inv, int D, int H, int W, int n_iters) {
+    long n3 = (long)D * H * W * 3;
+    memset(inv, 0, n3 * sizeof(float));
+    float *tmp = (float *)malloc(n3 * sizeof(float));
+
+    for (int iter = 0; iter < n_iters; iter++) {
+        for (int d = 0; d < D; d++) {
+            float nz = (D > 1) ? (2.0f * d / (D - 1) - 1.0f) : 0.0f;
+            for (int h = 0; h < H; h++) {
+                float ny = (H > 1) ? (2.0f * h / (H - 1) - 1.0f) : 0.0f;
+                for (int w = 0; w < W; w++) {
+                    float nx = (W > 1) ? (2.0f * w / (W - 1) - 1.0f) : 0.0f;
+                    long idx = ((long)d * H + h) * W * 3 + w * 3;
+                    float sx = nx + inv[idx], sy = ny + inv[idx+1], sz = nz + inv[idx+2];
+                    float ix = (sx+1.0f)*0.5f*(W-1), iy = (sy+1.0f)*0.5f*(H-1), iz = (sz+1.0f)*0.5f*(D-1);
+                    int x0 = (int)floorf(ix), y0 = (int)floorf(iy), z0 = (int)floorf(iz);
+                    float fx = ix-x0, fy = iy-y0, fz = iz-z0;
+                    float wt[8] = {(1-fx)*(1-fy)*(1-fz),fx*(1-fy)*(1-fz),(1-fx)*fy*(1-fz),fx*fy*(1-fz),
+                                   (1-fx)*(1-fy)*fz,fx*(1-fy)*fz,(1-fx)*fy*fz,fx*fy*fz};
+                    int dz[8]={z0,z0,z0,z0,z0+1,z0+1,z0+1,z0+1};
+                    int dy[8]={y0,y0,y0+1,y0+1,y0,y0,y0+1,y0+1};
+                    int dx[8]={x0,x0+1,x0,x0+1,x0,x0+1,x0,x0+1};
+                    #define U_AT(dd,hh,ww,c) (((dd)>=0&&(dd)<D&&(hh)>=0&&(hh)<H&&(ww)>=0&&(ww)<W) \
+                        ? u[((long)(dd)*H+(hh))*W*3+(ww)*3+(c)] : 0.0f)
+                    float v[3] = {0,0,0};
+                    for (int k = 0; k < 8; k++)
+                        for (int c = 0; c < 3; c++)
+                            v[c] += wt[k] * U_AT(dz[k],dy[k],dx[k],c);
+                    #undef U_AT
+                    tmp[idx] = -v[0]; tmp[idx+1] = -v[1]; tmp[idx+2] = -v[2];
+                }
+            }
+        }
+        memcpy(inv, tmp, n3 * sizeof(float));
+    }
+    free(tmp);
+}

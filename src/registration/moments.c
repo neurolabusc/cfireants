@@ -218,39 +218,6 @@ static void compute_moment_matrix(const float *data, const float *coords,
         }
 }
 
-/* Evaluate CC loss for a candidate rotation.
- * Warps moving image to fixed space using R, t and computes CC. */
-static float evaluate_orientation(const tensor_t *fixed_data, const image_t *moving,
-                                  const float R[3][3], const float com_f[3],
-                                  const float com_m[3]) {
-    /* Build physical-space affine: x_moving = R @ (x_fixed - com_f) + com_m
-     * In torch coordinates: grid = moving_p2t @ [R | t] @ fixed_t2p @ identity */
-    int D = fixed_data->shape[2], H = fixed_data->shape[3], W = fixed_data->shape[4];
-
-    /* Build the 3x4 affine in physical space: [R | com_m - R @ com_f] */
-    float phys_aff[3][4];
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++)
-            phys_aff[i][j] = R[i][j];
-        phys_aff[i][3] = com_m[i];
-        for (int j = 0; j < 3; j++)
-            phys_aff[i][3] -= R[i][j] * com_f[j];
-    }
-
-    /* We need: grid = moving_p2t @ [phys_aff; 0 0 0 1] @ fixed_t2p
-     * But we don't have easy access to the images' t2p/p2t here.
-     * Instead, use grid_sample with the combined affine.
-     *
-     * Actually, let's compute the combined torch-space affine:
-     *   combined = moving_p2t @ phys_affine_4x4 @ fixed_t2p
-     * then take the top 3 rows to get [1, 3, 4] for affine_grid.
-     */
-
-    /* Not cleanly available here without passing more args.
-     * For simplicity, return 0 (caller will handle differently). */
-    (void)fixed_data; (void)moving; (void)D; (void)H; (void)W;
-    return 0.0f;
-}
 
 int apply_affine_transform(const image_t *fixed, const image_t *moving,
                            const float affine_34[3][4], tensor_t *output) {
@@ -459,12 +426,10 @@ int moments_register(const image_t *fixed, const image_t *moving,
             }
         }
 
-        /* Evaluate two additional candidates beyond SVD:
-         * 1. Identity + COM translation: correct when images need only translation
-         * 2. Pure identity (R=I, t=0): correct when sforms already align images
-         * These prevent SVD from introducing spurious rotations. */
+        /* Optionally evaluate Identity+COM and Pure identity candidates.
+         * Not in Python FireANTs — useful when sforms already align images. */
         int best_extra = 0; /* 0=SVD, 1=COM identity, 2=pure identity */
-        {
+        if (opts.try_identity) {
             /* Identity + COM translation */
             float com_aff[3][4];
             for (int i = 0; i < 3; i++) {
@@ -497,9 +462,12 @@ int moments_register(const image_t *fixed, const image_t *moving,
         if (gpu_state) moments_gpu_free(gpu_state);
 #endif
         if (cfireants_verbose >= 2) {
-            const char *labels[] = {"SVD candidate", "identity+COM", "pure identity"};
-            fprintf(stderr, "  Best: %s (loss=%.6f)\n",
-                    best_idx >= 0 ? labels[0] : labels[best_extra], best_loss);
+            if (best_extra == 1)
+                fprintf(stderr, "  Best: identity+COM (loss=%.6f)\n", best_loss);
+            else if (best_extra == 2)
+                fprintf(stderr, "  Best: pure identity (loss=%.6f)\n", best_loss);
+            else
+                fprintf(stderr, "  Best: SVD candidate %d (loss=%.6f)\n", best_idx, best_loss);
         }
 
         /* Use best rotation */

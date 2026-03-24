@@ -40,7 +40,9 @@ validate/              Datasets, benchmarks (see validate/README.md)
 
 **Downsample modes:** FFT (default, matches Python) or trilinear (GPU-native, `--trilinear`). Trilinear uses Gaussian blur + trilinear resize. Both produce equivalent accuracy.
 
-**Fused CC loss.** Two CC implementations: `cc_loss.cu` (used by rigid/affine, 8 box-filter passes) and `fused_cc.cu` (used by SyN/greedy, 10 passes, computes both pred and target gradients). Using the wrong one causes gradient scaling issues.
+**Fused CC loss.** Two CC implementations: `cc_loss.cu` (used by rigid/affine, 8 box-filter passes) and `fused_cc.cu` (used by SyN/greedy, 10 passes, computes both pred and target gradients). The fused CC backward multiplies `grad_output_val` by `kernel_volume` to compensate for the mean-based box filter adjoint (Python uses sum-based separable filtering whose adjoint preserves magnitude).
+
+**Moments identity candidates.** `--try-identity` enables identity+COM and pure-identity candidates in moments (off by default to match Python). Useful when sforms already align images.
 
 ## Non-Obvious Gotchas
 
@@ -60,7 +62,7 @@ validate/              Datasets, benchmarks (see validate/README.md)
 
 ## Backend-Specific Notes
 
-**CUDA:** Production quality. Key files: `linear_gpu.cu`, `greedy_gpu.cu`, `syn_gpu.cu`, `downsample_fft.cu`, `mi_loss.cu`, `fused_cc.cu`. ~100 `cudaMalloc` calls lack error checking.
+**CUDA:** Production quality. Key files: `linear_gpu.cu`, `greedy_gpu.cu`, `syn_gpu.cu`, `downsample_fft.cu`, `mi_loss.cu`, `fused_cc.cu`, `warp_inverse.cu`. ~100 `cudaMalloc` calls lack error checking.
 
 **Metal:** Uses batched command buffers (`metal_begin_batch/flush_batch`) to reduce dispatch overhead. GPU WarpAdam shaders (`warp_adam_moments`, `warp_adam_direction`) in `elementwise.metal`. 3D texture trilinear resize implemented but no speed benefit over compute shader.
 
@@ -82,23 +84,23 @@ validate/              Datasets, benchmarks (see validate/README.md)
 
 Global NCC (Pearson correlation) between warped moving and fixed image:
 
-| Dataset | Python CUDA | C Metal | C CPU | Gap |
-|---------|-------------|---------|-------|-----|
-| small (2mm head) | 0.9450 | **0.9608** | **0.9645** | C wins |
-| medium (1mm brain) | 0.9443 | **0.9562** | — | C wins |
-| large (1mm head) | **0.8961** | 0.8509 | 0.8398 | Python wins 4.5% |
+| Dataset | Python CUDA | C CUDA | C WebGPU | CUDA-WebGPU gap |
+|---------|-------------|--------|----------|-----------------|
+| small (2mm head) | 0.9450 | **0.9623** | **0.9632** | 0.08% |
+| medium (1mm brain) | 0.9443 | **0.9585** | **0.9587** | 0.02% |
+| large (1mm head) | 0.8961 | **0.9216** | **0.9211** | 0.05% |
 
-### Per-stage metrics (C Metal, current build)
+### Per-stage metrics (C CUDA, current build)
 
 **Small** (`-f validate/small/MNI152_T1_2mm.nii.gz -m validate/small/T1_head_2mm.nii.gz`):
 ```
-Moments:  local NCC -0.2250  (identity+COM wins, COM shift ~28mm z)
-Rigid:    local NCC -0.2414  (MI, 3 scales 4x2x1, 200/100/50 iters)
-Affine:   local NCC -0.3148  (MI, 3 scales)
-SyN s4:   CC -0.673 → -0.868  (200 iters, 22x27x22)
-SyN s2:   CC -0.585 → -0.792  (100 iters, 45x54x45)
-SyN s1:   CC -0.442 → -0.604  (50 iters, 91x109x91)
-Eval:     local NCC -0.6501 (kernel=9)  → global NCC 0.9608
+Moments:  local NCC -0.2250  (SVD candidate 6 wins, COM shift ~28mm z)
+Rigid:    local NCC -0.2413  (MI, 3 scales 4x2x1, 200/100/50 iters)
+Affine:   local NCC -0.3137  (MI, 3 scales)
+SyN s4:   CC -0.671 → -0.864  (200 iters, 22x27x22)
+SyN s2:   CC -0.585 → -0.789  (100 iters, 45x54x45)
+SyN s1:   CC -0.440 → -0.620  (50 iters, 91x109x91)
+Eval:     local NCC -0.6600 (kernel=9)  → global NCC 0.9623
 ```
 
 **Medium** (`-f validate/medium/MNI152_T1_1mm_brain.nii.gz -m validate/medium/t1_brain.nii.gz`, CC for all stages):
@@ -111,41 +113,39 @@ SyN eval: local NCC -0.8592  → global NCC 0.9562
 
 **Large** (`-f validate/large/MNI152_T1_1mm.nii.gz -m validate/large/chris_t1.nii.gz`):
 ```
-Moments:  local NCC -0.1340  (pure identity wins, COM shift only 9mm z)
-Rigid:    local NCC -0.1256  (MI, 4 scales 8x4x2x1, 200/200/100/50 iters)
-Affine:   local NCC -0.1930  (MI, 4 scales) → global NCC 0.8119
-SyN s4:   CC -0.359 → -0.635  (200 iters, 45x54x45)
-SyN s2:   CC -0.361 → -0.498  (100 iters, 91x109x91)
-SyN s1:   CC -0.293 → -0.354  (50 iters, 182x218x182)
-Eval:     local NCC -0.2629 (kernel=9)  → global NCC 0.8509
+Moments:  local NCC -0.1315  (SVD candidate 6 wins, COM shift ~10mm z)
+Rigid:    local NCC -0.1119  (MI, 4 scales 8x4x2x1, 200/200/100/50 iters)
+Affine:   local NCC -0.1719  (MI, 4 scales)
+SyN s4:   CC -0.360 → -0.610  (200 iters, 45x54x45)
+SyN s2:   CC -0.346 → -0.485  (100 iters, 91x109x91)
+SyN s1:   CC -0.284 → -0.349  (50 iters, 182x218x182)
+Eval:     local NCC -0.3892 (kernel=9)  → global NCC 0.9216
 ```
+
+### What has been fixed
+
+- **Fused CC gradient magnitude**: backward pass was missing `kernel_volume` scaling factor — the mean-based box filter adjoint introduced 1/kv, making gradients 125x too small. Fixed by multiplying `grad_output_val` by `kernel_volume` in all 4 backends.
+- **Moments identity candidates**: identity+COM and pure-identity candidates caused large dataset to pick wrong starting orientation. Now opt-in via `--try-identity` (off by default to match Python).
+- **Warp inverse parity**: CUDA switched from Adam-based IC optimization to fixed-point iteration (`inv = -interp(u, id+inv)`) matching WebGPU/CPU, giving <0.1% cross-backend gap.
+- **CPU composition bug**: fixed (ux was used for all 3 channels in `syn_evaluate`)
 
 ### What has been ruled out
 
-- **Fused CC kv scaling**: intentional, matches CUDA/Metal shaders and Python design
 - **beta2**: 0.99 vs 0.999 has negligible effect (Adam adapts)
 - **FFT vs trilinear downsample**: FFT slightly better, neither closes gap
 - **Iteration count**: 200/200/200 for SyN is no better (oscillation at scale 1)
 - **Shrink factors**: 3-scale vs 4-scale identical for large
-- **Moments rotation**: fixed (identity/pure-identity candidates added)
-- **CPU composition bug**: fixed (ux was used for all 3 channels in `syn_evaluate`)
 
 ### Convergence plan
 
-**Phase 1: Generate reference data (CUDA system)**
-1. Run Python FireANTs on all 3 datasets with per-iteration logging
-2. Run C CUDA backend on same datasets
-3. Compare per-iteration: CC loss, gradmax, displacement max/mean L2 norm
-4. If C CUDA matches Python CUDA → the algorithm is correct, gap is Metal/CPU specific
-5. If C CUDA diverges → find the differing component
+**Phase 1: CUDA vs Python** — DONE (March 2026)
+C CUDA exceeds Python on all 3 datasets by 1.5-2.5%. The remaining gap is due to Python's non-separable 3D F.conv3d for CC box filter vs C's 3 separable 1D passes — mathematically identical but different float accumulation order compounds over iterations.
 
-**Phase 2: WebGPU convergence**
-1. Run C WebGPU (Vulkan/NVIDIA) on same datasets
-2. WebGPU uses the same WGSL shader source on all platforms → portable reference
-3. Match WebGPU output to C CUDA output
+**Phase 2: WebGPU vs CUDA** — DONE (March 2026)
+WebGPU matches CUDA within 0.1% on all datasets. Residual differences from cuFFT vs kissfft CPU fallback and CUDA vs Vulkan shader float precision.
 
-**Phase 3: Metal convergence**
-1. Compare Metal output to WebGPU reference
+**Phase 3: Metal convergence** — TODO
+1. Compare Metal output to CUDA/WebGPU reference
 2. Metal-specific areas to check: FFT downsample (MPSGraph), fused CC shader, grid_sample, blur kernel
 
 ### Debug metrics mode (TODO)

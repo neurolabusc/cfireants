@@ -205,8 +205,11 @@ void cuda_fused_cc_loss(
 {
     long spatial = (long)D * H * W;
     int blocks = (spatial + FCC_BLOCK - 1) / FCC_BLOCK;
-    float nr = 1e-5f, dr = 1e-5f;
     int kernel_volume = ks * ks * ks;
+    /* SyN uses cc.py's LocalNormalizedCrossCorrelationLoss which does NOT scale
+     * nr/dr by kernel_volume. The fused_cc formulation with box-filter means
+     * already matches cc.py's sum-based formulation when nr/dr = 1e-5. */
+    float nr = 1e-5f, dr = 1e-5f;
 
     /* Step 1: Create intermediates */
     fcc_create_intermediates_kernel<<<blocks, FCC_BLOCK>>>(
@@ -233,7 +236,11 @@ void cuda_fused_cc_loss(
     /* Steps 4-6: Backward (if gradient requested) */
     if (grad_pred) {
         int compute_grad_target = (grad_target_out != NULL);
-        float grad_output_val = -1.0f / spatial;  /* d(-mean(ncc))/d(ncc) = -1/N */
+        /* The box filter computes means (1/ks per axis). Its adjoint also applies
+         * 1/ks per axis, introducing an extra factor of 1/kv in the gradient.
+         * Python's cc.py uses sum-based separable filtering (kernel=[1,...,1]),
+         * whose adjoint preserves magnitude. Multiply by kv to compensate. */
+        float grad_output_val = -1.0f / spatial * kernel_volume;
 
         /* Step 4: Modify intermediates with gradient multipliers */
         fcc_bwd_modify_kernel<<<blocks, FCC_BLOCK>>>(

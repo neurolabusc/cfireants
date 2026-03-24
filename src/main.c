@@ -76,6 +76,7 @@ typedef struct {
     backend_t backend;
     int downsample_mode;
     int initial_moving_transform;  /* 0=none, 1=moments */
+    int try_identity;              /* 1=also try identity+COM in moments */
     int verbose;  /* 0=silent (errors only), 1=summary, 2=debug (per-iter) */
 } cli_config_t;
 
@@ -244,6 +245,7 @@ static void print_usage(const char *prog) {
         "Backend:\n"
         "  --backend <name>            cpu, metal, webgpu, cuda (default: best available)\n"
         "  --trilinear                 Use trilinear downsample (default: FFT)\n"
+        "  --try-identity              Also try identity+COM and pure-identity in moments\n"
         "\n"
         "Initial transform:\n"
         "  --moments                   Initialize with center-of-mass + orientation (default)\n"
@@ -388,6 +390,8 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
             exit(0);
         } else if (strcmp(arg, "--trilinear") == 0) {
             cfg->downsample_mode = DOWNSAMPLE_TRILINEAR;
+        } else if (strcmp(arg, "--try-identity") == 0) {
+            cfg->try_identity = 1;
         } else if (strcmp(arg, "--moments") == 0) {
             cfg->initial_moving_transform = 1;
         } else if (strcmp(arg, "--no-moments") == 0) {
@@ -525,6 +529,7 @@ int main(int argc, char **argv) {
     if (cfg.initial_moving_transform) {
         double t0 = get_time();
         moments_opts_t mopts = moments_opts_default();
+        mopts.try_identity = cfg.try_identity;
         moments_register(&fixed, &moving, mopts, &mom);
         if (cfireants_verbose >= 1)
             fprintf(stderr, "Moments: %.1fs (NCC %.4f)\n", get_time() - t0, mom.ncc_loss);

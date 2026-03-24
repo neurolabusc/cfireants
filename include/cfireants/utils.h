@@ -59,6 +59,12 @@ void cpu_blur_downsample(const float *input, float *output,
 int cpu_trilinear_resize(const tensor_t *input, tensor_t *output,
                          int align_corners);
 
+/* Fixed-point warp inverse: inv = -interp(u, id + inv), iterated n_iters times.
+ * u: [D,H,W,3] forward displacement field
+ * inv: [D,H,W,3] output inverse (pre-allocated, zeroed on entry)
+ * Uses trilinear interpolation with zeros padding. */
+void cpu_warp_inverse(const float *u, float *inv, int D, int H, int W, int n_iters);
+
 #ifdef __cplusplus
 }
 #endif

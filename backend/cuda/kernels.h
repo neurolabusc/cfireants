@@ -22,6 +22,20 @@ extern "C" {
 #define CC_SMOOTH_NR 1e-5f
 #define CC_SMOOTH_DR 1e-5f
 
+/* --- Common CUDA helpers (cuda_common.cu) --- */
+
+/* Elementwise: a[i] = b[i] + c[i] */
+void cuda_vec_add(float *a, const float *b, const float *c, int n);
+/* Elementwise: a[i] *= alpha */
+void cuda_vec_scale(float *a, float alpha, int n);
+/* Permute [D*H*W, 3] <-> [3, D*H*W] */
+void cuda_permute_dhw3_to_3dhw(const float *src, float *dst, long spatial);
+void cuda_permute_3dhw_to_dhw3(const float *src, float *dst, long spatial);
+/* Max L2 norm of per-voxel 3D vectors: eps + max(||grad[i]||_2) */
+float cuda_max_l2_norm(const float *grad, long spatial, float eps);
+/* Build ERF Gaussian kernel on GPU. Caller must cudaFree result. */
+float *cuda_make_gpu_gauss(float sigma, float truncated, int *klen_out);
+
 /* --- Grid sample 3D (bilinear, zeros padding, align_corners=True) --- */
 
 void cuda_grid_sample_3d_fwd(
@@ -123,9 +137,11 @@ void cuda_blur_disp_dhw3(float *data, float *scratch,
 
 /* --- Warp inversion (fixed-point iteration) --- */
 
-/* Compute inverse of displacement field: (id+u) ∘ (id+inv_u) ≈ identity
+/* Compute inverse of displacement field via fixed-point iteration:
+ *   inv = -interp(u, id + inv)
+ * Matches WebGPU/CPU implementation for cross-backend parity.
  * u: [D,H,W,3] on GPU, inv_u: [D,H,W,3] on GPU (pre-allocated) */
-void cuda_warp_inverse(const float *u, float *inv_u, int D, int H, int W, int n_iters);
+void cuda_warp_inverse_fixedpoint(const float *u, float *inv_u, int D, int H, int W, int n_iters);
 
 /* --- Fused compositive warp update --- */
 

@@ -480,7 +480,7 @@ void metal_fused_cc_loss(
                 .spatial = spatial,
                 .kernel_volume = (int32_t)kv,
                 .nr = 1e-5f, .dr = 1e-5f,
-                .grad_output_val = -1.0f / (float)spatial,
+                .grad_output_val = -1.0f / (float)spatial * kv, /* kv compensates mean-based box filter adjoint */
                 .compute_grad_target = (grad_target != NULL) ? 1 : 0
             };
             const void *bufs[] = { interm, pred, target };

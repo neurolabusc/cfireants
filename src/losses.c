@@ -321,7 +321,8 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
 
     /* Steps 4-6: Backward */
     if (grad_pred || grad_target) {
-        float gO = -1.0f / (float)n;
+        /* Multiply by kv to compensate for mean-based box filter adjoint */
+        float gO = -1.0f / (float)n * kv;
         int cgt = (grad_target != NULL) ? 1 : 0;
 
         /* Step 4: bwd_modify — overwrite intermediates with gradient multipliers */

@@ -48,89 +48,7 @@ void cuda_fused_cc_loss(const float *pred, const float *target,
 
 #define BLK 256
 
-/* Reuse kernels from greedy_gpu.cu */
-__global__ void syn_vec_add(float *a, const float *b, const float *c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] = b[i] + c[i];
-}
-
-__global__ void syn_vec_scale(float *a, float alpha, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] *= alpha;
-}
-
-__global__ void syn_permute_dhw3_3dhw(const float *src, float *dst, long spatial) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < spatial)
-        for (int c = 0; c < 3; c++)
-            dst[(long)c*spatial + idx] = src[(long)idx*3 + c];
-}
-
-__global__ void syn_permute_3dhw_dhw3(const float *src, float *dst, long spatial) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < spatial)
-        for (int c = 0; c < 3; c++)
-            dst[(long)idx*3 + c] = src[(long)c*spatial + idx];
-}
-
-/* Dead code removed: syn_blur_disp (replaced by cuda_blur_disp_dhw3) */
-
-/* GPU max L2 norm reduction */
-__global__ void max_l2_norm_kernel(const float *grad, float *partial_max, long spatial) {
-    __shared__ float smax[BLK];
-    int tid = threadIdx.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    float val = 0;
-    if (i < spatial) {
-        float gx = grad[i*3], gy = grad[i*3+1], gz = grad[i*3+2];
-        val = sqrtf(gx*gx + gy*gy + gz*gz);
-    }
-    smax[tid] = val;
-    __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (tid < s && smax[tid+s] > smax[tid]) smax[tid] = smax[tid+s];
-        __syncthreads();
-    }
-    if (tid == 0) partial_max[blockIdx.x] = smax[0];
-}
-
-static float syn_max_l2_norm(const float *grad, long spatial, float eps) {
-    int blocks = (spatial + BLK - 1) / BLK;
-    float *d_partial;
-    cudaMalloc(&d_partial, blocks * sizeof(float));
-    max_l2_norm_kernel<<<blocks, BLK>>>(grad, d_partial, spatial);
-    /* Second pass on CPU (blocks is small) */
-    float *h = (float *)malloc(blocks * sizeof(float));
-    cudaMemcpy(h, d_partial, blocks * sizeof(float), cudaMemcpyDeviceToHost);
-    float maxval = 0;
-    for (int i = 0; i < blocks; i++)
-        if (h[i] > maxval) maxval = h[i];
-    free(h);
-    cudaFree(d_partial);
-    return eps + maxval;
-}
-
-/* Dead code removed: syn_compositive_update (replaced by cuda_fused_compositive_update) */
-
-static float *syn_make_gpu_gauss(float sigma, float truncated, int *klen_out) {
-    if (sigma <= 0) { *klen_out = 0; return NULL; }
-    int tail = (int)(truncated * sigma + 0.5f);
-    int klen = 2 * tail + 1;
-    float *h = (float *)malloc(klen * sizeof(float));
-    float inv = 1.0f / (sigma * sqrtf(2.0f));
-    float sum = 0;
-    for (int i = 0; i < klen; i++) {
-        float x = (float)(i - tail);
-        h[i] = 0.5f * (erff((x+0.5f)*inv) - erff((x-0.5f)*inv));
-        sum += h[i];
-    }
-    for (int i = 0; i < klen; i++) h[i] /= sum;
-    float *d; cudaMalloc(&d, klen*sizeof(float));
-    cudaMemcpy(d, h, klen*sizeof(float), cudaMemcpyHostToDevice);
-    free(h);
-    *klen_out = klen;
-    return d;
-}
+/* Shared helpers from cuda_common.cu (declared in kernels.h) */
 
 /* ------------------------------------------------------------------ */
 /* WarpAdam step for one warp field (matching Python WarpAdam.step)    */
@@ -164,11 +82,11 @@ static void warp_adam_step(
     cuda_adam_direction(d_adam_dir, d_exp_avg, d_exp_avg_sq, bc1, bc2, eps, n3);
 
     /* Normalize: gradmax = eps + max(||adam_dir||_2), clamp min=1 */
-    float gradmax = syn_max_l2_norm(d_adam_dir, spatial, eps);
+    float gradmax = cuda_max_l2_norm(d_adam_dir, spatial, eps);
     if (gradmax < 1.0f) gradmax = 1.0f;
     float half_res = 1.0f / (float)((D > H ? (D > W ? D : W) : (H > W ? H : W)) - 1);
     float scale = half_res / gradmax * (-lr);
-    syn_vec_scale<<<blocks, BLK>>>(d_adam_dir, scale, n3);
+    cuda_vec_scale(d_adam_dir, scale, n3);
 
     /* Fused compositive update: adam_dir = adam_dir + interp(warp, identity + adam_dir)
      * Single kernel — no permute overhead */
@@ -225,8 +143,8 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
 
     /* Gaussian kernels */
     int grad_klen=0, warp_klen=0;
-    float *d_grad_kernel = syn_make_gpu_gauss(opts.smooth_grad_sigma, 2.0f, &grad_klen);
-    float *d_warp_kernel = syn_make_gpu_gauss(opts.smooth_warp_sigma, 2.0f, &warp_klen);
+    float *d_grad_kernel = cuda_make_gpu_gauss(opts.smooth_grad_sigma, 2.0f, &grad_klen);
+    float *d_warp_kernel = cuda_make_gpu_gauss(opts.smooth_warp_sigma, 2.0f, &warp_klen);
 
     /* Warp fields and optimizer state */
     float *d_fwd_warp=NULL, *d_rev_warp=NULL;
@@ -310,15 +228,15 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
             float *t1,*t2; int pb=(ps+BLK-1)/BLK, nb=(spatial+BLK-1)/BLK;
             /* Resize fwd */
             cudaMalloc(&t1,ps*3*sizeof(float)); cudaMalloc(&t2,spatial*3*sizeof(float));
-            syn_permute_dhw3_3dhw<<<pb,BLK>>>(d_fwd_warp,t1,ps);
+            cuda_permute_dhw3_to_3dhw(d_fwd_warp,t1,ps);
             cuda_trilinear_resize(t1,t2,1,3,prev_dD,prev_dH,prev_dW,dD,dH,dW,1);
             cudaFree(d_fwd_warp); cudaMalloc(&d_fwd_warp,n3*sizeof(float));
-            syn_permute_3dhw_dhw3<<<nb,BLK>>>(t2,d_fwd_warp,spatial);
+            cuda_permute_3dhw_to_dhw3(t2,d_fwd_warp,spatial);
             /* Resize rev */
-            syn_permute_dhw3_3dhw<<<pb,BLK>>>(d_rev_warp,t1,ps);
+            cuda_permute_dhw3_to_3dhw(d_rev_warp,t1,ps);
             cuda_trilinear_resize(t1,t2,1,3,prev_dD,prev_dH,prev_dW,dD,dH,dW,1);
             cudaFree(d_rev_warp); cudaMalloc(&d_rev_warp,n3*sizeof(float));
-            syn_permute_3dhw_dhw3<<<nb,BLK>>>(t2,d_rev_warp,spatial);
+            cuda_permute_3dhw_to_dhw3(t2,d_rev_warp,spatial);
             cudaFree(t1); cudaFree(t2);
             /* Reset optimizer state */
             if(d_fwd_m) cudaFree(d_fwd_m); if(d_fwd_v) cudaFree(d_fwd_v);
@@ -364,8 +282,8 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
 
         for (int it=0; it<iters; it++) {
             /* 1. sampling grids = base + warp */
-            syn_vec_add<<<blocks_n,BLK>>>(d_sg_fwd, d_fwd_base, d_fwd_warp, n3);
-            syn_vec_add<<<blocks_n,BLK>>>(d_sg_rev, d_rev_base, d_rev_warp, n3);
+            cuda_vec_add(d_sg_fwd, d_fwd_base, d_fwd_warp, n3);
+            cuda_vec_add(d_sg_rev, d_rev_base, d_rev_warp, n3);
 
             /* 2. moved = grid_sample(moving_blur, fwd_sampling_grid) */
             cuda_grid_sample_3d_fwd(d_moving_blur, d_sg_fwd, d_moved,
@@ -442,10 +360,10 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
             cudaMalloc(&_t1, _ps*3*sizeof(float)); \
             cudaMalloc(&_t2, _ts*3*sizeof(float)); \
             int _pb=(_ps+BLK-1)/BLK, _tb=(_ts+BLK-1)/BLK; \
-            syn_permute_dhw3_3dhw<<<_pb,BLK>>>(src, _t1, _ps); \
+            cuda_permute_dhw3_to_3dhw(src, _t1, _ps); \
             cuda_trilinear_resize(_t1, _t2, 1, 3, sD, sH, sW, tD, tH, tW, 1); \
             cudaMalloc(&dst, _ts*3*sizeof(float)); \
-            syn_permute_3dhw_dhw3<<<_tb,BLK>>>(_t2, dst, _ts); \
+            cuda_permute_3dhw_to_dhw3(_t2, dst, _ts); \
             cudaFree(_t1); cudaFree(_t2); \
         } while(0)
 
@@ -459,10 +377,11 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
             RESIZE_DISP(d_rev_warp, d_rev_full, prev_dD, prev_dH, prev_dW, fD, fH, fW);
         }
 
-        /* Compute inverse of rev_warp via iterative IC optimization */
+        /* Compute inverse of rev_warp via fixed-point iteration
+         * (matching WebGPU/CPU for cross-backend parity) */
         float *d_inv_rev;
         cudaMalloc(&d_inv_rev, n3 * sizeof(float));
-        cuda_warp_inverse(d_rev_full, d_inv_rev, fD, fH, fW, 0);
+        cuda_warp_inverse_fixedpoint(d_rev_full, d_inv_rev, fD, fH, fW, 550);
 
         /* Compose: composed = inv_rev + interp(fwd_warp, identity + inv_rev)
          * Using our fused compositive update kernel */
@@ -480,7 +399,7 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
         float *d_sg;
         cudaMalloc(&d_sg, n3 * sizeof(float));
         int blocks = (n3 + BLK - 1) / BLK;
-        syn_vec_add<<<blocks, BLK>>>(d_sg, d_base, d_composed, n3);
+        cuda_vec_add(d_sg, d_base, d_composed, n3);
 
         /* Sample moving image */
         float *d_moved_full;

@@ -481,7 +481,8 @@ void wgpu_fused_cc_loss(
     /* Steps 4-6: Backward */
     if (grad_pred) {
         int cgt = (grad_target != NULL) ? 1 : 0;
-        float gO = -1.0f / n;
+        /* Multiply by kv to compensate for mean-based box filter adjoint */
+        float gO = -1.0f / n * kernel_volume;
 
         /* Step 4: bwd_modify — overwrite the 5 buffers with gradient multipliers.
          * We do this on CPU since the data is small and avoids another shader. */
