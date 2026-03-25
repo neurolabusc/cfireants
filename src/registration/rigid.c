@@ -46,8 +46,6 @@ static void quat_rotmat_jacobian(const float q[4], float dR_dq[4][3][3]) {
     if (norm < 1e-8f) norm = 1e-8f;
     float inv_n = 1.0f / norm;
     float w = q[0]*inv_n, x = q[1]*inv_n, y = q[2]*inv_n, z = q[3]*inv_n;
-    float inv_n2 = inv_n * inv_n;
-
     /* For each q component, dR/dq_k = dR/d(normalized_q) * d(normalized_q)/dq_k
      * d(q_normalized)/dq_k = (I - q_hat*q_hat^T) / norm, where q_hat = q/norm
      * This is complex. For simplicity, use the direct formula assuming unit quaternion

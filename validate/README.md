@@ -23,124 +23,76 @@ python validate/run_validation.py --check-reference        # check for regressio
 
 # C/CUDA validation (run from repo root)
 build/test_validate_all                                    # all datasets (SyN)
-build/test_validate_all --dataset small --trilinear        # trilinear downsample
 
 # Metal (macOS)
-build/test_validate_metal --dataset small --trilinear      # SyN
-build/test_validate_metal --dataset small --trilinear --greedy  # Greedy (faster)
+build/test_validate_metal                                  # all datasets (SyN)
+build/test_validate_metal --dataset small --greedy         # Greedy (faster)
 
 # WebGPU
-build/test_validate_webgpu --dataset small --trilinear     # SyN
-build/test_validate_webgpu --dataset small --trilinear --greedy  # Greedy
+build/test_validate_webgpu                                 # all datasets (SyN)
+build/test_validate_webgpu --dataset small --greedy        # Greedy
+
+# CLI tool (any backend)
+build/cfireants_reg -f validate/small/MNI152_T1_2mm.nii.gz -m validate/small/T1_head_2mm.nii.gz \
+  -v 2 -o test/small_syn.nii.gz --backend cuda
 ```
 
-## Baseline Metrics
+## Python vs CUDA vs WebGPU — All Datasets (NVIDIA RTX 4090)
 
-Measured on NVIDIA RTX 4090 (24 GB).
+Pipeline: Moments → Rigid → Affine → SyN. FFT downsampling.
 
-### Python (PyTorch 2.10.0+cu128, fused ops)
+| Dataset | Python NCC | CUDA NCC | WebGPU NCC | Python Time | CUDA Time | WebGPU Time |
+|---------|-----------|---------|-----------|------------|----------|------------|
+| small   | 0.9450    | 0.9530  | 0.9548    | 3.9s       | 2.7s     | 16.1s      |
+| medium  | 0.9443    | 0.9469  | 0.9465    | 3.8s       | 3.2s     | 127.6s     |
+| large   | 0.8961    | 0.8972  | 0.8886    | 16.1s      | 15.6s    | 127.7s     |
 
-Pipeline: Moments → Rigid → Affine → SyN
+### Peak memory (RTX 4090)
 
-| Dataset | NCC Before | NCC After | Local NCC Loss | Time (s) | Peak GPU (MB) |
-|---------|-----------|-----------|---------------|---------|--------------|
-| small   | 0.5953    | 0.9450    | -0.5838       | 4.0     | 804          |
-| medium  | 0.5753    | 0.9443    | -0.8127       | 4.9     | 1409         |
-| large   | 0.7254    | 0.8961    | -0.3051       | 17.1    | 6337         |
-
-### C/CUDA SyN (cfireants, symmetric bidirectional)
-
-Pipeline: Moments (GPU) → Rigid (GPU) → Affine (GPU) → SyN (GPU).
-Same method as Python. Evaluation uses `compose(fwd_warp, inverse(rev_warp))`
-via iterative IC-based warp inversion (550 iterations matching Python's
-`compositive_warp_inverse`). Per-axis Gaussian blur on moving image matching
-Python's `_smooth_image_not_mask`.
-
-| Dataset | NCC Before | NCC After | Local NCC Loss | Time (s) | Peak CPU (MB) | Peak GPU (MB) |
-|---------|-----------|-----------|---------------|---------|--------------|--------------|
-| small   | 0.5957    | 0.9533    | -0.6131       | 3.0     | 127          | 903          |
-| medium  | 0.5753    | 0.9469    | -0.8138       | 5.5     | 337          | 907          |
-| large   | 0.7254    | 0.8966    | -0.2876       | 17.9    | 400          | 921          |
-
-### Comparison (NVIDIA RTX 4090)
-
-| Dataset | NCC After | | | Time | | |
-|---------|-----------|-----------|-----------|------|------|------|
-|         | **Python SyN** | **C Greedy** | **C SyN** | **Py** | **C Greedy** | **C SyN** |
-| small   | 0.9450    | —         | **0.9533** | 4.0s | 2.7s | 3.0s |
-| medium  | 0.9443    | —         | **0.9469** | 4.9s | 2.4s | 5.5s |
-| large   | 0.8961    | —         | **0.8966** | 17.1s| 13.7s| 17.9s|
+| Dataset | Python GPU | CUDA GPU | CUDA CPU | WebGPU CPU |
+|---------|-----------|---------|---------|-----------|
+| small   | 804 MB    | 1093 MB | 130 MB  | 468 MB    |
+| medium  | 1574 MB   | 1097 MB | 341 MB  | 872 MB    |
+| large   | 7825 MB   | 1111 MB | 404 MB  | 901 MB    |
 
 Notes:
-- **C/CUDA SyN matches or slightly exceeds Python** on all three datasets.
-- CUDA greedy NCC not yet re-measured after `1/ks²` fix.
-- Quality differences from float32 optimization trajectory divergence (separable 1D vs non-separable 3D CC box filter). Individual operations match; compound differences across iterations.
-- Peak GPU memory: ~900 MB (C) vs 804–6337 MB (Python).
+- Python GPU memory is PyTorch CUDA peak (`torch.cuda.max_memory_allocated`), includes autograd graph overhead.
+- CUDA GPU memory is approximate (total - free at peak). CUDA CPU is Linux VmPeak.
+- WebGPU runs on Vulkan via wgpu-native. Reports CPU RSS only (wgpu manages GPU memory internally).
+- CUDA uses ~1 GB GPU regardless of dataset size (pre-allocated workspace). Python scales with image size.
 
-### C/CUDA Greedy (cfireants, compositive single-direction)
+## Metal — All Datasets (Apple M4 Pro, SyN Trilinear)
 
-Pipeline: Moments (GPU) → Rigid (GPU) → Affine (GPU) → Greedy compositive (GPU).
-Faster than SyN (no dual warp, no warp inversion for evaluation).
+Metal uses native API with unified memory on Apple Silicon.
 
-*NCC values pending re-measurement after `1/ks²` fix. Timing unchanged.*
+| Dataset | Python NCC | Metal NCC | Metal Time | Metal RAM |
+|---------|------------|-----------|------------|-----------|
+| small   | 0.9450     | 0.9574    | 7.4s       | 391 MB    |
+| medium  | 0.9443     | 0.9454    | 19.9s      | 2955 MB   |
+| large   | 0.8961     | 0.9022    | 44.2s      | 3123 MB   |
 
-| Dataset | NCC Before | NCC After | Time (s) | Peak CPU (MB) | Peak GPU (MB) |
-|---------|-----------|-----------|---------|--------------|--------------|
-| small   | 0.5957    | —         | 2.7     | 128          | 903          |
-| medium  | 0.5753    | —         | 2.4     | 339          | 906          |
-| large   | 0.7254    | —         | 13.7    | 403          | 906          |
+## Greedy vs SyN
 
-Greedy is the fastest option (0.1-0.6s for deformable stage).
+Greedy compositive (single-direction) is faster than SyN (no dual warp, no warp inversion) at 1–2% lower NCC.
 
-### Per-stage timing breakdown
+### Greedy vs SyN — Metal (Apple M4 Pro, Trilinear)
 
-#### Python (PyTorch)
+| Dataset | SyN NCC | Greedy NCC | SyN Time | Greedy Time | SyN RAM | Greedy RAM |
+|---------|---------|------------|----------|-------------|---------|------------|
+| small   | 0.9574  | 0.9417     | 7.4s     | 6.5s        | 391 MB  | 276 MB     |
+| medium  | 0.9454  | 0.9345     | 19.9s    | 16.3s       | 2955 MB | 2036 MB    |
+| large   | 0.9022  | 0.8836     | 44.2s    | 39.6s       | 3123 MB | 2203 MB    |
 
-| Dataset | Moments (s) | Rigid (s) | Affine (s) | SyN (s) | Total (s) |
-|---------|------------|-----------|-----------|---------|----------|
-| small   | 0.2        | 2.0       | 1.0       | 0.8     | 4.0      |
-| medium  | 0.3        | 1.2       | 1.3       | 2.2     | 4.9      |
-| large   | 0.3        | 7.9       | 6.6       | 2.4     | 17.1     |
+Greedy uses 19–30% less memory. Use `--greedy` flag.
 
-#### C/CUDA SyN
+## FFT vs Trilinear Downsampling
 
-| Dataset | Moments (s) | Rigid (s) | Affine (s) | SyN (s)  | Total (s) |
-|---------|------------|-----------|-----------|----------|----------|
-| small   | 0.1        | 1.0       | 1.4       | 0.4      | 3.0      |
-| medium  | 0.1        | 0.9       | 0.9       | 3.6      | 5.5      |
-| large   | 0.2        | 6.9       | 7.2       | 3.7      | 17.9     |
+| Metric | CUDA FFT | CUDA Trilinear | Metal FFT | Metal Trilinear |
+|--------|----------|----------------|-----------|-----------------|
+| NCC After (small) | 0.9533 | 0.9548 | 0.9532 | 0.9574 |
+| Total Time | 3.0s | 3.0s | 7.6s | 7.4s |
 
-#### C/CUDA Greedy
-
-| Dataset | Moments (s) | Rigid (s) | Affine (s) | Greedy (s) | Total (s) |
-|---------|------------|-----------|-----------|-----------|----------|
-| small   | 0.1        | 1.0       | 1.4       | 0.1       | 2.7      |
-| medium  | 0.1        | 0.9       | 0.9       | 0.5       | 2.4      |
-| large   | 0.2        | 6.2       | 6.7       | 0.6       | 13.7     |
-
-Notes:
-- Moments uses GPU for orientation candidate evaluation. SVD and COM stay on CPU.
-- Rigid uses MI + extra moving blur (matching Python `_smooth_image_not_mask`).
-- Affine uses MI (small/large) or CC (medium), with FFT downsample, no extra blur (matching Python).
-- SyN includes 550-iteration IC warp inversion at full resolution for evaluation.
-- Per-axis Gaussian kernels match Python's `separable_filtering` with axis-specific sigmas.
-- FFT-based downsampling (`cuda_downsample_fft`) matches the Python fused-ops CUDA path.
-- Fused CC loss, fused compositive update, and fused blur kernels minimize per-iteration overhead.
-
-### Metric definitions
-
-- **NCC Before**: Global normalized cross-correlation between the stationary image
-  and the moving image resampled into stationary space (identity transform).
-- **NCC After**: Global NCC between the stationary image and the warped output.
-  Values closer to 1.0 indicate better alignment.
-- **Local NCC Loss**: FireANTs `LocalNormalizedCrossCorrelationLoss` with kernel_size=9.
-  More negative values indicate better local alignment. This is the primary quality metric.
-
-## Reference outputs
-
-Running `--save-reference` saves warped images and metrics JSON under
-`validate/reference/<dataset>/`. These serve as the baseline for regression
-detection via `--check-reference`, which flags any NCC degradation exceeding 2%.
+Both modes produce equivalent accuracy. Trilinear is fully GPU-native and enables like-for-like cross-backend comparison (no FFT library dependency).
 
 ## Dataset-specific parameter choices
 
@@ -152,80 +104,13 @@ detection via `--check-reference`, which flags any NCC degradation exceeding 2%.
 - **large**: Uses an extra 8x downsampling scale for rigid/affine to handle
   the larger field of view and resolution difference (1mm vs 0.88mm).
 
-## Downsample Modes
+## Metric definitions
 
-All three GPU backends support two downsampling modes:
+- **NCC**: Global normalized cross-correlation (Pearson) between the stationary image and the warped output. Values closer to 1.0 indicate better alignment.
+- **Local NCC Loss**: FireANTs `LocalNormalizedCrossCorrelationLoss` with kernel_size=9. More negative = better local alignment.
 
-- **FFT** (default) — FFT-based downsample matching Python. CUDA uses cuFFT; Metal uses MPSGraph; WebGPU uses kissfft (CPU fallback).
-- **Trilinear** (`--trilinear`) — Gaussian blur + trilinear resize, fully GPU-native. Matches or exceeds FFT accuracy. Enables like-for-like comparison across all backends.
+## Reference outputs
 
-### FFT vs Trilinear (small dataset)
-
-| Metric | CUDA FFT | CUDA Trilinear | Metal FFT | Metal Trilinear |
-|--------|----------|----------------|-----------|-----------------|
-| NCC After | 0.9533 | 0.9548 | 0.9532 | 0.9574 |
-| Total Time | 3.0s | 3.0s | 7.6s | 7.4s |
-| Peak RAM | 147 MB | 140 MB | 390 MB | 391 MB |
-
-CUDA measured on NVIDIA GB10. Metal measured on Apple M4 Pro.
-
-## WebGPU Backend (wgpu-native)
-
-### CUDA vs WebGPU — Trilinear Mode (small dataset, NVIDIA GB10 Vulkan)
-
-| Metric | CUDA | WebGPU | Ratio |
-|--------|------|--------|-------|
-| NCC After | 0.9644 | 0.9643 | 1.000 |
-| Total Time | 7.5s | 14.2s | 1.9x |
-| Rigid (MI) | 2.8s | 0.9s | 0.3x |
-| Affine (MI) | 3.0s | 1.1s | 0.4x |
-| SyN (CC) | 1.4s | 11.9s | 8.5x |
-| Peak RAM | 140 MB | 445 MB | 3.2x |
-
-WebGPU matches CUDA accuracy. MI is faster on WebGPU (CUDA downloads full images for max-finding). SyN is slower due to per-dispatch overhead.
-
-### CUDA vs WebGPU — All Datasets (Trilinear, NVIDIA GB10)
-
-| Dataset | CUDA NCC | WebGPU NCC | CUDA Time | WebGPU Time |
-|---------|----------|------------|-----------|-------------|
-| small | 0.9644 | 0.9647 | 7.5s | 13.7s |
-| medium | 0.9536 | 0.9541 | 18.2s | 90.5s |
-| large | 0.9213 | 0.9190 | 55.1s | 93.2s |
-
-## Metal Backend (Apple Silicon)
-
-### Metal — All Datasets (SyN Trilinear, Apple M4 Pro)
-
-Metal uses native API with unified memory on Apple Silicon.
-
-| Dataset | Python NCC | Metal NCC | Metal Time | Metal RAM |
-|---------|------------|-----------|------------|-----------|
-| small | 0.9450 | 0.9574 | 7.4s | 391 MB |
-| medium | 0.9443 | 0.9454 | 19.9s | 2955 MB |
-| large | 0.8961 | 0.9022 | 44.2s | 3123 MB |
-
-Metal exceeds Python accuracy on all datasets.
-
-### Greedy vs SyN — WebGPU (Apple M4 Pro, Trilinear)
-
-| Dataset | | SyN | Greedy | Improvement |
-|---------|------|------|--------|-------------|
-| **small** | NCC | 0.9642 | 0.9542 | -1.0% |
-| | Total Time | 61.3s | 39.0s | 1.6x faster |
-| | Peak RAM | 132 MB | 107 MB | 19% less |
-| **medium** | NCC | 0.9541 | 0.9434 | -1.1% |
-| | Total Time | 132.2s | 88.4s | 1.5x faster |
-| | Peak RAM | 874 MB | 647 MB | 26% less |
-| **large** | NCC | 0.9191 | 0.9053 | -1.5% |
-| | Total Time | 90.7s | 46.9s | 1.9x faster |
-| | Peak RAM | 1028 MB | 794 MB | 23% less |
-
-### Greedy vs SyN — Metal (Apple M4 Pro, Trilinear)
-
-| Dataset | SyN NCC | Greedy NCC | SyN Time | Greedy Time | SyN RAM | Greedy RAM |
-|---------|---------|------------|----------|-------------|---------|------------|
-| small | 0.9574 | 0.9417 | 7.4s | 6.5s | 391 MB | 276 MB |
-| medium | 0.9454 | 0.9345 | 19.9s | 16.3s | 2955 MB | 2036 MB |
-| large | 0.9022 | 0.8836 | 44.2s | 39.6s | 3123 MB | 2203 MB |
-
-Greedy is 1–2% lower NCC with 19–30% less memory. Speed varies: faster on small/medium, comparable on large. Use `--greedy` flag.
+Running `--save-reference` saves warped images and metrics JSON under
+`validate/reference/<dataset>/`. These serve as the baseline for regression
+detection via `--check-reference`, which flags any NCC degradation exceeding 2%.
