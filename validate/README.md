@@ -58,39 +58,39 @@ Python's `_smooth_image_not_mask`.
 
 | Dataset | NCC Before | NCC After | Local NCC Loss | Time (s) | Peak CPU (MB) | Peak GPU (MB) |
 |---------|-----------|-----------|---------------|---------|--------------|--------------|
-| small   | 0.5957    | 0.9614    | -0.6511       | 3.0     | 127          | 903          |
-| medium  | 0.5753    | 0.9554    | -0.8570       | 5.5     | 337          | 907          |
-| large   | 0.7254    | 0.9176    | -0.3679       | 17.9    | 400          | 921          |
+| small   | 0.5957    | 0.9533    | -0.6131       | 3.0     | 127          | 903          |
+| medium  | 0.5753    | 0.9469    | -0.8138       | 5.5     | 337          | 907          |
+| large   | 0.7254    | 0.8966    | -0.2876       | 17.9    | 400          | 921          |
 
-### Comparison
+### Comparison (NVIDIA RTX 4090)
 
-| Dataset | NCC After | | | Local NCC Loss | | | Time | | |
-|---------|-----------|-----------|-----------|--------------|-----------|-----------|------|------|------|
-|         | **Python SyN** | **C Greedy** | **C SyN** | **Python SyN** | **C Greedy** | **C SyN** | **Py** | **C Greedy** | **C SyN** |
-| small   | 0.9450    | 0.9512    | **0.9614** | -0.5838      | -0.6090   | **-0.6511** | 4.0s | **2.7s** | 3.0s |
-| medium  | 0.9443    | 0.9434    | **0.9554** | -0.8127      | -0.8458   | **-0.8570** | 4.9s | **2.4s** | 5.5s |
-| large   | 0.8961    | 0.9022    | **0.9176** | -0.3051      | -0.3277   | **-0.3679** | 17.1s| **13.7s**| 17.9s|
+| Dataset | NCC After | | | Time | | |
+|---------|-----------|-----------|-----------|------|------|------|
+|         | **Python SyN** | **C Greedy** | **C SyN** | **Py** | **C Greedy** | **C SyN** |
+| small   | 0.9450    | —         | **0.9533** | 4.0s | 2.7s | 3.0s |
+| medium  | 0.9443    | —         | **0.9469** | 4.9s | 2.4s | 5.5s |
+| large   | 0.8961    | —         | **0.8966** | 17.1s| 13.7s| 17.9s|
 
 Notes:
-- **Both C/CUDA approaches exceed Python SyN quality** on all three datasets for both NCC metrics.
-- **C/CUDA Greedy** is the fastest (1.2-2.0x faster than Python), suitable when speed is prioritized.
-- **C/CUDA SyN** produces the highest quality, comparable speed to Python.
-- Quality differences are due to float32 optimization trajectory divergence, verified to be within expected precision: MI loss matches to 1e-13, affine backward to 7e-6, FFT downsample to 0.001. Individual operations are identical; compound differences across hundreds of iterations lead to different (slightly better) local minima.
-- Both implementations use FFT-based downsampling, Gaussian Parzen MI for linear stages, CC for deformable, compositive Adam with gradient normalization, per-axis blur, and IC-based warp inversion (SyN only).
-- Peak GPU memory is ~900-930 MB across all datasets (vs Python's 804-6337 MB).
+- **C/CUDA SyN matches or slightly exceeds Python** on all three datasets.
+- CUDA greedy NCC not yet re-measured after `1/ks²` fix.
+- Quality differences from float32 optimization trajectory divergence (separable 1D vs non-separable 3D CC box filter). Individual operations match; compound differences across iterations.
+- Peak GPU memory: ~900 MB (C) vs 804–6337 MB (Python).
 
 ### C/CUDA Greedy (cfireants, compositive single-direction)
 
 Pipeline: Moments (GPU) → Rigid (GPU) → Affine (GPU) → Greedy compositive (GPU).
 Faster than SyN (no dual warp, no warp inversion for evaluation).
 
-| Dataset | NCC Before | NCC After | Local NCC Loss | Time (s) | Peak CPU (MB) | Peak GPU (MB) |
-|---------|-----------|-----------|---------------|---------|--------------|--------------|
-| small   | 0.5957    | 0.9512    | -0.6090       | 2.7     | 128          | 903          |
-| medium  | 0.5753    | 0.9434    | -0.8458       | 2.4     | 339          | 906          |
-| large   | 0.7254    | 0.9022    | -0.3277       | 13.7    | 403          | 906          |
+*NCC values pending re-measurement after `1/ks²` fix. Timing unchanged.*
 
-Greedy is the fastest option (0.1-0.6s for deformable stage) and still exceeds Python SyN quality on all datasets.
+| Dataset | NCC Before | NCC After | Time (s) | Peak CPU (MB) | Peak GPU (MB) |
+|---------|-----------|-----------|---------|--------------|--------------|
+| small   | 0.5957    | —         | 2.7     | 128          | 903          |
+| medium  | 0.5753    | —         | 2.4     | 339          | 906          |
+| large   | 0.7254    | —         | 13.7    | 403          | 906          |
+
+Greedy is the fastest option (0.1-0.6s for deformable stage).
 
 ### Per-stage timing breakdown
 
@@ -163,8 +163,8 @@ All three GPU backends support two downsampling modes:
 
 | Metric | CUDA FFT | CUDA Trilinear | Metal FFT | Metal Trilinear |
 |--------|----------|----------------|-----------|-----------------|
-| NCC After | 0.9614 | 0.9644 | 0.9608 | 0.9639 |
-| Total Time | 7.6s | 7.5s | 7.4s | 7.3s |
+| NCC After | 0.9533 | 0.9548 | 0.9532 | 0.9574 |
+| Total Time | 3.0s | 3.0s | 7.6s | 7.4s |
 | Peak RAM | 147 MB | 140 MB | 390 MB | 391 MB |
 
 CUDA measured on NVIDIA GB10. Metal measured on Apple M4 Pro.
@@ -194,17 +194,17 @@ WebGPU matches CUDA accuracy. MI is faster on WebGPU (CUDA downloads full images
 
 ## Metal Backend (Apple Silicon)
 
-### Metal vs WebGPU — All Datasets (SyN Trilinear, Apple M4 Pro)
+### Metal — All Datasets (SyN Trilinear, Apple M4 Pro)
 
-Both backends run on the same M4 Pro GPU. Metal uses native API with unified memory; WebGPU runs via wgpu-native's Metal backend.
+Metal uses native API with unified memory on Apple Silicon.
 
-| Dataset | WebGPU NCC | Metal NCC | WebGPU Time | Metal Time | Metal RAM |
-|---------|------------|-----------|-------------|------------|-----------|
-| small | 0.9642 | 0.9636 | 60.1s | 7.2s | 391 MB |
-| medium | 0.9541 | 0.9540 | 131.7s | 18.7s | 3023 MB |
-| large | 0.9191 | 0.9199 | 88.5s | 36.2s | 3259 MB |
+| Dataset | Python NCC | Metal NCC | Metal Time | Metal RAM |
+|---------|------------|-----------|------------|-----------|
+| small | 0.9450 | 0.9574 | 7.4s | 391 MB |
+| medium | 0.9443 | 0.9454 | 19.9s | 2955 MB |
+| large | 0.8961 | 0.9022 | 44.2s | 3123 MB |
 
-Metal matches WebGPU accuracy (within 0.1%) and runs 2–8x faster.
+Metal exceeds Python accuracy on all datasets.
 
 ### Greedy vs SyN — WebGPU (Apple M4 Pro, Trilinear)
 
@@ -224,8 +224,8 @@ Metal matches WebGPU accuracy (within 0.1%) and runs 2–8x faster.
 
 | Dataset | SyN NCC | Greedy NCC | SyN Time | Greedy Time | SyN RAM | Greedy RAM |
 |---------|---------|------------|----------|-------------|---------|------------|
-| small | 0.9636 | 0.9511 | 7.2s | 6.5s | 391 MB | 276 MB |
-| medium | 0.9540 | 0.9420 | 18.7s | 16.7s | 3023 MB | 2103 MB |
-| large | 0.9199 | 0.8996 | 36.2s | 37.6s | 3259 MB | 2340 MB |
+| small | 0.9574 | 0.9417 | 7.4s | 6.5s | 391 MB | 276 MB |
+| medium | 0.9454 | 0.9345 | 19.9s | 16.3s | 2955 MB | 2036 MB |
+| large | 0.9022 | 0.8836 | 44.2s | 39.6s | 3123 MB | 2203 MB |
 
 Greedy is 1–2% lower NCC with 19–30% less memory. Speed varies: faster on small/medium, comparable on large. Use `--greedy` flag.
