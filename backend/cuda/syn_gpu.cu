@@ -238,10 +238,12 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
             cudaFree(d_rev_warp); cudaMalloc(&d_rev_warp,n3*sizeof(float));
             cuda_permute_3dhw_to_dhw3(t2,d_rev_warp,spatial);
             cudaFree(t1); cudaFree(t2);
-            /* Reset optimizer state */
+            /* Reset optimizer state (matching Python: CompositiveWarp.set_size
+             * creates a new WarpAdam, resetting step_t, exp_avg, exp_avg_sq) */
             if(d_fwd_m) cudaFree(d_fwd_m); if(d_fwd_v) cudaFree(d_fwd_v);
             if(d_rev_m) cudaFree(d_rev_m); if(d_rev_v) cudaFree(d_rev_v);
             d_fwd_m=d_fwd_v=d_rev_m=d_rev_v=NULL;
+            fwd_step=0; rev_step=0;
         }
         if (!d_fwd_m) {
             cudaMalloc(&d_fwd_m,n3*sizeof(float)); cudaMemset(d_fwd_m,0,n3*sizeof(float));
@@ -324,8 +326,15 @@ int syn_register_gpu(const image_t *fixed, const image_t *moving,
                           opts.lr, beta1, beta2, eps,
                           d_warp_kernel, warp_klen, d_s2, d_s3, d_sg_rev);
 
-            if (it%50==0 || it==iters-1)
-                fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
+            if (it%50==0 || it==iters-1) {
+                fprintf(stderr, "    iter %d/%d loss=%.6f", it, iters, loss);
+                if (cfireants_verbose >= 2) {
+                    float fwd_max = cuda_max_l2_norm(d_fwd_warp, spatial, 0);
+                    float rev_max = cuda_max_l2_norm(d_rev_warp, spatial, 0);
+                    fprintf(stderr, "  fwd_max=%.6f rev_max=%.6f", fwd_max, rev_max);
+                }
+                fprintf(stderr, "\n");
+            }
             if (fabsf(loss-prev_loss)<opts.tolerance) {
                 converge_count++; if(converge_count>=opts.max_tolerance_iters) break;
             } else converge_count=0;

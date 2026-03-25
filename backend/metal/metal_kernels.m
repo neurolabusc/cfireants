@@ -480,7 +480,7 @@ void metal_fused_cc_loss(
                 .spatial = spatial,
                 .kernel_volume = (int32_t)kv,
                 .nr = 1e-5f, .dr = 1e-5f,
-                .grad_output_val = -1.0f / (float)spatial * kv, /* kv compensates mean-based box filter adjoint */
+                .grad_output_val = -1.0f / (float)spatial,
                 .compute_grad_target = (grad_target != NULL) ? 1 : 0
             };
             const void *bufs[] = { interm, pred, target };
@@ -516,6 +516,15 @@ void metal_fused_cc_loss(
                 (size_t)spatial * sizeof(float)
             };
             metal_dispatch(pso, bufs, sizes, 5, &params, sizeof(params), spatial);
+        }
+
+        /* Scale final gradients by 1/ks² to match Python cc.py autograd.
+         * Applied AFTER the box filter adjoint, not inside grad_output_val. */
+        {
+            float inv_ks2 = 1.0f / (float)(ks * ks);
+            metal_tensor_scale(grad_pred, inv_ks2, spatial);
+            if (grad_target)
+                metal_tensor_scale(grad_target, inv_ks2, spatial);
         }
     }
 }

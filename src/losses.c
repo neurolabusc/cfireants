@@ -321,8 +321,7 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
 
     /* Steps 4-6: Backward */
     if (grad_pred || grad_target) {
-        /* Multiply by kv to compensate for mean-based box filter adjoint */
-        float gO = -1.0f / (float)n * kv;
+        float gO = -1.0f / (float)n;
         int cgt = (grad_target != NULL) ? 1 : 0;
 
         /* Step 4: bwd_modify — overwrite intermediates with gradient multipliers */
@@ -351,16 +350,17 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
             separable_box_filter_3d(b_IJ, b_IJ, D, H, W, kernel_size, tmp);
         }
 
-        /* Step 6: Final gradients */
+        /* Step 6: Final gradients (divide by ks² to match Python cc.py autograd) */
+        float inv_ks2 = 1.0f / (float)(kernel_size * kernel_size);
         if (grad_pred) {
             float *gp = tensor_data_f32(grad_pred);
             for (size_t i = 0; i < n; i++)
-                gp[i] = b_I[i]*J[i] - b_J[i]*I[i] + b_I2[i];
+                gp[i] = (b_I[i]*J[i] - b_J[i]*I[i] + b_I2[i]) * inv_ks2;
         }
         if (grad_target) {
             float *gt = tensor_data_f32(grad_target);
             for (size_t i = 0; i < n; i++)
-                gt[i] = b_I[i]*I[i] - b_J2[i]*J[i] + b_IJ[i];
+                gt[i] = (b_I[i]*I[i] - b_J2[i]*J[i] + b_IJ[i]) * inv_ks2;
         }
     }
 

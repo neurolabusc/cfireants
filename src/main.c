@@ -77,6 +77,7 @@ typedef struct {
     int downsample_mode;
     int initial_moving_transform;  /* 0=none, 1=moments */
     int try_identity;              /* 1=also try identity+COM in moments */
+    const char *init_affine_path;  /* optional: initial 4x4 physical affine from file */
     int verbose;  /* 0=silent (errors only), 1=summary, 2=debug (per-iter) */
 } cli_config_t;
 
@@ -250,6 +251,7 @@ static void print_usage(const char *prog) {
         "Initial transform:\n"
         "  --moments                   Initialize with center-of-mass + orientation (default)\n"
         "  --no-moments                Skip moments initialization\n"
+        "  --init-affine <file>        Load 4x4 physical affine from text file (skips linear stages)\n"
         "\n"
         "Skull stripping:\n"
         "  --skullstrip <mask.nii.gz>  Brain mask in template/moving space. Warps mask to subject\n"
@@ -396,6 +398,8 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
             cfg->initial_moving_transform = 1;
         } else if (strcmp(arg, "--no-moments") == 0) {
             cfg->initial_moving_transform = 0;
+        } else if (strcmp(arg, "--init-affine") == 0) {
+            NEED_ARG(); cfg->init_affine_path = argv[++i];
         } else if (strcmp(arg, "--skullstrip") == 0) {
             NEED_ARG(); cfg->skullstrip_mask = argv[++i];
         } else if (strcmp(arg, "--backend") == 0) {
@@ -547,6 +551,23 @@ int main(int argc, char **argv) {
         for (int j = 0; j < 4; j++)
             affine_44[i][j] = affine_mat[i][j];
     affine_44[3][3] = 1.0f;
+
+    /* Override with external affine if provided (for cross-implementation testing) */
+    if (cfg.init_affine_path) {
+        FILE *af = fopen(cfg.init_affine_path, "r");
+        if (!af) { fprintf(stderr, "Cannot open --init-affine file: %s\n", cfg.init_affine_path); return 1; }
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                if (fscanf(af, "%f", &affine_44[i][j]) != 1) {
+                    fprintf(stderr, "Failed to read 4x4 affine from %s\n", cfg.init_affine_path); fclose(af); return 1;
+                }
+        fclose(af);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 4; j++)
+                affine_mat[i][j] = affine_44[i][j];
+        if (cfireants_verbose >= 1)
+            fprintf(stderr, "Loaded initial affine from %s\n", cfg.init_affine_path);
+    }
 
     tensor_t final_moved = {0};
     (void)0; /* final_ncc removed — NCC printed per-stage */

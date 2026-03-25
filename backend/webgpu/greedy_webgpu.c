@@ -122,6 +122,7 @@ int greedy_register_webgpu(const image_t *fixed, const image_t *moving,
 
             free(h_old);free(h_3dhw);free(h_3dhw_new);free(h_new);
             if(d_ea){wgpuBufferRelease(d_ea);wgpuBufferRelease(d_eas);d_ea=NULL;}
+            step_t=0;
         }
         if(!d_ea) {
             d_ea=wgpu_create_buffer(n3*4,u,"ea");

@@ -267,11 +267,12 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
             syn_metal_free_buf(d_t1, t1_buf);
             syn_metal_free_buf(d_t2, t2_buf);
 
-            /* Reset optimizer state */
+            /* Reset optimizer state (matching Python: new WarpAdam per scale) */
             if (d_fwd_m) { syn_metal_free_buf(d_fwd_m, fwd_m_buf); d_fwd_m = NULL; }
             if (d_fwd_v) { syn_metal_free_buf(d_fwd_v, fwd_v_buf); d_fwd_v = NULL; }
             if (d_rev_m) { syn_metal_free_buf(d_rev_m, rev_m_buf); d_rev_m = NULL; }
             if (d_rev_v) { syn_metal_free_buf(d_rev_v, rev_v_buf); d_rev_v = NULL; }
+            fwd_step = 0; rev_step = 0;
         }
 
         if (!d_fwd_m) {

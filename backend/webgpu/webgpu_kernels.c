@@ -481,8 +481,7 @@ void wgpu_fused_cc_loss(
     /* Steps 4-6: Backward */
     if (grad_pred) {
         int cgt = (grad_target != NULL) ? 1 : 0;
-        /* Multiply by kv to compensate for mean-based box filter adjoint */
-        float gO = -1.0f / n * kernel_volume;
+        float gO = -1.0f / n;
 
         /* Step 4: bwd_modify — overwrite the 5 buffers with gradient multipliers.
          * We do this on CPU since the data is small and avoids another shader. */
@@ -600,9 +599,11 @@ void wgpu_fused_cc_loss(
             wgpu_read_buffer(pred, 0, h_pred_, sz);
             wgpu_read_buffer(target, 0, h_tgt_, sz);
 
+            /* Scale by 1/ks² to match Python cc.py autograd (applied AFTER box filter adjoint) */
+            float inv_ks2 = 1.0f / (float)(ks * ks);
             float *h_gp = (float*)malloc(sz);
             for (int i = 0; i < n; i++)
-                h_gp[i] = gini_a[i]*h_tgt_[i] - gini_b[i]*h_pred_[i] + gini_mu[i];
+                h_gp[i] = (gini_a[i]*h_tgt_[i] - gini_b[i]*h_pred_[i] + gini_mu[i]) * inv_ks2;
             wgpu_write_buffer(grad_pred, 0, h_gp, sz);
 
             if (cgt) {
@@ -611,7 +612,7 @@ void wgpu_fused_cc_loss(
                 wgpu_read_buffer(b_IJ, 0, gini_mu2, sz);
                 float *h_gt = (float*)malloc(sz);
                 for (int i = 0; i < n; i++)
-                    h_gt[i] = gini_a[i]*h_pred_[i] - gini_c[i]*h_tgt_[i] + gini_mu2[i];
+                    h_gt[i] = (gini_a[i]*h_pred_[i] - gini_c[i]*h_tgt_[i] + gini_mu2[i]) * inv_ks2;
                 wgpu_write_buffer(grad_target, 0, h_gt, sz);
                 free(gini_c); free(gini_mu2); free(h_gt);
             }

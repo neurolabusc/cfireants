@@ -207,9 +207,10 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
 
             greedy_metal_free_buf(d_resized_3dhw, resized_3dhw_buf);
 
-            /* Reset optimizer state */
+            /* Reset optimizer state (matching Python: new WarpAdam per scale) */
             if (d_exp_avg) { greedy_metal_free_buf(d_exp_avg, exp_avg_buf); d_exp_avg = NULL; }
             if (d_exp_avg_sq) { greedy_metal_free_buf(d_exp_avg_sq, exp_avg_sq_buf); d_exp_avg_sq = NULL; }
+            step_t = 0;
         }
 
         /* Allocate optimizer state if needed */

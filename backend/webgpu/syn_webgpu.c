@@ -183,6 +183,7 @@ int syn_register_webgpu(const image_t *fixed, const image_t *moving,
 
             free(h_old);free(h_3dhw);free(h_3dhw_new);free(h_new);
             if(d_fea){wgpuBufferRelease(d_fea);wgpuBufferRelease(d_fev);wgpuBufferRelease(d_rea);wgpuBufferRelease(d_rev);d_fea=NULL;}
+            fwd_step=0; rev_step=0;
         }
         if(!d_fea){
             d_fea=wgpu_create_buffer(n3*4,u,"fea");wgpu_tensor_fill_buf(d_fea,0,(int)n3);

@@ -26,6 +26,12 @@ void cuda_conv1d_axis(const float *in, float *out,
 void cuda_box_filter_axis(const float *in, float *out,
                           int D, int H, int W, int ks, int axis, float scale);
 
+/* Scale kernel for gradient correction */
+__global__ void fcc_scale_kernel(float *data, float scale, long n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] *= scale;
+}
+
 /* ------------------------------------------------------------------ */
 /* Kernel 1: Create intermediates [B, 5C, D, H, W]                    */
 /* Pack: [I, J, I², J², IJ]                                           */
@@ -236,11 +242,7 @@ void cuda_fused_cc_loss(
     /* Steps 4-6: Backward (if gradient requested) */
     if (grad_pred) {
         int compute_grad_target = (grad_target_out != NULL);
-        /* The box filter computes means (1/ks per axis). Its adjoint also applies
-         * 1/ks per axis, introducing an extra factor of 1/kv in the gradient.
-         * Python's cc.py uses sum-based separable filtering (kernel=[1,...,1]),
-         * whose adjoint preserves magnitude. Multiply by kv to compensate. */
-        float grad_output_val = -1.0f / spatial * kernel_volume;
+        float grad_output_val = -1.0f / spatial;
 
         /* Step 4: Modify intermediates with gradient multipliers */
         fcc_bwd_modify_kernel<<<blocks, FCC_BLOCK>>>(
@@ -253,6 +255,16 @@ void cuda_fused_cc_loss(
         /* Step 6: Compute final gradients */
         fcc_bwd_grads_kernel<<<blocks, FCC_BLOCK>>>(
             interm, pred, target, grad_pred, grad_target_out, spatial);
+
+        /* The box filter uses mean scaling (1/ks per axis). The forward NCC
+         * formula absorbs this via kv factors in A,B,C, but the backward adjoint
+         * introduces an extra 1/ks^2 scaling vs Python's autograd.
+         * Fix: divide final gradient by ks^2 to match Python cc.py. */
+        float inv_ks2 = 1.0f / (float)(ks * ks);
+        int grad_blocks = (spatial + FCC_BLOCK - 1) / FCC_BLOCK;
+        fcc_scale_kernel<<<grad_blocks, FCC_BLOCK>>>(grad_pred, inv_ks2, spatial);
+        if (grad_target_out)
+            fcc_scale_kernel<<<grad_blocks, FCC_BLOCK>>>(grad_target_out, inv_ks2, spatial);
     }
 }
 

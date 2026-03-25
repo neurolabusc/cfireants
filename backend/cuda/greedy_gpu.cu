@@ -171,10 +171,10 @@ int greedy_register_gpu(const image_t *fixed, const image_t *moving,
             cuda_permute_3dhw_to_dhw3(d_resized_3dhw, d_warp, spatial);
             cudaFree(d_resized_3dhw);
 
-            /* Resize optimizer state similarly (or reset) */
-            /* Python default: reset=False means interpolate. For simplicity, reset. */
+            /* Reset optimizer state (matching Python: new WarpAdam per scale) */
             cudaFree(d_exp_avg); cudaFree(d_exp_avg_sq);
             d_exp_avg = NULL; d_exp_avg_sq = NULL;
+            step_t = 0;
         }
 
         /* Allocate optimizer state if needed */
