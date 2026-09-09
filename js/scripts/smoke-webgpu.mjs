@@ -130,11 +130,16 @@ await new Promise((resolveListen, reject) => {
 const address = server.address()
 if (!address || typeof address === 'string') throw new Error('HTTP server did not bind')
 
+// Twenty minutes: the CI job allows thirty. Real GPUs finish in seconds.
+const RUN_BUDGET_MS = 1_200_000
 let browser
 try {
   browser = await puppeteer.launch({
     executablePath: chromeExecutable(),
     headless: true,
+    // The whole CPU+GPU run is one evaluate() call; puppeteer's default 180 s
+    // protocol timeout is shorter than SwiftShader needs on a 2-core runner.
+    protocolTimeout: RUN_BUDGET_MS,
     args: process.platform === 'linux' ? [
       '--no-sandbox',
       '--enable-unsafe-webgpu',
@@ -146,16 +151,18 @@ try {
     ] : ['--enable-unsafe-webgpu'],
   })
   const page = await browser.newPage()
-  page.setDefaultTimeout(300_000)
+  page.setDefaultTimeout(RUN_BUDGET_MS)
   page.on('console', (message) => console.log(`browser: ${message.text()}`))
   page.on('pageerror', (error) => console.error(`browser error: ${error.message}`))
   await page.goto(`http://127.0.0.1:${address.port}/`, { waitUntil: 'load' })
 
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async (RUN_BUDGET_MS) => {
     const { register } = await import('/package/dist/index.js')
     if (!navigator.gpu) throw new Error('navigator.gpu is unavailable')
+    console.log('smoke: requesting adapter')
     const adapter = await navigator.gpu.requestAdapter()
     if (!adapter) throw new Error('requestAdapter returned null')
+    console.log(`smoke: adapter ${adapter.info?.device || adapter.info?.description || '?'}`)
 
     const [fixedBuffer, movingBuffer] = await Promise.all([
       fetch('/fixed.nii').then((response) => response.arrayBuffer()),
@@ -172,10 +179,13 @@ try {
     // Exercise the package's default deployment path too: worker bootstrap,
     // dynamic module import, colocated WASM discovery, and WebGPU acquisition
     // all happen inside the packaged worker rather than this test page.
-    const common = { stages, worker: true, gzip: false, timeoutMs: 300_000 }
+    const common = { stages, worker: true, gzip: false, timeoutMs: RUN_BUDGET_MS,
+      onLog: (line) => console.log(line) }
+    console.log('smoke: cpu run')
     const cpu = await register(fixedBuffer, movingBuffer, {
       ...common, backend: 'cpu', threads: false,
     })
+    console.log('smoke: webgpu run')
     const gpu = await register(fixedBuffer, movingBuffer, {
       ...common, backend: 'webgpu',
     })
@@ -213,7 +223,7 @@ try {
       gpuMs: gpu.elapsedMs,
       adapter: adapter.info?.device || adapter.info?.description || 'WebGPU adapter',
     }
-  })
+  }, RUN_BUDGET_MS)
 
   if (result.cpuVariant !== 'st' || result.gpuVariant !== 'gpu')
     throw new Error(`wrong variants: CPU=${result.cpuVariant}, WebGPU=${result.gpuVariant}`)
