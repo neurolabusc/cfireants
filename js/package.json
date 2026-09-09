@@ -1,6 +1,6 @@
 {
   "name": "cfireants",
-  "version": "0.1.20260324",
+  "version": "0.1.20260909",
   "description": "Browser medical image registration -- rigid, affine, SyN and greedy deformable -- as a wasm module, threaded where the page is cross-origin isolated. A C port of FireANTs.",
   "type": "module",
   "main": "dist/index.js",

@@ -31,7 +31,7 @@ carries the immutable tarball and SHA-256 file produced by
 `.github/workflows/release-npm.yml`:
 
 ```sh
-npm install https://github.com/neurolabusc/cfireants/releases/download/v0.1.20260324/cfireants-0.1.20260324.tgz
+npm install https://github.com/neurolabusc/cfireants/releases/download/v0.1.20260909/cfireants-0.1.20260909.tgz
 ```
 
 npm records the URL and integrity hash in the lockfile, so installs are pinned.

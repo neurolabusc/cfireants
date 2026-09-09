@@ -12,7 +12,7 @@
  *     -o output.nii.gz
  */
 
-#define CFIREANTS_VERSION "0.1.20260324"
+#define CFIREANTS_VERSION "0.1.20260909"
 
 #include "cfireants/tensor.h"
 #include "cfireants/image.h"
