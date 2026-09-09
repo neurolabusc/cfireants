@@ -66,133 +66,6 @@ static int resize_disp(const tensor_t *in, tensor_t *out, int nD, int nH, int nW
 }
 
 /* Separable Gaussian blur on [D,H,W,3] interleaved displacement field (in-place) */
-static void blur_disp_dhw3(float *data, int D, int H, int W, float sigma) {
-    if (sigma <= 0) return;
-    long spatial = (long)D * H * W;
-    size_t n3 = (size_t)spatial * 3;
-    float *scratch = (float *)malloc(n3 * sizeof(float));
-    float *kern = NULL; int klen = 0;
-    make_gaussian_kernel(sigma, 2.0f, &kern, &klen);
-    int r = klen / 2;
-
-    /* Axis 0 (D): data → scratch */
-    for (long s = 0; s < spatial; s++) {
-        int w = s % W, h = (int)((s / W) % H), d = (int)(s / ((long)H * W));
-        float s0=0,s1=0,s2=0;
-        for (int k = 0; k < klen; k++) {
-            int dd = d + k - r;
-            if (dd >= 0 && dd < D) {
-                long si = ((long)dd*H+h)*W*3+w*3;
-                s0+=data[si]*kern[k]; s1+=data[si+1]*kern[k]; s2+=data[si+2]*kern[k];
-            }
-        }
-        long di=s*3; scratch[di]=s0; scratch[di+1]=s1; scratch[di+2]=s2;
-    }
-    /* Axis 1 (H): scratch → data */
-    for (long s = 0; s < spatial; s++) {
-        int w = s % W, h = (int)((s / W) % H), d = (int)(s / ((long)H * W));
-        float s0=0,s1=0,s2=0;
-        for (int k = 0; k < klen; k++) {
-            int hh = h + k - r;
-            if (hh >= 0 && hh < H) {
-                long si = ((long)d*H+hh)*W*3+w*3;
-                s0+=scratch[si]*kern[k]; s1+=scratch[si+1]*kern[k]; s2+=scratch[si+2]*kern[k];
-            }
-        }
-        long di=s*3; data[di]=s0; data[di+1]=s1; data[di+2]=s2;
-    }
-    /* Axis 2 (W): data → scratch */
-    for (long s = 0; s < spatial; s++) {
-        int w = s % W, h = (int)((s / W) % H), d = (int)(s / ((long)H * W));
-        float s0=0,s1=0,s2=0;
-        for (int k = 0; k < klen; k++) {
-            int ww = w + k - r;
-            if (ww >= 0 && ww < W) {
-                long si = ((long)d*H+h)*W*3+ww*3;
-                s0+=data[si]*kern[k]; s1+=data[si+1]*kern[k]; s2+=data[si+2]*kern[k];
-            }
-        }
-        long di=s*3; scratch[di]=s0; scratch[di+1]=s1; scratch[di+2]=s2;
-    }
-    memcpy(data, scratch, n3 * sizeof(float));
-    free(scratch); free(kern);
-}
-
-/* Compositive warp update: out[x] = update[x] + interp(warp, identity + update[x]) */
-static void compositive_update(const float *warp, float *update,
-                                int D, int H, int W) {
-    long spatial = (long)D * H * W;
-    for (long s = 0; s < spatial; s++) {
-        int w = s % W, h = (int)((s / W) % H), d = (int)(s / ((long)H * W));
-        float nx = (W > 1) ? 2.0f * w / (W - 1) - 1.0f : 0.0f;
-        float ny = (H > 1) ? 2.0f * h / (H - 1) - 1.0f : 0.0f;
-        float nz = (D > 1) ? 2.0f * d / (D - 1) - 1.0f : 0.0f;
-        float sx = nx + update[s*3], sy = ny + update[s*3+1], sz = nz + update[s*3+2];
-        float ix = (sx + 1.0f) * 0.5f * (W - 1);
-        float iy = (sy + 1.0f) * 0.5f * (H - 1);
-        float iz = (sz + 1.0f) * 0.5f * (D - 1);
-        int x0 = (int)floorf(ix), y0 = (int)floorf(iy), z0 = (int)floorf(iz);
-        float fx = ix - x0, fy = iy - y0, fz = iz - z0;
-        #define WI(dd,hh,ww,c) ((dd)>=0&&(dd)<D&&(hh)>=0&&(hh)<H&&(ww)>=0&&(ww)<W?\
-            warp[((long)(dd)*H+(hh))*W*3+(ww)*3+(c)]:0.0f)
-        float wt[8] = {(1-fx)*(1-fy)*(1-fz),fx*(1-fy)*(1-fz),(1-fx)*fy*(1-fz),fx*fy*(1-fz),
-                        (1-fx)*(1-fy)*fz,fx*(1-fy)*fz,(1-fx)*fy*fz,fx*fy*fz};
-        int dz[8]={z0,z0,z0,z0,z0+1,z0+1,z0+1,z0+1};
-        int dy[8]={y0,y0,y0+1,y0+1,y0,y0,y0+1,y0+1};
-        int dx[8]={x0,x0+1,x0,x0+1,x0,x0+1,x0,x0+1};
-        for (int c = 0; c < 3; c++) {
-            float val = 0;
-            for (int k = 0; k < 8; k++) val += wt[k] * WI(dz[k],dy[k],dx[k],c);
-            update[s*3+c] += val;
-        }
-        #undef WI
-    }
-}
-
-/* WarpAdam step for one displacement field (matching GPU syn_warp_adam_step) */
-static void warp_adam_step(float *warp, const float *grad, float *exp_avg, float *exp_avg_sq,
-                            float *adam_dir, int D, int H, int W,
-                            int *step_t, float lr, float beta1, float beta2, float eps,
-                            float smooth_grad_sigma, float smooth_warp_sigma) {
-    long spatial = (long)D * H * W;
-    size_t n3 = (size_t)spatial * 3;
-
-    (*step_t)++;
-    float bc1 = 1.0f - powf(beta1, (float)*step_t);
-    float bc2 = 1.0f - powf(beta2, (float)*step_t);
-
-    /* Moments update + direction */
-    for (size_t i = 0; i < n3; i++) {
-        float g = grad[i];
-        exp_avg[i] = beta1 * exp_avg[i] + (1.0f - beta1) * g;
-        exp_avg_sq[i] = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g * g;
-        adam_dir[i] = (exp_avg[i] / bc1) / (sqrtf(exp_avg_sq[i] / bc2) + eps);
-    }
-
-    /* Normalize by max L2 norm */
-    float gradmax = eps;
-    for (long s = 0; s < spatial; s++) {
-        float dx = adam_dir[s*3], dy = adam_dir[s*3+1], dz = adam_dir[s*3+2];
-        float l2 = sqrtf(dx*dx + dy*dy + dz*dz);
-        if (l2 > gradmax) gradmax = l2;
-    }
-    if (gradmax < 1.0f) gradmax = 1.0f;
-    float half_res = 1.0f / (float)((D > H ? (D > W ? D : W) : (H > W ? H : W)) - 1);
-    float sf = half_res / gradmax * (-lr);
-    for (size_t i = 0; i < n3; i++)
-        adam_dir[i] *= sf;
-
-    /* Compositive update */
-    compositive_update(warp, adam_dir, D, H, W);
-
-    /* Smooth result */
-    if (smooth_warp_sigma > 0)
-        blur_disp_dhw3(adam_dir, D, H, W, smooth_warp_sigma);
-
-    /* warp = adam_dir */
-    memcpy(warp, adam_dir, n3 * sizeof(float));
-}
-
 int syn_register(const image_t *fixed, const image_t *moving,
                  const float init_affine_44[4][4],
                  syn_opts_t opts, syn_result_t *result) {
@@ -305,7 +178,7 @@ int syn_register(const image_t *fixed, const image_t *moving,
         }
         fwd_step = 0; rev_step = 0;
 
-        fprintf(stderr, "  SyN scale %d: fixed[%d,%d,%d] moving_blur[%d,%d,%d] x %d iters\n",
+        if (cfireants_verbose >= 2) fprintf(stderr, "  SyN scale %d: fixed[%d,%d,%d] moving_blur[%d,%d,%d] x %d iters\n",
                 scale, dD, dH, dW, mbD, mbH, mbW, iters);
 
         /* Generate base grids */
@@ -355,22 +228,18 @@ int syn_register(const image_t *fixed, const image_t *moving,
             /* 6. Smooth gradients */
             float *gfwd = tensor_data_f32(&grad_fwd_grid);
             float *grev = tensor_data_f32(&grad_rev_grid);
-            if (opts.smooth_grad_sigma > 0) {
-                blur_disp_dhw3(gfwd, dD, dH, dW, opts.smooth_grad_sigma);
-                blur_disp_dhw3(grev, dD, dH, dW, opts.smooth_grad_sigma);
-            }
+            cpu_blur_disp_dhw3(gfwd, dD, dH, dW, opts.smooth_grad_sigma);
+            cpu_blur_disp_dhw3(grev, dD, dH, dW, opts.smooth_grad_sigma);
 
             /* 7-8. WarpAdam step for both warps */
-            warp_adam_step(tensor_data_f32(&fwd_disp), gfwd,
-                            tensor_data_f32(&fwd_m), tensor_data_f32(&fwd_v),
-                            adam_dir_fwd, dD, dH, dW,
-                            &fwd_step, opts.lr, beta1, beta2, eps,
-                            opts.smooth_grad_sigma, opts.smooth_warp_sigma);
-            warp_adam_step(tensor_data_f32(&rev_disp), grev,
-                            tensor_data_f32(&rev_m), tensor_data_f32(&rev_v),
-                            adam_dir_rev, dD, dH, dW,
-                            &rev_step, opts.lr, beta1, beta2, eps,
-                            opts.smooth_grad_sigma, opts.smooth_warp_sigma);
+            cpu_warp_adam_step(tensor_data_f32(&fwd_disp), gfwd,
+                               tensor_data_f32(&fwd_m), tensor_data_f32(&fwd_v),
+                               adam_dir_fwd, dD, dH, dW, &fwd_step,
+                               opts.lr, beta1, beta2, eps, opts.smooth_warp_sigma);
+            cpu_warp_adam_step(tensor_data_f32(&rev_disp), grev,
+                               tensor_data_f32(&rev_m), tensor_data_f32(&rev_v),
+                               adam_dir_rev, dD, dH, dW, &rev_step,
+                               opts.lr, beta1, beta2, eps, opts.smooth_warp_sigma);
 
             /* Cleanup iteration tensors (before potential break) */
             tensor_free(&fwd_sg); tensor_free(&rev_sg);
@@ -379,12 +248,12 @@ int syn_register(const image_t *fixed, const image_t *moving,
             tensor_free(&grad_fwd_grid); tensor_free(&grad_rev_grid);
 
             if (it % 50 == 0 || it == iters - 1)
-                fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
+                if (cfireants_verbose >= 2) fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
 
             if (fabsf(loss - prev_loss) < opts.tolerance) {
                 converge_count++;
                 if (converge_count >= opts.max_tolerance_iters) {
-                    fprintf(stderr, "    Converged at iter %d\n", it);
+                    if (cfireants_verbose >= 2) fprintf(stderr, "    Converged at iter %d\n", it);
                     break;
                 }
             } else { converge_count = 0; }
@@ -458,7 +327,7 @@ int syn_evaluate(const image_t *fixed, const image_t *moving,
     }
 
     /* Invert reverse warp (550 iterations of fixed-point, matching GPU) */
-    fprintf(stderr, "  Warp inverse: 550 iters at [%d,%d,%d]\n", fD, fH, fW);
+    if (cfireants_verbose >= 2) fprintf(stderr, "  Warp inverse: 550 iters at [%d,%d,%d]\n", fD, fH, fW);
     float *inv_rev = (float *)malloc(n3 * sizeof(float));
     cpu_warp_inverse(tensor_data_f32(&full_rev), inv_rev, fD, fH, fW, 550);
 

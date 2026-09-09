@@ -1,8 +1,4 @@
-// reduction.wgsl - Reduction operations (sum)
-//
-// Two-pass reduction: each workgroup reduces a chunk, writes partial result.
-// Host reads partials and does final sum (matching CUDA pattern).
-
+// Workgroup partial-sum reduction.
 struct Params {
     n: u32,
     _pad0: u32,
@@ -23,24 +19,18 @@ fn reduce_sum(@builtin(global_invocation_id) gid: vec3<u32>,
               @builtin(num_workgroups) nwg: vec3<u32>) {
     let i = gid.x + gid.y * nwg.x * 256u;
     let tid = lid.x;
-
-    // Load element or zero
     if (i < params.n) {
         shared_data[tid] = input[i];
     } else {
         shared_data[tid] = 0.0;
     }
     workgroupBarrier();
-
-    // Tree reduction in shared memory
     for (var s = 128u; s > 0u; s = s >> 1u) {
         if (tid < s) {
             shared_data[tid] = shared_data[tid] + shared_data[tid + s];
         }
         workgroupBarrier();
     }
-
-    // Write partial sum
     if (tid == 0u) {
         output[wid.x + wid.y * nwg.x] = shared_data[0];
     }

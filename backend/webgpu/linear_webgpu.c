@@ -52,29 +52,6 @@ static void quat_rotmat_jacobian(const float q[4], float dR_dq[4][3][3]) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Affine grid backward on CPU (download grad_grid, reduce to 12)      */
-/* ------------------------------------------------------------------ */
-
-static void cpu_affine_grid_backward(const float *h_grad_grid, int D, int H, int W,
-                                      float h_dL_dA[12]) {
-    memset(h_dL_dA, 0, 12 * sizeof(float));
-    for (int d = 0; d < D; d++) {
-        float nz = (D > 1) ? (2.0f * d / (D - 1) - 1.0f) : 0.0f;
-        for (int h = 0; h < H; h++) {
-            float ny = (H > 1) ? (2.0f * h / (H - 1) - 1.0f) : 0.0f;
-            for (int w = 0; w < W; w++) {
-                float nx = (W > 1) ? (2.0f * w / (W - 1) - 1.0f) : 0.0f;
-                int idx = ((d * H + h) * W + w) * 3;
-                float coord[4] = {nx, ny, nz, 1.0f};
-                for (int i = 0; i < 3; i++)
-                    for (int j = 0; j < 4; j++)
-                        h_dL_dA[i * 4 + j] += h_grad_grid[idx + i] * coord[j];
-            }
-        }
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /* Helper: downsample image (delegates to shared wgpu_downsample_image) */
 /* ------------------------------------------------------------------ */
 
@@ -87,6 +64,12 @@ static void blur_moving_gpu(WGPUBuffer buf, int D, int H, int W,
     wgpu_blur_volume(buf, D, H, W, sig_d, sig_h, sig_w);
 }
 
+static int linear_webgpu_abort(const char *stage, const char *message) {
+    fprintf(stderr, "%s: %s\n", stage, message);
+    wgpu_context_cleanup();
+    return -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* GPU rigid registration (WebGPU)                                     */
 /* ------------------------------------------------------------------ */
@@ -95,6 +78,7 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
                            const moments_result_t *moments_init,
                            rigid_opts_t opts, rigid_result_t *result)
 {
+    wgpu_clear_fatal_error();
     memset(result, 0, sizeof(rigid_result_t));
 
     int fD=fixed->data.shape[2], fH=fixed->data.shape[3], fW=fixed->data.shape[4];
@@ -109,6 +93,9 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
     fprintf(stderr, "  rigid: buffers created, writing data...\n");
     wgpu_write_buffer(d_fixed, 0, fixed->data.data, (size_t)fD*fH*fW*4);
     wgpu_write_buffer(d_moving, 0, moving->data.data, (size_t)mD*mH*mW*4);
+    if (wgpu_had_fatal_error())
+        return linear_webgpu_abort("rigid_register_webgpu",
+                                   "image allocation failed");
     fprintf(stderr, "  rigid: data uploaded\n");
 
     /* Initialize parameters on CPU (identical to CUDA) */
@@ -146,15 +133,13 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
         if (dD < 8) dD = 8; if (dH < 8) dH = 8; if (dW < 8) dW = 8;
         if (scale == 1) { dD = fD; dH = fH; dW = fW; }
 
-        int mdD = (scale > 1) ? mD/scale : mD;
-        int mdH = (scale > 1) ? mH/scale : mH;
-        int mdW = (scale > 1) ? mW/scale : mW;
-        if (mdD < 8) mdD = 8; if (mdH < 8) mdH = 8; if (mdW < 8) mdW = 8;
+        int mdD, mdH, mdW;
+        moving_pyramid_size(scale, fixed->meta.spacing, moving->meta.spacing,
+                            mD, mH, mW, &mdD, &mdH, &mdW);
         if (scale == 1) { mdD = mD; mdH = mH; mdW = mW; }
 
         long spatial = (long)dD * dH * dW;
         long n3 = spatial * 3;
-        long mSDown = (long)mdD * mdH * mdW;
 
         /* Downsample */
         fprintf(stderr, "  rigid: scale %d, downsampling...\n", scale);
@@ -168,6 +153,9 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
             d_fdown = d_fixed; d_mdown = d_moving;
             mdD = mD; mdH = mH; mdW = mW;
         }
+        if (!d_fdown || !d_mdown || wgpu_had_fatal_error())
+            return linear_webgpu_abort("rigid_register_webgpu",
+                                       "pyramid allocation failed");
 
         /* Allocate iteration buffers */
         WGPUBuffer d_aff = wgpu_create_buffer(12*4, usage, "aff");
@@ -175,6 +163,14 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
         WGPUBuffer d_moved = wgpu_create_buffer(spatial*4, usage, "moved");
         WGPUBuffer d_grad_moved = wgpu_create_buffer(spatial*4, usage, "gmoved");
         WGPUBuffer d_grad_grid = wgpu_create_buffer(n3*4, usage, "ggrad");
+        wgpu_cc_workspace_t cc_workspace = {0};
+        if (opts.loss_type == LOSS_CC &&
+            wgpu_cc_workspace_init(&cc_workspace, (int)spatial, 1) != 0)
+            return linear_webgpu_abort("rigid_register_webgpu",
+                                       "CC workspace allocation failed");
+        if (wgpu_had_fatal_error())
+            return linear_webgpu_abort("rigid_register_webgpu",
+                                       "per-scale workspace allocation failed");
 
         adam_step = 0;
         memset(adam_m, 0, sizeof(adam_m));
@@ -225,8 +221,6 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
             wgpu_grid_sample_3d_fwd(d_mdown, d_grid, d_moved,
                                      1, 1, mdD, mdH, mdW, dD, dH, dW);
 
-            /* Flush forward batch before loss computation */
-            wgpu_flush();
             float loss;
             if (opts.loss_type == LOSS_MI) {
                 int nbins = opts.mi_num_bins > 0 ? opts.mi_num_bins : 32;
@@ -234,15 +228,18 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
                                      dD, dH, dW, nbins, &loss);
             } else {
                 wgpu_cc_loss_3d_raw(d_moved, d_fdown, d_grad_moved,
-                                     dD, dH, dW, opts.cc_kernel_size, &loss);
+                                     dD, dH, dW, opts.cc_kernel_size, &loss,
+                                     &cc_workspace);
             }
+            if (wgpu_had_fatal_error()) break;
 
-            /* Backward pass — no batch needed (each op flushes internally) */
+            /* The loss helper resumes the batch after its small readbacks. */
             wgpu_grid_sample_3d_bwd(d_grad_moved, d_mdown, d_grid,
                                      d_grad_grid, 1, 1, mdD, mdH, mdW, dD, dH, dW);
             /* affine_grid_backward does wgpu_read_buffer which auto-flushes */
             float dL_dA_comb[12];
             wgpu_affine_grid_backward(d_grad_grid, dD, dH, dW, dL_dA_comb);
+            if (wgpu_had_fatal_error()) break;
 
             /* Chain rule: dL/d(phys) */
             mat44d dL_comb_44 = {{{0}}};
@@ -305,6 +302,10 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
 
             for (int k = 0; k < 4; k++) quat[k] = params7[k];
             for (int k = 0; k < 3; k++) transl[k] = params7[4+k];
+            float qnorm = sqrtf(quat[0]*quat[0] + quat[1]*quat[1] +
+                                quat[2]*quat[2] + quat[3]*quat[3]);
+            if (qnorm > 1e-8f)
+                for (int k = 0; k < 4; k++) quat[k] /= qnorm;
 
             if (it % 50 == 0 || it == iters - 1)
                 fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
@@ -316,10 +317,14 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
             prev_loss = loss;
         }
 
-        wgpuBufferRelease(d_aff); wgpuBufferRelease(d_grid);
-        wgpuBufferRelease(d_moved); wgpuBufferRelease(d_grad_moved);
-        wgpuBufferRelease(d_grad_grid);
-        if (scale > 1) { wgpuBufferRelease(d_fdown); wgpuBufferRelease(d_mdown); }
+        wgpu_release_buffer(d_aff); wgpu_release_buffer(d_grid);
+        wgpu_release_buffer(d_moved); wgpu_release_buffer(d_grad_moved);
+        wgpu_release_buffer(d_grad_grid);
+        wgpu_cc_workspace_cleanup(&cc_workspace);
+        if (scale > 1) { wgpu_release_buffer(d_fdown); wgpu_release_buffer(d_mdown); }
+        if (wgpu_had_fatal_error())
+            return linear_webgpu_abort("rigid_register_webgpu",
+                                       "GPU iteration failed");
     }
 
     /* Extract final rigid matrix */
@@ -341,6 +346,9 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
         WGPUBuffer d_aff2 = wgpu_create_buffer(12*4, usage, "a2");
         WGPUBuffer d_grid2 = wgpu_create_buffer((size_t)fD*fH*fW*3*4, usage, "g2");
         WGPUBuffer d_moved2 = wgpu_create_buffer((size_t)fD*fH*fW*4, usage, "m2");
+        if (wgpu_had_fatal_error())
+            return linear_webgpu_abort("rigid_register_webgpu",
+                                       "evaluation allocation failed");
 
         float phys44[4][4] = {{0}};
         for (int i = 0; i < 3; i++) for (int j = 0; j < 4; j++) phys44[i][j] = result->rigid_mat[i][j];
@@ -353,11 +361,15 @@ int rigid_register_webgpu(const image_t *fixed, const image_t *moving,
         wgpu_write_buffer(d_aff2, 0, ha, 12*4);
         wgpu_affine_grid_3d(d_aff2, d_grid2, 1, fD, fH, fW);
         wgpu_grid_sample_3d_fwd(d_moving, d_grid2, d_moved2, 1,1, mD,mH,mW, fD,fH,fW);
-        wgpu_cc_loss_3d_raw(d_moved2, d_fixed, NULL, fD, fH, fW, 9, &result->ncc_loss);
-        wgpuBufferRelease(d_aff2); wgpuBufferRelease(d_grid2); wgpuBufferRelease(d_moved2);
+        wgpu_cc_loss_3d_raw(d_moved2, d_fixed, NULL, fD, fH, fW, 9,
+                            &result->ncc_loss, NULL);
+        wgpu_release_buffer(d_aff2); wgpu_release_buffer(d_grid2); wgpu_release_buffer(d_moved2);
     }
 
-    wgpuBufferRelease(d_fixed); wgpuBufferRelease(d_moving);
+    wgpu_release_buffer(d_fixed); wgpu_release_buffer(d_moving);
+    if (wgpu_had_fatal_error())
+        return linear_webgpu_abort("rigid_register_webgpu",
+                                   "GPU operation failed; result is not trustworthy");
     return 0;
 }
 
@@ -369,6 +381,7 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
                             const float init_rigid_34[3][4],
                             affine_opts_t opts, affine_result_t *result)
 {
+    wgpu_clear_fatal_error();
     memset(result, 0, sizeof(affine_result_t));
 
     int fD=fixed->data.shape[2], fH=fixed->data.shape[3], fW=fixed->data.shape[4];
@@ -379,6 +392,9 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
     WGPUBuffer d_moving = wgpu_create_buffer((size_t)mD*mH*mW*4, usage, "moving");
     wgpu_write_buffer(d_fixed, 0, fixed->data.data, (size_t)fD*fH*fW*4);
     wgpu_write_buffer(d_moving, 0, moving->data.data, (size_t)mD*mH*mW*4);
+    if (wgpu_had_fatal_error())
+        return linear_webgpu_abort("affine_register_webgpu",
+                                   "image allocation failed");
 
     float A[3][4];
     float center[3];
@@ -404,10 +420,12 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
         int scale = opts.scales[si], iters = opts.iterations[si];
         int dD=(scale>1)?fD/scale:fD, dH=(scale>1)?fH/scale:fH, dW=(scale>1)?fW/scale:fW;
         if(dD<8)dD=8;if(dH<8)dH=8;if(dW<8)dW=8;if(scale==1){dD=fD;dH=fH;dW=fW;}
-        int mdD=(scale>1)?mD/scale:mD, mdH=(scale>1)?mH/scale:mH, mdW=(scale>1)?mW/scale:mW;
-        if(mdD<8)mdD=8;if(mdH<8)mdH=8;if(mdW<8)mdW=8;if(scale==1){mdD=mD;mdH=mH;mdW=mW;}
+        int mdD, mdH, mdW;
+        moving_pyramid_size(scale, fixed->meta.spacing, moving->meta.spacing,
+                            mD, mH, mW, &mdD, &mdH, &mdW);
+        if(scale==1){mdD=mD;mdH=mH;mdW=mW;}
 
-        long spatial=(long)dD*dH*dW, n3=spatial*3, mSD=(long)mdD*mdH*mdW;
+        long spatial=(long)dD*dH*dW, n3=spatial*3;
 
         WGPUBuffer d_fdown, d_mdown;
         if (scale > 1) {
@@ -415,12 +433,23 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
             d_mdown = wgpu_downsample_image(d_moving, mD, mH, mW, mdD, mdH, mdW, opts.downsample_mode);
             /* Affine: NO extra blur on moving (unlike rigid) */
         } else { d_fdown=d_fixed; d_mdown=d_moving; mdD=mD;mdH=mH;mdW=mW; }
+        if (!d_fdown || !d_mdown || wgpu_had_fatal_error())
+            return linear_webgpu_abort("affine_register_webgpu",
+                                       "pyramid allocation failed");
 
         WGPUBuffer d_aff = wgpu_create_buffer(12*4, usage, "aff");
         WGPUBuffer d_grid = wgpu_create_buffer(n3*4, usage, "grid");
         WGPUBuffer d_moved = wgpu_create_buffer(spatial*4, usage, "moved");
         WGPUBuffer d_grad_moved = wgpu_create_buffer(spatial*4, usage, "gmov");
         WGPUBuffer d_grad_grid = wgpu_create_buffer(n3*4, usage, "ggrid");
+        wgpu_cc_workspace_t cc_workspace = {0};
+        if (opts.loss_type == LOSS_CC &&
+            wgpu_cc_workspace_init(&cc_workspace, (int)spatial, 1) != 0)
+            return linear_webgpu_abort("affine_register_webgpu",
+                                       "CC workspace allocation failed");
+        if (wgpu_had_fatal_error())
+            return linear_webgpu_abort("affine_register_webgpu",
+                                       "per-scale workspace allocation failed");
 
         adam_step=0; memset(adam_m,0,sizeof(adam_m)); memset(adam_v,0,sizeof(adam_v));
 
@@ -443,26 +472,29 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
             float ha[12]; for(int i=0;i<3;i++) for(int j=0;j<4;j++) ha[i*4+j]=(float)cb.m[i][j];
 
             wgpu_write_buffer(d_aff, 0, ha, 12*4);
+            wgpu_begin_batch();
             wgpu_affine_grid_3d(d_aff, d_grid, 1, dD, dH, dW);
             wgpu_grid_sample_3d_fwd(d_mdown, d_grid, d_moved, 1,1,mdD,mdH,mdW,dD,dH,dW);
-            wgpuDevicePoll(g_wgpu.device, 1, NULL);  /* Ensure forward pass completes */
 
             float loss;
             if (opts.loss_type == LOSS_MI) {
                 int nbins = opts.mi_num_bins > 0 ? opts.mi_num_bins : 32;
-                wgpu_mi_loss_3d_raw(d_moved, d_fdown, d_grad_moved, dD,dH,dW, nbins, &loss);
+                wgpu_mi_loss_3d_raw(d_moved, d_fdown, d_grad_moved,
+                                    dD,dH,dW,nbins,&loss);
             } else {
-                wgpu_cc_loss_3d_raw(d_moved, d_fdown, d_grad_moved, dD,dH,dW, opts.cc_kernel_size, &loss);
+                wgpu_cc_loss_3d_raw(d_moved, d_fdown, d_grad_moved,
+                                    dD,dH,dW,opts.cc_kernel_size,&loss,
+                                    &cc_workspace);
             }
+            if (wgpu_had_fatal_error()) break;
 
             wgpu_grid_sample_3d_bwd(d_grad_moved, d_mdown, d_grid,
                                      d_grad_grid, 1,1,mdD,mdH,mdW,dD,dH,dW);
 
-            float *h_gg = (float *)malloc(n3 * 4);
-            wgpu_read_buffer(d_grad_grid, 0, h_gg, n3 * 4);
             float dL_dA_comb[12];
-            cpu_affine_grid_backward(h_gg, dD, dH, dW, dL_dA_comb);
-            free(h_gg);
+            wgpu_affine_grid_backward(d_grad_grid, dD, dH, dW,
+                                      dL_dA_comb);
+            if (wgpu_had_fatal_error()) break;
 
             mat44d dL44={{{0}}};
             for(int i=0;i<3;i++) for(int j=0;j<4;j++) dL44.m[i][j]=dL_dA_comb[i*4+j];
@@ -493,9 +525,13 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
             prev_loss=loss;
         }
 
-        wgpuBufferRelease(d_aff);wgpuBufferRelease(d_grid);
-        wgpuBufferRelease(d_moved);wgpuBufferRelease(d_grad_moved);wgpuBufferRelease(d_grad_grid);
-        if(scale>1){wgpuBufferRelease(d_fdown);wgpuBufferRelease(d_mdown);}
+        wgpu_release_buffer(d_aff);wgpu_release_buffer(d_grid);
+        wgpu_release_buffer(d_moved);wgpu_release_buffer(d_grad_moved);wgpu_release_buffer(d_grad_grid);
+        wgpu_cc_workspace_cleanup(&cc_workspace);
+        if(scale>1){wgpu_release_buffer(d_fdown);wgpu_release_buffer(d_mdown);}
+        if (wgpu_had_fatal_error())
+            return linear_webgpu_abort("affine_register_webgpu",
+                                       "GPU iteration failed");
     }
 
     /* Extract physical affine */
@@ -510,6 +546,9 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
         WGPUBuffer d_a = wgpu_create_buffer(12*4, usage, "a2");
         WGPUBuffer d_g = wgpu_create_buffer((size_t)fD*fH*fW*3*4, usage, "g2");
         WGPUBuffer d_m2 = wgpu_create_buffer((size_t)fD*fH*fW*4, usage, "m2");
+        if (wgpu_had_fatal_error())
+            return linear_webgpu_abort("affine_register_webgpu",
+                                       "evaluation allocation failed");
         float p44[4][4]={{0}};
         for(int i=0;i<3;i++) for(int j=0;j<4;j++) p44[i][j]=result->affine_mat[i][j];
         p44[3][3]=1;
@@ -520,10 +559,14 @@ int affine_register_webgpu(const image_t *fixed, const image_t *moving,
         wgpu_write_buffer(d_a, 0, ha, 12*4);
         wgpu_affine_grid_3d(d_a,d_g,1,fD,fH,fW);
         wgpu_grid_sample_3d_fwd(d_moving,d_g,d_m2,1,1,mD,mH,mW,fD,fH,fW);
-        wgpu_cc_loss_3d_raw(d_m2,d_fixed,NULL,fD,fH,fW,9,&result->ncc_loss);
-        wgpuBufferRelease(d_a);wgpuBufferRelease(d_g);wgpuBufferRelease(d_m2);
+        wgpu_cc_loss_3d_raw(d_m2,d_fixed,NULL,fD,fH,fW,9,
+                            &result->ncc_loss,NULL);
+        wgpu_release_buffer(d_a);wgpu_release_buffer(d_g);wgpu_release_buffer(d_m2);
     }
 
-    wgpuBufferRelease(d_fixed); wgpuBufferRelease(d_moving);
+    wgpu_release_buffer(d_fixed); wgpu_release_buffer(d_moving);
+    if (wgpu_had_fatal_error())
+        return linear_webgpu_abort("affine_register_webgpu",
+                                   "GPU operation failed; result is not trustworthy");
     return 0;
 }

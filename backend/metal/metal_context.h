@@ -71,6 +71,12 @@ typedef struct {
 
 extern metal_context_t g_metal;
 
+/* Sticky per-registration error state used to propagate asynchronous command,
+ * pipeline, buffer-table, and allocation failures to the stage boundary. */
+int metal_had_fatal_error(void);
+void metal_clear_fatal_error(void);
+void metal_record_fatal_error(const char *operation);
+
 /* Initialize Metal device, queue, and shader library. Returns 0 on success. */
 int metal_context_init(void);
 
@@ -81,6 +87,9 @@ void metal_context_cleanup(void);
 /* Get or create a compute pipeline for a named kernel function.
    The function must exist in the pre-compiled metallib. */
 void *metal_get_pipeline(const char *function_name);
+/* Look up an acceleration-only kernel. A missing function returns NULL without
+ * poisoning the context so the caller may execute an equivalent CPU fallback. */
+void *metal_get_pipeline_optional(const char *function_name);
 
 /* --- Buffer management --- */
 /* Register a newly created MTLBuffer in the tracking table.

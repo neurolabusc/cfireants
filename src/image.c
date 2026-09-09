@@ -493,6 +493,13 @@ int image_save_like(const char *out_path, const char *ref_path,
     nim->nbyper = 4;
     nim->scl_slope = 0.0f;
     nim->scl_inter = 0.0f;
+    /* The fixed image's display window describes the fixed image, not the warped
+     * moving image cloned onto its header. Carrying it over renders the output
+     * blank in viewers that honour cal_min/cal_max (MNI152's 3000..8000 against
+     * warped data spanning 0..314). Zeroing makes nifti_write omit them, so
+     * viewers auto-window instead. */
+    nim->cal_min = 0.0f;
+    nim->cal_max = 0.0f;
     nim->data = (void *)data;
 
     /* Set output path */

@@ -1,0 +1,110 @@
+# Build the npm-format TypeScript/WASM package. Public release attachment is
+# separately gated on recorded redistribution approval; CI/manual builds remain
+# available while that approval is pending.
+name: js-package
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build and test native CPU backend
+        run: |
+          cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Release -DCFIREANTS_ZSTD=OFF
+          cmake --build build-ci -j 2
+          ctest --test-dir build-ci --output-on-failure
+
+  build:
+    if: github.event_name != 'release' || startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: mymindstorm/setup-emsdk@6ab9eb1bda2574c4ddb79809fc9247783eaf9021 # v14
+        with:
+          version: 6.0.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Check release identity
+        working-directory: js
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: npm run checkVersion
+
+      - name: Build and pack
+        working-directory: js
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
+          npm run build
+          archive=$(npm pack --silent)
+          sha256sum "$archive" > "$archive.sha256"
+          echo "NPM_TARBALL=$archive" >> "$GITHUB_ENV"
+
+      - name: Smoke-test packed CPU variants
+        working-directory: js
+        run: |
+          package_dir=$(mktemp -d)
+          tar -xzf "$NPM_TARBALL" -C "$package_dir"
+          node scripts/smoke-package.mjs "$package_dir/package" ../validate/small
+          echo "PACKED_PACKAGE_DIR=$package_dir/package" >> "$GITHUB_ENV"
+
+      - name: Smoke-test packed browser WebGPU against CPU
+        working-directory: js
+        run: npm run smokeWebgpu -- "$PACKED_PACKAGE_DIR"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name == 'release' && vars.CFIREANTS_NPM_REDISTRIBUTION_APPROVED == 'true'
+        with:
+          name: cfireants-npm
+          path: |
+            js/cfireants-*.tgz
+            js/cfireants-*.tgz.sha256
+          if-no-files-found: error
+
+  attach:
+    if: github.event_name == 'release'
+    needs: [build, native-cpu-tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Require redistribution approval
+        env:
+          APPROVED: ${{ vars.CFIREANTS_NPM_REDISTRIBUTION_APPROVED }}
+        run: |
+          if [ "$APPROVED" != true ]; then
+            echo "Set repository variable CFIREANTS_NPM_REDISTRIBUTION_APPROVED=true only after redistribution approval is recorded." >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cfireants-npm
+          path: release-assets
+
+      - name: Attach immutable assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" release-assets/*

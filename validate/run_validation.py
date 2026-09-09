@@ -70,7 +70,7 @@ DATASETS = {
             "moments": dict(
                 scale=1.0,
                 moments=2,
-                orientation="both",
+                orientation="rot",
                 blur=True,
                 loss_type="cc",
                 cc_kernel_size=5,
@@ -112,7 +112,7 @@ DATASETS = {
             "moments": dict(
                 scale=1.0,
                 moments=2,
-                orientation="both",
+                orientation="rot",
                 blur=True,
                 loss_type="cc",
                 cc_kernel_size=5,
@@ -156,7 +156,7 @@ DATASETS = {
             "moments": dict(
                 scale=1.0,
                 moments=2,
-                orientation="both",
+                orientation="rot",
                 blur=True,
                 loss_type="cc",
                 cc_kernel_size=5,

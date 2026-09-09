@@ -63,13 +63,30 @@ void wgpu_fused_cc_loss(
     WGPUBuffer grad_pred,          /* may be NULL */
     WGPUBuffer grad_target,        /* may be NULL */
     int D, int H, int W, int ks,
-    float *h_loss_out);            /* may be NULL */
+    float *h_loss_out,             /* may be NULL */
+    WGPUBuffer interm,             /* workspace: 5*D*H*W floats */
+    WGPUBuffer scratch);           /* workspace: 5*D*H*W floats */
+
+/* Reusable regular-CC storage. Greedy and CC-based linear stages allocate one
+ * per pyramid level instead of creating ~16 large buffers every iteration. */
+typedef struct {
+    int voxels;
+    int has_gradient;
+    WGPUBuffer p_sum, t_sum, p2_sum, t2_sum, tp_sum, work, tmp;
+    WGPUBuffer ncc, grad_sources;
+    WGPUBuffer src_p, src_p2, src_tp, adj_p, adj_p2, adj_tp;
+} wgpu_cc_workspace_t;
+
+int wgpu_cc_workspace_init(wgpu_cc_workspace_t *workspace, int voxels,
+                           int with_gradient);
+void wgpu_cc_workspace_cleanup(wgpu_cc_workspace_t *workspace);
 
 void wgpu_cc_loss_3d_raw(
     WGPUBuffer pred, WGPUBuffer target,
     WGPUBuffer grad_pred,   /* may be NULL if no gradient needed */
     int D, int H, int W, int ks,
-    float *h_loss_out);
+    float *h_loss_out,
+    wgpu_cc_workspace_t *workspace); /* NULL creates a one-call workspace */
 
 /* --- MI loss --- */
 
@@ -133,6 +150,11 @@ void wgpu_adam_direction_buf(WGPUBuffer output, WGPUBuffer exp_avg,
 /* --- Max L2 norm reduction --- */
 
 float wgpu_max_l2_norm_buf(WGPUBuffer data, int spatial, float eps);
+
+/* Scale a [spatial,3] field by factor/max(1, eps + max L2 norm), without
+ * synchronizing or reading the reduction back to the CPU. */
+void wgpu_normalize_l2_buf(WGPUBuffer data, int spatial, float eps,
+                           float factor, WGPUBuffer max_state);
 
 /* --- Affine grid backward --- */
 

@@ -36,18 +36,40 @@
 /* ------------------------------------------------------------------ */
 
 static float *greedy_metal_alloc_buf(size_t bytes, id<MTLBuffer> *out_buf) {
+    *out_buf = nil;
+    if (metal_had_fatal_error()) return NULL;
     id<MTLBuffer> buf = [g_metal.device newBufferWithLength:bytes
                                                    options:MTLResourceStorageModeShared];
-    if (!buf) return NULL;
+    if (!buf) {
+        fprintf(stderr, "greedy Metal: could not allocate %zu-byte buffer\n", bytes);
+        metal_record_fatal_error("buffer allocation");
+        return NULL;
+    }
     float *ptr = (float *)buf.contents;
+    if (!ptr) {
+        metal_record_fatal_error("buffer mapping");
+        return NULL;
+    }
     metal_register_buffer(ptr, (__bridge void *)buf, bytes);
+    if (!metal_buffer_from_ptr(ptr)) return NULL;
     *out_buf = buf;
     return ptr;
 }
 
 static void greedy_metal_free_buf(float *ptr, id<MTLBuffer> buf) {
-    if (ptr) metal_unregister_buffer(ptr);
+    if (ptr && metal_buffer_from_ptr(ptr)) metal_unregister_buffer(ptr);
     (void)buf;
+}
+
+/* A failed Metal allocation invalidates the command stream for this stage.
+ * Tear down the tracked context in one place; the public cleanup call remains
+ * idempotent, and a library caller may explicitly initialize Metal again. */
+static int greedy_metal_abort(greedy_result_t *result, const char *message) {
+    fprintf(stderr, "greedy_register_metal: %s\n", message);
+    tensor_free(&result->disp);
+    tensor_free(&result->moved);
+    metal_context_cleanup();
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -59,6 +81,7 @@ static float *greedy_make_gauss_kernel(float sigma, int *out_klen) {
     int tail = (int)(2.0f * sigma + 0.5f);
     int klen = 2 * tail + 1;
     float *h_k = (float *)malloc(klen * sizeof(float));
+    if (!h_k) { *out_klen = -1; return NULL; }
     float inv = 1.0f / (sigma * sqrtf(2.0f));
     float ksum = 0;
     for (int i = 0; i < klen; i++) {
@@ -81,7 +104,8 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
 {
     @autoreleasepool {
 
-    memset(result, 0, sizeof(greedy_result_t));
+    metal_clear_fatal_error();
+    if (greedy_result_init(result) != 0) return -1;
     memcpy(result->affine_44, init_affine_44, 16 * sizeof(float));
 
     int fD = fixed->data.shape[2], fH = fixed->data.shape[3], fW = fixed->data.shape[4];
@@ -106,12 +130,8 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
     id<MTLBuffer> fixed_buf, moving_buf;
     float *d_fixed_full = greedy_metal_alloc_buf(fSpatial * sizeof(float), &fixed_buf);
     float *d_moving_full = greedy_metal_alloc_buf(mSpatial * sizeof(float), &moving_buf);
-    if (!d_fixed_full || !d_moving_full) {
-        fprintf(stderr, "greedy_register_metal: buffer allocation failed\n");
-        if (d_fixed_full) greedy_metal_free_buf(d_fixed_full, fixed_buf);
-        if (d_moving_full) greedy_metal_free_buf(d_moving_full, moving_buf);
-        return -1;
-    }
+    if (!d_fixed_full || !d_moving_full)
+        return greedy_metal_abort(result, "image allocation failed");
     memcpy(d_fixed_full, fixed->data.data, fSpatial * sizeof(float));
     memcpy(d_moving_full, moving->data.data, mSpatial * sizeof(float));
 
@@ -119,16 +139,28 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
     int grad_klen = 0, warp_klen = 0;
     float *h_grad_kernel = greedy_make_gauss_kernel(opts.smooth_grad_sigma, &grad_klen);
     float *h_warp_kernel = greedy_make_gauss_kernel(opts.smooth_warp_sigma, &warp_klen);
+    if (grad_klen < 0 || warp_klen < 0) {
+        free(h_grad_kernel); free(h_warp_kernel);
+        return greedy_metal_abort(result, "host kernel allocation failed");
+    }
 
     /* Allocate Metal buffers for kernels */
     id<MTLBuffer> grad_kern_buf = nil, warp_kern_buf = nil;
     float *d_grad_kernel = NULL, *d_warp_kernel = NULL;
     if (grad_klen > 0) {
         d_grad_kernel = greedy_metal_alloc_buf(grad_klen * sizeof(float), &grad_kern_buf);
+        if (!d_grad_kernel) {
+            free(h_grad_kernel); free(h_warp_kernel);
+            return greedy_metal_abort(result, "gradient-kernel allocation failed");
+        }
         memcpy(d_grad_kernel, h_grad_kernel, grad_klen * sizeof(float));
     }
     if (warp_klen > 0) {
         d_warp_kernel = greedy_metal_alloc_buf(warp_klen * sizeof(float), &warp_kern_buf);
+        if (!d_warp_kernel) {
+            free(h_grad_kernel); free(h_warp_kernel);
+            return greedy_metal_abort(result, "warp-kernel allocation failed");
+        }
         memcpy(d_warp_kernel, h_warp_kernel, warp_klen * sizeof(float));
     }
     free(h_grad_kernel);
@@ -153,10 +185,9 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         if (dD < 8) dD = 8; if (dH < 8) dH = 8; if (dW < 8) dW = 8;
         if (scale == 1) { dD = fD; dH = fH; dW = fW; }
 
-        int mdD = (scale > 1) ? mD/scale : mD;
-        int mdH = (scale > 1) ? mH/scale : mH;
-        int mdW = (scale > 1) ? mW/scale : mW;
-        if (mdD < 8) mdD = 8; if (mdH < 8) mdH = 8; if (mdW < 8) mdW = 8;
+        int mdD, mdH, mdW;
+        moving_pyramid_size(scale, fixed->meta.spacing, moving->meta.spacing,
+                            mD, mH, mW, &mdD, &mdH, &mdW);
         if (scale == 1) { mdD = mD; mdH = mH; mdW = mW; }
 
         long spatial = (long)dD * dH * dW;
@@ -169,6 +200,8 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         if (scale > 1) {
             d_fixed_down = greedy_metal_alloc_buf(spatial * sizeof(float), &fdown_buf);
             d_moving_down = greedy_metal_alloc_buf(mSpatialDown * sizeof(float), &mdown_buf);
+            if (!d_fixed_down || !d_moving_down)
+                return greedy_metal_abort(result, "pyramid allocation failed");
             if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
                 metal_blur_downsample(d_fixed_full, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
                 metal_blur_downsample(d_moving_full, d_moving_down, 1, 1, mD, mH, mW, mdD, mdH, mdW);
@@ -176,6 +209,8 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
                 metal_downsample_fft(d_fixed_full, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
                 metal_downsample_fft(d_moving_full, d_moving_down, 1, 1, mD, mH, mW, mdD, mdH, mdW);
             }
+            if (metal_had_fatal_error())
+                return greedy_metal_abort(result, "pyramid construction failed");
         } else {
             d_fixed_down = d_fixed_full;
             d_moving_down = d_moving_full;
@@ -186,6 +221,8 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         if (d_warp == NULL) {
             /* First scale: init to zeros */
             d_warp = greedy_metal_alloc_buf(n3 * sizeof(float), &warp_buf);
+            if (!d_warp)
+                return greedy_metal_abort(result, "warp allocation failed");
             memset(d_warp, 0, n3 * sizeof(float));
         } else if (prev_dD != dD || prev_dH != dH || prev_dW != dW) {
             /* Resize via permute+trilinear (same as CUDA) */
@@ -194,6 +231,8 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
             id<MTLBuffer> tmp_3dhw_buf, resized_3dhw_buf;
             float *d_tmp_3dhw = greedy_metal_alloc_buf(prev_spatial * 3 * sizeof(float), &tmp_3dhw_buf);
             float *d_resized_3dhw = greedy_metal_alloc_buf(spatial * 3 * sizeof(float), &resized_3dhw_buf);
+            if (!d_tmp_3dhw || !d_resized_3dhw)
+                return greedy_metal_abort(result, "warp-resize allocation failed");
 
             metal_permute_dhw3_3dhw(d_warp, d_tmp_3dhw, prev_dD, prev_dH, prev_dW);
             metal_trilinear_resize(d_tmp_3dhw, d_resized_3dhw,
@@ -203,6 +242,8 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
             greedy_metal_free_buf(d_warp, warp_buf);
 
             d_warp = greedy_metal_alloc_buf(n3 * sizeof(float), &warp_buf);
+            if (!d_warp)
+                return greedy_metal_abort(result, "resized-warp allocation failed");
             metal_permute_3dhw_dhw3(d_resized_3dhw, d_warp, dD, dH, dW);
 
             greedy_metal_free_buf(d_resized_3dhw, resized_3dhw_buf);
@@ -217,6 +258,8 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         if (d_exp_avg == NULL) {
             d_exp_avg = greedy_metal_alloc_buf(n3 * sizeof(float), &exp_avg_buf);
             d_exp_avg_sq = greedy_metal_alloc_buf(n3 * sizeof(float), &exp_avg_sq_buf);
+            if (!d_exp_avg || !d_exp_avg_sq)
+                return greedy_metal_abort(result, "optimizer allocation failed");
             memset(d_exp_avg, 0, n3 * sizeof(float));
             memset(d_exp_avg_sq, 0, n3 * sizeof(float));
         }
@@ -232,23 +275,29 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         /* Generate affine base grid for forward pass */
         id<MTLBuffer> aff_buf, base_grid_buf;
         float *d_aff = greedy_metal_alloc_buf(12 * sizeof(float), &aff_buf);
+        if (!d_aff)
+            return greedy_metal_abort(result, "affine allocation failed");
         memcpy(d_aff, h_aff, 12 * sizeof(float));
         float *d_base_grid = greedy_metal_alloc_buf(n3 * sizeof(float), &base_grid_buf);
+        if (!d_base_grid)
+            return greedy_metal_abort(result, "base-grid allocation failed");
         metal_affine_grid_3d(d_aff, d_base_grid, 1, dD, dH, dW);
 
         /* Scratch buffers */
         id<MTLBuffer> sg_buf, moved_buf, gmoved_buf, ggrid_buf, adam_dir_buf;
-        id<MTLBuffer> scratch_buf, scratch2_buf;
-        id<MTLBuffer> cc_interm_buf, cc_scratch_buf;
+        id<MTLBuffer> scratch2_buf;
         float *d_sampling_grid = greedy_metal_alloc_buf(n3 * sizeof(float), &sg_buf);
         float *d_moved = greedy_metal_alloc_buf(spatial * sizeof(float), &moved_buf);
         float *d_grad_moved = greedy_metal_alloc_buf(spatial * sizeof(float), &gmoved_buf);
         float *d_grad_grid = greedy_metal_alloc_buf(n3 * sizeof(float), &ggrid_buf);
         float *d_adam_dir = greedy_metal_alloc_buf(n3 * sizeof(float), &adam_dir_buf);
-        float *d_scratch = greedy_metal_alloc_buf(spatial * sizeof(float), &scratch_buf);
         float *d_scratch2 = greedy_metal_alloc_buf(n3 * sizeof(float), &scratch2_buf);
-        float *d_cc_interm = greedy_metal_alloc_buf(5L * spatial * sizeof(float), &cc_interm_buf);
-        float *d_cc_scratch = greedy_metal_alloc_buf(spatial * sizeof(float), &cc_scratch_buf);
+        metal_cc_workspace_t cc_workspace;
+        if (metal_cc_workspace_init(&cc_workspace, (int)spatial, 1) != 0)
+            return greedy_metal_abort(result, "CC workspace allocation failed");
+        if (!d_sampling_grid || !d_moved || !d_grad_moved || !d_grad_grid ||
+            !d_adam_dir || !d_scratch2)
+            return greedy_metal_abort(result, "per-scale workspace allocation failed");
 
         float prev_loss = 1e30f;
         int converge_count = 0;
@@ -261,12 +310,15 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
             metal_grid_sample_3d_fwd(d_moving_down, d_sampling_grid, d_moved,
                                       1, 1, mdD, mdH, mdW, dD, dH, dW);
 
-            /* Step 4a: Fused CC loss + gradient w.r.t. moved */
+            /* Step 4a: CC loss + gradient w.r.t. moved.
+             * Greedy has a one-sided objective, so use the same regular CC
+             * gradient as the CPU and WebGPU backends.  The fused CC path is
+             * two-sided and is reserved for SyN. */
             float loss;
-            metal_fused_cc_loss(d_moved, d_fixed_down,
-                               d_grad_moved, NULL,
-                               dD, dH, dW, opts.cc_kernel_size,
-                               &loss, d_cc_interm, d_cc_scratch);
+            metal_cc_loss_3d(d_moved, d_fixed_down, d_grad_moved,
+                             dD, dH, dW, opts.cc_kernel_size, &loss,
+                             &cc_workspace);
+            if (metal_had_fatal_error()) break;
 
             /* Step 4b: grid_sample backward -> dL/d(warp) */
             metal_grid_sample_3d_bwd(d_grad_moved, d_moving_down, d_sampling_grid,
@@ -329,14 +381,14 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         greedy_metal_free_buf(d_grad_moved, gmoved_buf);
         greedy_metal_free_buf(d_grad_grid, ggrid_buf);
         greedy_metal_free_buf(d_adam_dir, adam_dir_buf);
-        greedy_metal_free_buf(d_scratch, scratch_buf);
         greedy_metal_free_buf(d_scratch2, scratch2_buf);
-        greedy_metal_free_buf(d_cc_interm, cc_interm_buf);
-        greedy_metal_free_buf(d_cc_scratch, cc_scratch_buf);
+        metal_cc_workspace_cleanup(&cc_workspace);
         if (scale > 1) {
             greedy_metal_free_buf(d_fixed_down, fdown_buf);
             greedy_metal_free_buf(d_moving_down, mdown_buf);
         }
+        if (metal_had_fatal_error())
+            return greedy_metal_abort(result, "GPU iteration failed");
     }
 
     /* ---- Evaluate at full resolution ---- */
@@ -348,6 +400,9 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
         float *d_eval_base = greedy_metal_alloc_buf(n3 * sizeof(float), &eval_base_buf);
         float *d_eval_sg = greedy_metal_alloc_buf(n3 * sizeof(float), &eval_sg_buf);
         float *d_eval_moved = greedy_metal_alloc_buf(fSpatial * sizeof(float), &eval_moved_buf);
+
+        if (!d_eval_aff || !d_eval_base || !d_eval_sg || !d_eval_moved)
+            return greedy_metal_abort(result, "evaluation allocation failed");
 
         memcpy(d_eval_aff, h_aff, 12 * sizeof(float));
         metal_affine_grid_3d(d_eval_aff, d_eval_base, 1, fD, fH, fW);
@@ -362,18 +417,43 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
 
         metal_grid_sample_3d_fwd(d_moving_full, d_eval_sg, d_eval_moved,
                                   1, 1, mD, mH, mW, fD, fH, fW);
-        metal_cc_loss_3d(d_eval_moved, d_fixed_full, NULL, fD, fH, fW, 9, &result->ncc_loss);
+        metal_cc_loss_3d(d_eval_moved, d_fixed_full, NULL, fD, fH, fW, 9,
+                         &result->ncc_loss, NULL);
 
         /* Download warped image to CPU */
         metal_sync();
         int shape[5] = {1, 1, fD, fH, fW};
-        tensor_alloc(&result->moved, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
+        if (tensor_alloc(&result->moved, 5, shape,
+                         DTYPE_FLOAT32, DEVICE_CPU) != 0)
+            return greedy_metal_abort(result, "output allocation failed");
         memcpy(result->moved.data, d_eval_moved, fSpatial * sizeof(float));
 
         greedy_metal_free_buf(d_eval_aff, eval_aff_buf);
         greedy_metal_free_buf(d_eval_base, eval_base_buf);
         greedy_metal_free_buf(d_eval_sg, eval_sg_buf);
         greedy_metal_free_buf(d_eval_moved, eval_moved_buf);
+    }
+
+    /* Match the CPU result contract: return the optimized displacement as a
+     * CPU-owned tensor so its lifetime does not depend on the Metal context. */
+    if (d_warp) {
+        int disp_shape[5] = {1, prev_dD, prev_dH, prev_dW, 3};
+        if (tensor_alloc(&result->disp, 5, disp_shape,
+                         DTYPE_FLOAT32, DEVICE_CPU) != 0) {
+            fprintf(stderr, "greedy_register_metal: displacement allocation failed\n");
+            tensor_free(&result->moved);
+            if (d_warp) greedy_metal_free_buf(d_warp, warp_buf);
+            if (d_exp_avg) greedy_metal_free_buf(d_exp_avg, exp_avg_buf);
+            if (d_exp_avg_sq) greedy_metal_free_buf(d_exp_avg_sq, exp_avg_sq_buf);
+            if (d_grad_kernel) greedy_metal_free_buf(d_grad_kernel, grad_kern_buf);
+            if (d_warp_kernel) greedy_metal_free_buf(d_warp_kernel, warp_kern_buf);
+            greedy_metal_free_buf(d_fixed_full, fixed_buf);
+            greedy_metal_free_buf(d_moving_full, moving_buf);
+            return -1;
+        }
+        metal_sync();
+        memcpy(result->disp.data, d_warp,
+               (size_t)prev_dD * prev_dH * prev_dW * 3 * sizeof(float));
     }
 
     /* Cleanup */
@@ -384,6 +464,12 @@ int greedy_register_metal(const image_t *fixed, const image_t *moving,
     if (d_warp_kernel) greedy_metal_free_buf(d_warp_kernel, warp_kern_buf);
     greedy_metal_free_buf(d_fixed_full, fixed_buf);
     greedy_metal_free_buf(d_moving_full, moving_buf);
+
+    if (metal_had_fatal_error()) {
+        tensor_free(&result->disp);
+        tensor_free(&result->moved);
+        return -1;
+    }
 
     } /* @autoreleasepool */
     return 0;

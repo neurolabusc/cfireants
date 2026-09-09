@@ -7,6 +7,7 @@
 
 #include "cfireants/tensor.h"
 #include "cfireants/image.h"
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,7 +39,7 @@ typedef struct {
 static inline moments_opts_t moments_opts_default(void) {
     moments_opts_t o;
     o.moments = 2;
-    o.orientation = 2; /* both */
+    o.orientation = 0; /* rot: proper rotations only, as ANTs/FireANTs; "both" admits mirror images */
     o.blur = 1;
     o.scale = 1.0f;
     o.cc_kernel_size = 5;
@@ -79,9 +80,10 @@ typedef struct {
 #define LOSS_CC  0
 #define LOSS_MI  1
 
-/* Downsample mode codes */
-#define DOWNSAMPLE_FFT       0   /* FFT-based (matching Python default) */
-#define DOWNSAMPLE_TRILINEAR 1   /* Gaussian blur + trilinear resize (faster, GPU-native) */
+/* Downsample mode codes. Trilinear is 0 so a zero-initialised options struct
+ * gets the same pyramid as the CLI default and the CPU backend. */
+#define DOWNSAMPLE_TRILINEAR 0   /* Gaussian blur + trilinear resize (every backend) */
+#define DOWNSAMPLE_FFT       1   /* FFT-based (matches Python; GPU backends only) */
 
 /* Options for rigid registration */
 typedef struct {
@@ -175,11 +177,27 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    tensor_t disp;          /* displacement field [1, D, H, W, 3] (owned) */
+    tensor_t disp;          /* optional displacement [1,D,H,W,3] (owned);
+                             * canonical empty tensor when not exported */
     tensor_t moved;         /* warped image [1, 1, D, H, W] on CPU (owned) */
     float affine_44[4][4];  /* initial affine (physical space) */
     float ncc_loss;         /* local NCC loss (CC k=9) */
 } greedy_result_t;
+
+/* Registration entry points call this before doing any work, so every output
+ * is safe to inspect and free even when a backend does not provide it. */
+static inline int greedy_result_init(greedy_result_t *result) {
+    if (result == NULL) return -1;
+    memset(result, 0, sizeof(*result));
+    return 0;
+}
+
+/* Successful CPU, Metal, and WebGPU registrations export the displacement.
+ * Keep the predicate for callers that also build another accelerator backend
+ * or inspect a failed/partially populated result. */
+static inline int greedy_result_has_displacement(const greedy_result_t *result) {
+    return result != NULL && result->disp.data != NULL;
+}
 
 typedef struct {
     int n_scales;

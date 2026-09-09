@@ -492,3 +492,80 @@ kernel void box_filter_axis(
 
     output[idx] = sum * scale;
 }
+
+/* ------------------------------------------------------------------ */
+/* Packed box filter: all `channels` planes of a [C,D,H,W] buffer in    */
+/* one dispatch. Mirrors WebGPU's box_filter_packed. Accumulates then   */
+/* scales by 1/klen (never per element) to match CUDA/WebGPU precision. */
+/* ------------------------------------------------------------------ */
+
+struct BoxPackedParams {
+    uint D, H, W;
+    uint klen;
+    uint axis;
+    uint channels;
+    uint _pad0, _pad1;
+};
+
+kernel void box_filter_axis_packed(
+    device const float *input      [[buffer(0)]],
+    device       float *output     [[buffer(1)]],
+    constant BoxPackedParams &p    [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    /* 32-bit index math: channels*spatial is bounded by the u32 thread count,
+       and a 64-bit divide costs ~an order of magnitude more per thread. */
+    uint spatial = p.D * p.H * p.W;
+    uint flat = tid;
+    if (flat >= spatial * p.channels) return;
+
+    uint channel = flat / spatial;
+    uint idx = flat - channel * spatial;
+
+    int D = int(p.D), H = int(p.H), W = int(p.W);
+    int w = int(idx % p.W);
+    int tmp = int(idx / p.W);
+    int h = tmp % H;
+    int d = tmp / H;
+
+    uint base = channel * spatial;
+    int klen = int(p.klen);
+    int r = klen / 2;
+
+    float sum = 0.0f;
+
+    if (p.axis == 2) {
+        for (int k = 0; k < klen; k++) {
+            int ww = w + k - r;
+            if (ww >= 0 && ww < W)
+                sum += input[base + uint(d * H * W + h * W + ww)];
+        }
+    } else if (p.axis == 1) {
+        for (int k = 0; k < klen; k++) {
+            int hh = h + k - r;
+            if (hh >= 0 && hh < H)
+                sum += input[base + uint(d * H * W + hh * W + w)];
+        }
+    } else {
+        for (int k = 0; k < klen; k++) {
+            int dd = d + k - r;
+            if (dd >= 0 && dd < D)
+                sum += input[base + uint(dd * H * W + h * W + w)];
+        }
+    }
+
+    output[flat] = sum / float(klen);
+}
+
+/* GPU-side buffer copy (replaces host memcpy in batched paths) */
+struct CopyParams { uint n, _pad0, _pad1, _pad2; };
+
+kernel void copy_f32(
+    device const float *src   [[buffer(0)]],
+    device       float *dst   [[buffer(1)]],
+    constant CopyParams &p    [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= p.n) return;
+    dst[tid] = src[tid];
+}

@@ -458,12 +458,14 @@ int moments_register(const image_t *fixed, const image_t *moving,
                 best_label = "identity+COM";
                 mat3_identity(best_R);
             }
-        }
 
-        /* Z-axis jiggle: for large-FOV images (>120mm in S-I direction),
-         * test identity+COM with foot-head offsets. The sform origin may not
-         * perfectly center the brain, especially for full-head images. */
-        {
+            /* Z-axis jiggle: for large-FOV images (>120mm in S-I direction),
+             * test identity+COM with foot-head offsets. The sform origin may not
+             * perfectly center the brain, especially for full-head images.
+             * Inside the degenerate/try-identity guard: a stray brace let this
+             * run on every registration, where it beat a perfectly good SVD
+             * rotation by a fraction of a percent and replaced it with identity,
+             * costing ~6% NCC on the large dataset. */
             /* Compute physical extent along z (superior-inferior in LPS).
              * Row 2 of px2phy is the z (S-I) row. */
             double fov_z = fabs(fixed->meta.px2phy.m[2][0]) * fixed->meta.size[0]

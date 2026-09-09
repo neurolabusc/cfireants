@@ -227,10 +227,9 @@ int affine_register(const image_t *fixed, const image_t *moving,
         if (dD < 8) dD = 8; if (dH < 8) dH = 8; if (dW < 8) dW = 8;
         if (scale == 1) { dD = fD; dH = fH; dW = fW; }
 
-        int mdD = (scale > 1) ? mD/scale : mD;
-        int mdH = (scale > 1) ? mH/scale : mH;
-        int mdW = (scale > 1) ? mW/scale : mW;
-        if (mdD < 8) mdD = 8; if (mdH < 8) mdH = 8; if (mdW < 8) mdW = 8;
+        int mdD, mdH, mdW;
+        moving_pyramid_size(scale, fixed->meta.spacing, moving->meta.spacing,
+                            mD, mH, mW, &mdD, &mdH, &mdW);
         if (scale == 1) { mdD = mD; mdH = mH; mdW = mW; }
 
         tensor_t fixed_down, moving_down;
@@ -252,7 +251,7 @@ int affine_register(const image_t *fixed, const image_t *moving,
             mdD = mD; mdH = mH; mdW = mW;
         }
 
-        fprintf(stderr, "  Affine scale %d: fixed[%d,%d,%d] moving[%d,%d,%d] x %d iters\n",
+        if (cfireants_verbose >= 2) fprintf(stderr, "  Affine scale %d: fixed[%d,%d,%d] moving[%d,%d,%d] x %d iters\n",
                 scale, dD, dH, dW, mdD, mdH, mdW, iters);
 
         state.step = 0;
@@ -270,12 +269,12 @@ int affine_register(const image_t *fixed, const image_t *moving,
                                      opts.lr, 0.9f, 0.999f, 1e-8f);
 
             if (i % 50 == 0 || i == iters - 1)
-                fprintf(stderr, "    iter %d/%d loss=%.6f\n", i, iters, loss);
+                if (cfireants_verbose >= 2) fprintf(stderr, "    iter %d/%d loss=%.6f\n", i, iters, loss);
 
             if (fabsf(loss - prev_loss) < opts.tolerance) {
                 converge_count++;
                 if (converge_count >= opts.max_tolerance_iters) {
-                    fprintf(stderr, "    Converged at iter %d\n", i);
+                    if (cfireants_verbose >= 2) fprintf(stderr, "    Converged at iter %d\n", i);
                     break;
                 }
             } else {

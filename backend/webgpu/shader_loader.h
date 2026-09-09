@@ -1,40 +1,25 @@
 /*
- * shader_loader.h - Load WGSL shader source from files at runtime
+ * shader_loader.h - Look up WGSL shader source in the embedded table.
  *
- * Falls back to embedded strings if file not found.
+ * The table is generated from the WGSL files in backend/webgpu/shaders by
+ * CMake, so the
+ * binary always carries the shader that was on disk when it was built. There
+ * is deliberately no runtime file lookup: it made the natively tested shader a
+ * different copy from the one shipped.
  */
 
 #ifndef SHADER_LOADER_H
 #define SHADER_LOADER_H
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include "embedded_shaders.h"
 
-/* Load a file into a malloc'd string. Returns NULL on failure. */
-static inline char *load_shader_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = (char *)malloc(len + 1);
-    if (buf) {
-        size_t n = fread(buf, 1, len, f);
-        buf[n] = '\0';
-    }
-    fclose(f);
-    return buf;
-}
-
-/* Try to load shader from file, fall back to embedded string.
- * Caller must NOT free the returned pointer (may be static). */
+/* Returns the table entry for filename, or `embedded` if there is none. */
 static inline const char *get_shader_source(const char *filename, const char *embedded) {
-    /* Try relative to working directory */
-    char path[512];
-    snprintf(path, sizeof(path), "backend/webgpu/shaders/%s", filename);
-    char *loaded = load_shader_file(path);
-    if (loaded) return loaded;  /* Note: small leak, acceptable for long-lived shaders */
+    int n = 0;
+    const shader_entry_t *tab = embedded_shader_table(&n);
+    for (int i = 0; i < n; i++)
+        if (strcmp(tab[i].name, filename) == 0) return tab[i].src;
     return embedded;
 }
 

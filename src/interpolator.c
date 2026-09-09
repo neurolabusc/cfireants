@@ -6,6 +6,7 @@
  */
 
 #include "cfireants/interpolator.h"
+#include "cfireants/threading.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -16,9 +17,119 @@ static inline float unnormalize(float coord, int size) {
     return ((coord + 1.0f) * 0.5f) * (size - 1);
 }
 
-/* Clip to [0, size-1] */
-static inline int clamp_int(int v, int lo, int hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
+typedef struct {
+    const float *inp, *grd;
+    float *out;
+    int C, iD, iH, iW, oD, oH, oW;
+    size_t inp_sB, inp_sC, inp_sD, inp_sH;
+    size_t out_sB, out_sC, out_sD, out_sH;
+    size_t grd_sB, grd_sD, grd_sH;
+} grid_forward_context_t;
+
+static void grid_forward_range(size_t begin, size_t end, void *opaque) {
+    grid_forward_context_t *ctx = (grid_forward_context_t *)opaque;
+    for (size_t slice = begin; slice < end; slice++) {
+        int b = (int)(slice / (size_t)ctx->oD);
+        int od = (int)(slice % (size_t)ctx->oD);
+        for (int oh = 0; oh < ctx->oH; oh++) {
+            for (int ow = 0; ow < ctx->oW; ow++) {
+                size_t gidx = b*ctx->grd_sB + od*ctx->grd_sD + oh*ctx->grd_sH + ow*3;
+                float ix = unnormalize(ctx->grd[gidx], ctx->iW);
+                float iy = unnormalize(ctx->grd[gidx + 1], ctx->iH);
+                float iz = unnormalize(ctx->grd[gidx + 2], ctx->iD);
+                int ix0 = (int)floorf(ix), iy0 = (int)floorf(iy), iz0 = (int)floorf(iz);
+                int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
+                float fx = ix - ix0, fy = iy - iy0, fz = iz - iz0;
+                float w000 = (1-fx)*(1-fy)*(1-fz), w001 = fx*(1-fy)*(1-fz);
+                float w010 = (1-fx)*fy*(1-fz), w011 = fx*fy*(1-fz);
+                float w100 = (1-fx)*(1-fy)*fz, w101 = fx*(1-fy)*fz;
+                float w110 = (1-fx)*fy*fz, w111 = fx*fy*fz;
+                int v000 = (iz0>=0 && iz0<ctx->iD && iy0>=0 && iy0<ctx->iH && ix0>=0 && ix0<ctx->iW);
+                int v001 = (iz0>=0 && iz0<ctx->iD && iy0>=0 && iy0<ctx->iH && ix1>=0 && ix1<ctx->iW);
+                int v010 = (iz0>=0 && iz0<ctx->iD && iy1>=0 && iy1<ctx->iH && ix0>=0 && ix0<ctx->iW);
+                int v011 = (iz0>=0 && iz0<ctx->iD && iy1>=0 && iy1<ctx->iH && ix1>=0 && ix1<ctx->iW);
+                int v100 = (iz1>=0 && iz1<ctx->iD && iy0>=0 && iy0<ctx->iH && ix0>=0 && ix0<ctx->iW);
+                int v101 = (iz1>=0 && iz1<ctx->iD && iy0>=0 && iy0<ctx->iH && ix1>=0 && ix1<ctx->iW);
+                int v110 = (iz1>=0 && iz1<ctx->iD && iy1>=0 && iy1<ctx->iH && ix0>=0 && ix0<ctx->iW);
+                int v111 = (iz1>=0 && iz1<ctx->iD && iy1>=0 && iy1<ctx->iH && ix1>=0 && ix1<ctx->iW);
+                for (int c = 0; c < ctx->C; c++) {
+                    const float *p = ctx->inp + b*ctx->inp_sB + c*ctx->inp_sC;
+                    float val = 0.0f;
+                    if (v000) val += w000 * p[iz0*ctx->inp_sD + iy0*ctx->inp_sH + ix0];
+                    if (v001) val += w001 * p[iz0*ctx->inp_sD + iy0*ctx->inp_sH + ix1];
+                    if (v010) val += w010 * p[iz0*ctx->inp_sD + iy1*ctx->inp_sH + ix0];
+                    if (v011) val += w011 * p[iz0*ctx->inp_sD + iy1*ctx->inp_sH + ix1];
+                    if (v100) val += w100 * p[iz1*ctx->inp_sD + iy0*ctx->inp_sH + ix0];
+                    if (v101) val += w101 * p[iz1*ctx->inp_sD + iy0*ctx->inp_sH + ix1];
+                    if (v110) val += w110 * p[iz1*ctx->inp_sD + iy1*ctx->inp_sH + ix0];
+                    if (v111) val += w111 * p[iz1*ctx->inp_sD + iy1*ctx->inp_sH + ix1];
+                    ctx->out[b*ctx->out_sB + c*ctx->out_sC + od*ctx->out_sD + oh*ctx->out_sH + ow] = val;
+                }
+            }
+        }
+    }
+}
+
+typedef struct {
+    const float *inp, *grd, *go;
+    float *gg;
+    int C, iD, iH, iW, oD, oH, oW;
+    size_t inp_sC, inp_sD, inp_sH;
+    size_t out_sC, out_sD, out_sH;
+    float mult_x, mult_y, mult_z;
+} grid_backward_context_t;
+
+static void grid_backward_range(size_t begin, size_t end, void *opaque) {
+    grid_backward_context_t *ctx = (grid_backward_context_t *)opaque;
+    int C = ctx->C, iD = ctx->iD, iH = ctx->iH, iW = ctx->iW;
+    for (size_t slice = begin; slice < end; slice++) {
+        int b = (int)(slice / (size_t)ctx->oD);
+        int od = (int)(slice % (size_t)ctx->oD);
+        for (int oh = 0; oh < ctx->oH; oh++) {
+            for (int ow = 0; ow < ctx->oW; ow++) {
+                size_t gidx = ((((size_t)b*ctx->oD + od)*ctx->oH + oh)*ctx->oW + ow) * 3;
+                float ix = unnormalize(ctx->grd[gidx], iW);
+                float iy = unnormalize(ctx->grd[gidx + 1], iH);
+                float iz = unnormalize(ctx->grd[gidx + 2], iD);
+                int ix0 = (int)floorf(ix), iy0 = (int)floorf(iy), iz0 = (int)floorf(iz);
+                int ix1 = ix0 + 1, iy1 = iy0 + 1, iz1 = iz0 + 1;
+                float fx = ix - ix0, fy = iy - iy0, fz = iz - iz0;
+                float dgx = 0.0f, dgy = 0.0f, dgz = 0.0f;
+
+                for (int c = 0; c < C; c++) {
+                    size_t out_idx = ((size_t)b*C + c)*ctx->out_sC
+                                   + od*ctx->out_sD + oh*ctx->out_sH + ow;
+                    float go_val = ctx->go[out_idx];
+                    const float *p = ctx->inp + ((size_t)b*C + c)*ctx->inp_sC;
+                    #define INP(d, h, w) \
+                        ((d)>=0 && (d)<iD && (h)>=0 && (h)<iH && (w)>=0 && (w)<iW \
+                         ? p[(d)*ctx->inp_sD + (h)*ctx->inp_sH + (w)] : 0.0f)
+                    float dval_dfx =
+                        -(1-fy)*(1-fz)*INP(iz0,iy0,ix0) + (1-fy)*(1-fz)*INP(iz0,iy0,ix1)
+                        -fy*(1-fz)*INP(iz0,iy1,ix0) + fy*(1-fz)*INP(iz0,iy1,ix1)
+                        -(1-fy)*fz*INP(iz1,iy0,ix0) + (1-fy)*fz*INP(iz1,iy0,ix1)
+                        -fy*fz*INP(iz1,iy1,ix0) + fy*fz*INP(iz1,iy1,ix1);
+                    float dval_dfy =
+                        -(1-fx)*(1-fz)*INP(iz0,iy0,ix0) - fx*(1-fz)*INP(iz0,iy0,ix1)
+                        +(1-fx)*(1-fz)*INP(iz0,iy1,ix0) + fx*(1-fz)*INP(iz0,iy1,ix1)
+                        -(1-fx)*fz*INP(iz1,iy0,ix0) - fx*fz*INP(iz1,iy0,ix1)
+                        +(1-fx)*fz*INP(iz1,iy1,ix0) + fx*fz*INP(iz1,iy1,ix1);
+                    float dval_dfz =
+                        -(1-fx)*(1-fy)*INP(iz0,iy0,ix0) - fx*(1-fy)*INP(iz0,iy0,ix1)
+                        -(1-fx)*fy*INP(iz0,iy1,ix0) - fx*fy*INP(iz0,iy1,ix1)
+                        +(1-fx)*(1-fy)*INP(iz1,iy0,ix0) + fx*(1-fy)*INP(iz1,iy0,ix1)
+                        +(1-fx)*fy*INP(iz1,iy1,ix0) + fx*fy*INP(iz1,iy1,ix1);
+                    #undef INP
+                    dgx += go_val * dval_dfx;
+                    dgy += go_val * dval_dfy;
+                    dgz += go_val * dval_dfz;
+                }
+                ctx->gg[gidx] = dgx * ctx->mult_x;
+                ctx->gg[gidx + 1] = dgy * ctx->mult_y;
+                ctx->gg[gidx + 2] = dgz * ctx->mult_z;
+            }
+        }
+    }
 }
 
 int affine_grid_3d(const tensor_t *affine, const int out_shape[3],
@@ -98,72 +209,13 @@ int cpu_grid_sample_3d_forward(const tensor_t *input, const tensor_t *grid,
     size_t grd_sD = (size_t)oH * oW * 3;
     size_t grd_sH = (size_t)oW * 3;
 
-    for (int b = 0; b < B; b++) {
-        for (int od = 0; od < oD; od++) {
-            for (int oh = 0; oh < oH; oh++) {
-                for (int ow = 0; ow < oW; ow++) {
-                    size_t gidx = b*grd_sB + od*grd_sD + oh*grd_sH + ow*3;
-                    float gx = grd[gidx + 0]; /* x -> W */
-                    float gy = grd[gidx + 1]; /* y -> H */
-                    float gz = grd[gidx + 2]; /* z -> D */
-
-                    /* Unnormalize to input coordinates */
-                    float ix = unnormalize(gx, iW);
-                    float iy = unnormalize(gy, iH);
-                    float iz = unnormalize(gz, iD);
-
-                    /* Floor indices */
-                    int ix0 = (int)floorf(ix);
-                    int iy0 = (int)floorf(iy);
-                    int iz0 = (int)floorf(iz);
-                    int ix1 = ix0 + 1;
-                    int iy1 = iy0 + 1;
-                    int iz1 = iz0 + 1;
-
-                    /* Fractional parts */
-                    float fx = ix - ix0;
-                    float fy = iy - iy0;
-                    float fz = iz - iz0;
-
-                    /* Trilinear weights */
-                    float w000 = (1-fx)*(1-fy)*(1-fz);
-                    float w001 = fx    *(1-fy)*(1-fz);
-                    float w010 = (1-fx)*fy    *(1-fz);
-                    float w011 = fx    *fy    *(1-fz);
-                    float w100 = (1-fx)*(1-fy)*fz;
-                    float w101 = fx    *(1-fy)*fz;
-                    float w110 = (1-fx)*fy    *fz;
-                    float w111 = fx    *fy    *fz;
-
-                    /* Boundary check flags (zeros padding) */
-                    int v000 = (iz0>=0 && iz0<iD && iy0>=0 && iy0<iH && ix0>=0 && ix0<iW);
-                    int v001 = (iz0>=0 && iz0<iD && iy0>=0 && iy0<iH && ix1>=0 && ix1<iW);
-                    int v010 = (iz0>=0 && iz0<iD && iy1>=0 && iy1<iH && ix0>=0 && ix0<iW);
-                    int v011 = (iz0>=0 && iz0<iD && iy1>=0 && iy1<iH && ix1>=0 && ix1<iW);
-                    int v100 = (iz1>=0 && iz1<iD && iy0>=0 && iy0<iH && ix0>=0 && ix0<iW);
-                    int v101 = (iz1>=0 && iz1<iD && iy0>=0 && iy0<iH && ix1>=0 && ix1<iW);
-                    int v110 = (iz1>=0 && iz1<iD && iy1>=0 && iy1<iH && ix0>=0 && ix0<iW);
-                    int v111 = (iz1>=0 && iz1<iD && iy1>=0 && iy1<iH && ix1>=0 && ix1<iW);
-
-                    for (int c = 0; c < C; c++) {
-                        const float *inp_c = inp + b*inp_sB + c*inp_sC;
-                        float val = 0.0f;
-
-                        if (v000) val += w000 * inp_c[iz0*inp_sD + iy0*inp_sH + ix0];
-                        if (v001) val += w001 * inp_c[iz0*inp_sD + iy0*inp_sH + ix1];
-                        if (v010) val += w010 * inp_c[iz0*inp_sD + iy1*inp_sH + ix0];
-                        if (v011) val += w011 * inp_c[iz0*inp_sD + iy1*inp_sH + ix1];
-                        if (v100) val += w100 * inp_c[iz1*inp_sD + iy0*inp_sH + ix0];
-                        if (v101) val += w101 * inp_c[iz1*inp_sD + iy0*inp_sH + ix1];
-                        if (v110) val += w110 * inp_c[iz1*inp_sD + iy1*inp_sH + ix0];
-                        if (v111) val += w111 * inp_c[iz1*inp_sD + iy1*inp_sH + ix1];
-
-                        out[b*out_sB + c*out_sC + od*out_sD + oh*out_sH + ow] = val;
-                    }
-                }
-            }
-        }
-    }
+    grid_forward_context_t context = {
+        inp, grd, out, C, iD, iH, iW, oD, oH, oW,
+        inp_sB, inp_sC, inp_sD, inp_sH,
+        out_sB, out_sC, out_sD, out_sH,
+        grd_sB, grd_sD, grd_sH
+    };
+    cfireants_parallel_for((size_t)B * oD, 2, grid_forward_range, &context);
     return 0;
 }
 
@@ -203,76 +255,11 @@ int cpu_grid_sample_3d_backward(const tensor_t *grad_output,
     float mult_y = (iH - 1) * 0.5f;
     float mult_z = (iD - 1) * 0.5f;
 
-    for (int b = 0; b < B; b++) {
-        for (int od = 0; od < oD; od++) {
-            for (int oh = 0; oh < oH; oh++) {
-                for (int ow = 0; ow < oW; ow++) {
-                    size_t gidx = ((((size_t)b*oD + od)*oH + oh)*oW + ow) * 3;
-                    float gx = grd[gidx + 0];
-                    float gy = grd[gidx + 1];
-                    float gz = grd[gidx + 2];
-
-                    float ix = unnormalize(gx, iW);
-                    float iy = unnormalize(gy, iH);
-                    float iz = unnormalize(gz, iD);
-
-                    int ix0 = (int)floorf(ix);
-                    int iy0 = (int)floorf(iy);
-                    int iz0 = (int)floorf(iz);
-                    int ix1 = ix0 + 1;
-                    int iy1 = iy0 + 1;
-                    int iz1 = iz0 + 1;
-
-                    float fx = ix - ix0;
-                    float fy = iy - iy0;
-                    float fz = iz - iz0;
-
-                    /* Accumulate gradient over channels */
-                    float dgx = 0.0f, dgy = 0.0f, dgz = 0.0f;
-
-                    for (int c = 0; c < C; c++) {
-                        size_t out_idx = ((size_t)b*C + c)*out_sC + od*out_sD + oh*out_sH + ow;
-                        float go_val = go[out_idx];
-                        const float *inp_c = inp + ((size_t)b*C + c)*inp_sC;
-
-                        /* Helper to get input value with bounds check */
-                        #define INP(d, h, w) \
-                            ((d)>=0 && (d)<iD && (h)>=0 && (h)<iH && (w)>=0 && (w)<iW \
-                             ? inp_c[(d)*inp_sD + (h)*inp_sH + (w)] : 0.0f)
-
-                        /* d(interp)/d(ix) partial derivatives */
-                        float dval_dfx =
-                            -(1-fy)*(1-fz)*INP(iz0,iy0,ix0) + (1-fy)*(1-fz)*INP(iz0,iy0,ix1)
-                            -fy    *(1-fz)*INP(iz0,iy1,ix0) + fy    *(1-fz)*INP(iz0,iy1,ix1)
-                            -(1-fy)*fz    *INP(iz1,iy0,ix0) + (1-fy)*fz    *INP(iz1,iy0,ix1)
-                            -fy    *fz    *INP(iz1,iy1,ix0) + fy    *fz    *INP(iz1,iy1,ix1);
-
-                        float dval_dfy =
-                            -(1-fx)*(1-fz)*INP(iz0,iy0,ix0) - fx*(1-fz)*INP(iz0,iy0,ix1)
-                            +(1-fx)*(1-fz)*INP(iz0,iy1,ix0) + fx*(1-fz)*INP(iz0,iy1,ix1)
-                            -(1-fx)*fz    *INP(iz1,iy0,ix0) - fx*fz    *INP(iz1,iy0,ix1)
-                            +(1-fx)*fz    *INP(iz1,iy1,ix0) + fx*fz    *INP(iz1,iy1,ix1);
-
-                        float dval_dfz =
-                            -(1-fx)*(1-fy)*INP(iz0,iy0,ix0) - fx*(1-fy)*INP(iz0,iy0,ix1)
-                            -(1-fx)*fy    *INP(iz0,iy1,ix0) - fx*fy    *INP(iz0,iy1,ix1)
-                            +(1-fx)*(1-fy)*INP(iz1,iy0,ix0) + fx*(1-fy)*INP(iz1,iy0,ix1)
-                            +(1-fx)*fy    *INP(iz1,iy1,ix0) + fx*fy    *INP(iz1,iy1,ix1);
-
-                        #undef INP
-
-                        dgx += go_val * dval_dfx;
-                        dgy += go_val * dval_dfy;
-                        dgz += go_val * dval_dfz;
-                    }
-
-                    /* Chain rule: d(unnorm)/d(norm) */
-                    gg[gidx + 0] = dgx * mult_x;
-                    gg[gidx + 1] = dgy * mult_y;
-                    gg[gidx + 2] = dgz * mult_z;
-                }
-            }
-        }
-    }
+    grid_backward_context_t context = {
+        inp, grd, go, gg, C, iD, iH, iW, oD, oH, oW,
+        inp_sC, inp_sD, inp_sH, out_sC, out_sD, out_sH,
+        mult_x, mult_y, mult_z
+    };
+    cfireants_parallel_for((size_t)B * oD, 2, grid_backward_range, &context);
     return 0;
 }

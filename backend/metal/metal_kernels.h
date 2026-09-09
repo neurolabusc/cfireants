@@ -57,6 +57,12 @@ void metal_conv1d_axis(const float *in, float *out,
                         const float *kernel, int klen, int axis);
 void metal_box_filter_axis(const float *in, float *out,
                             int D, int H, int W, int ks, int axis, float scale);
+/* Box filter a packed [channels,D,H,W] buffer along one axis, one dispatch. */
+void metal_box_filter_packed(const float *in, float *out,
+                              int D, int H, int W, int ks, int axis,
+                              int channels);
+/* GPU-side buffer copy. */
+void metal_copy_f32(float *dst, const float *src, int n);
 
 /* --- Phase 3: CC loss + Gaussian blur --- */
 
@@ -73,10 +79,25 @@ void metal_blur_disp_dhw3(float *data, float *scratch,
                            int D, int H, int W,
                            const float *kernel_data, int klen);
 
-/* CC loss via backend_ops_t (allocates workspace internally) */
+/* Reusable regular-CC storage. Pointer fields refer to registered shared Metal
+ * buffers and are owned by the workspace until cleanup. */
+typedef struct {
+    int voxels;
+    int has_gradient;
+    float *p_sum, *t_sum, *p2_sum, *t2_sum, *tp_sum, *work, *tmp;
+    float *src_p, *src_p2, *src_tp;
+    float *partial;
+} metal_cc_workspace_t;
+
+int metal_cc_workspace_init(metal_cc_workspace_t *workspace, int voxels,
+                            int with_gradient);
+void metal_cc_workspace_cleanup(metal_cc_workspace_t *workspace);
+
+/* CC loss via backend_ops_t; NULL workspace allocates for one call. */
 void metal_cc_loss_3d(const float *pred, const float *target,
                        float *grad_pred,
-                       int D, int H, int W, int ks, float *h_loss_out);
+                       int D, int H, int W, int ks, float *h_loss_out,
+                       metal_cc_workspace_t *workspace);
 
 /* --- Phase 4: FFT downsample --- */
 

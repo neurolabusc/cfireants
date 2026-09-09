@@ -43,7 +43,7 @@ void wgpu_fused_compositive_update(WGPUBuffer warp, WGPUBuffer update,
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
     WGPUComputePipeline pl = wgpu_get_pipeline("compose", wgsl, "compositive_update");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("compose");
 
     size_t sz = (size_t)D * H * W * 3 * 4;
@@ -64,20 +64,15 @@ void wgpu_fused_compositive_update(WGPUBuffer warp, WGPUBuffer update,
         { .binding = 3, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(D*H*W, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 
     if (need_copy) {
-        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, actual_output, 0, output, 0, sz);
-        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-        wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-        wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
-        wgpuDevicePoll(g_wgpu.device, 1, NULL);
-        wgpuBufferRelease(actual_output);
+        wgpu_copy_buffer(actual_output, output, sz);
+        wgpu_release_buffer(actual_output);
     }
 }
 
@@ -111,7 +106,7 @@ void wgpu_blur_disp_dhw3(WGPUBuffer data, WGPUBuffer scratch,
         WGPUBuffer pb = make_params(&p, sizeof(p));
 
         WGPUComputePipeline pl = wgpu_get_pipeline("blur_dhw3", wgsl, "conv1d_dhw3");
-        if (!pl) { wgpuBufferRelease(pb); return; }
+        if (!pl) { wgpu_release_buffer(pb); return; }
         WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("blur_dhw3");
 
         WGPUBindGroupEntry e[] = {
@@ -121,20 +116,15 @@ void wgpu_blur_disp_dhw3(WGPUBuffer data, WGPUBuffer scratch,
             { .binding = 3, .buffer = pb, .size = sizeof(p) },
         };
         WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
-        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+        WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
         { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
         wgpu_dispatch(pl, bg, wx, wy, 1); }
-        wgpuBindGroupRelease(bg);
-        wgpuBufferRelease(pb);
+        wgpu_release_bind_group(bg);
+        wgpu_release_buffer(pb);
     }
 
-    /* After 3 passes (even number), result is in scratch. Copy to data. */
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-    wgpuCommandEncoderCopyBufferToBuffer(enc, scratch, 0, data, 0, sz);
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-    wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
-    wgpuDevicePoll(g_wgpu.device, 1, NULL);
+    /* After 3 passes the result is in scratch. Preserve outer batching. */
+    wgpu_copy_buffer(scratch, data, sz);
 }
 
 /* ================================================================== */
@@ -158,7 +148,7 @@ void wgpu_adam_moments_update_buf(WGPUBuffer grad, WGPUBuffer exp_avg,
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
     WGPUComputePipeline pl = wgpu_get_pipeline("adam_moments", wgsl, "adam_moments_update");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("adam_moments");
 
     size_t sz = (size_t)n * 4;
@@ -169,11 +159,11 @@ void wgpu_adam_moments_update_buf(WGPUBuffer grad, WGPUBuffer exp_avg,
         { .binding = 3, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 }
 
 void wgpu_adam_direction_buf(WGPUBuffer output, WGPUBuffer exp_avg,
@@ -187,7 +177,7 @@ void wgpu_adam_direction_buf(WGPUBuffer output, WGPUBuffer exp_avg,
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
     WGPUComputePipeline pl = wgpu_get_pipeline("adam_dir", wgsl, "adam_direction");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("adam_dir");
 
     size_t sz = (size_t)n * 4;
@@ -198,28 +188,25 @@ void wgpu_adam_direction_buf(WGPUBuffer output, WGPUBuffer exp_avg,
         { .binding = 3, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 }
 
 /* ================================================================== */
 /* Max L2 norm reduction                                               */
 /* ================================================================== */
 
-/* Cached max L2 norm — only recompute every N calls to reduce sync */
-static float cached_max_l2 = 1.0f;
-static int max_l2_call_count = 0;
-
 float wgpu_max_l2_norm_buf(WGPUBuffer data, int spatial, float eps) {
-    /* Only recompute every 5 calls — reuse cached value otherwise */
-    max_l2_call_count++;
-    if (max_l2_call_count % 5 != 1 && cached_max_l2 > eps) {
-        return cached_max_l2;
-    }
-
+    /* Computed every call, deliberately. This used to reuse a cached value on
+     * four calls out of five to avoid the readback, but the cache was a file
+     * static: it was stale within a scale, and survived scale transitions and
+     * whole registrations. Greedy normalises its update by this maximum on every
+     * iteration, and the CPU backend recomputes it every step, so caching made
+     * the GPU and CPU paths disagree by construction. */
+    int caller_batching = g_wgpu.batch_active;
     const char *wgsl = get_warp_ops_wgsl();
     if (!wgsl) return eps;
 
@@ -233,7 +220,7 @@ float wgpu_max_l2_norm_buf(WGPUBuffer data, int spatial, float eps) {
     WGPUBuffer out_buf = wgpu_create_buffer(n_groups * 4, u, "norm_out");
 
     WGPUComputePipeline pl = wgpu_get_pipeline("max_l2", wgsl, "max_l2_norm");
-    if (!pl) { wgpuBufferRelease(pb); wgpuBufferRelease(out_buf); return eps; }
+    if (!pl) { wgpu_release_buffer(pb); wgpu_release_buffer(out_buf); return eps; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("max_l2");
 
     WGPUBindGroupEntry e[] = {
@@ -242,23 +229,105 @@ float wgpu_max_l2_norm_buf(WGPUBuffer data, int spatial, float eps) {
         { .binding = 2, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = e };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
     { uint32_t wx, wy; wgpu_dispatch_dims(n_groups, &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
+    wgpu_release_bind_group(bg);
 
     /* Read partials and find max on CPU */
     float *partials = (float *)malloc(n_groups * 4);
+    if (!partials) {
+        wgpu_record_fatal_error("max-L2 host reduction allocation");
+        wgpu_release_buffer(pb);
+        wgpu_release_buffer(out_buf);
+        return eps;
+    }
     wgpu_read_buffer(out_buf, 0, partials, n_groups * 4);
     float maxval = 0;
-    for (uint32_t i = 0; i < n_groups; i++)
-        if (partials[i] > maxval) maxval = partials[i];
+    if (!wgpu_had_fatal_error())
+        for (uint32_t i = 0; i < n_groups; i++)
+            if (partials[i] > maxval) maxval = partials[i];
     free(partials);
 
-    wgpuBufferRelease(pb);
-    wgpuBufferRelease(out_buf);
-    cached_max_l2 = eps + maxval;
-    return cached_max_l2;
+    wgpu_release_buffer(pb);
+    wgpu_release_buffer(out_buf);
+    if (caller_batching) wgpu_begin_batch();
+    return maxval > eps ? maxval : eps;
+}
+
+void wgpu_normalize_l2_buf(WGPUBuffer data, int spatial, float eps,
+                           float factor, WGPUBuffer max_state) {
+    static const char *wgsl = NULL;
+    if (!wgsl) wgsl = get_shader_source("normalize_l2.wgsl", NULL);
+    if (!wgsl) return;
+
+    typedef struct {
+        uint32_t spatial, n;
+        float eps, factor;
+    } params_t;
+    params_t p = {
+        (uint32_t)spatial, (uint32_t)(3 * spatial), eps, factor,
+    };
+    WGPUBuffer pb = make_params(&p, sizeof(p));
+
+    WGPUComputePipeline clear_pl =
+        wgpu_get_pipeline("normalize_l2_clear", wgsl, "clear_max");
+    if (clear_pl) {
+        WGPUBindGroupEntry entry = {
+            .binding = 1, .buffer = max_state, .size = sizeof(uint32_t),
+        };
+        WGPUBindGroupDescriptor desc = {
+            .layout = wgpu_get_bind_group_layout("normalize_l2_clear"),
+            .entryCount = 1,
+            .entries = &entry,
+        };
+        WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+        wgpu_dispatch(clear_pl, bg, 1, 1, 1);
+        wgpu_release_bind_group(bg);
+    }
+
+    size_t data_size = (size_t)spatial * 3 * sizeof(float);
+    WGPUComputePipeline max_pl =
+        wgpu_get_pipeline("normalize_l2_max", wgsl, "reduce_max_l2");
+    if (max_pl) {
+        WGPUBindGroupEntry entries[] = {
+            { .binding = 0, .buffer = data, .size = data_size },
+            { .binding = 1, .buffer = max_state, .size = sizeof(uint32_t) },
+            { .binding = 2, .buffer = pb, .size = sizeof(p) },
+        };
+        WGPUBindGroupDescriptor desc = {
+            .layout = wgpu_get_bind_group_layout("normalize_l2_max"),
+            .entryCount = 3,
+            .entries = entries,
+        };
+        WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+        uint32_t wx, wy;
+        wgpu_dispatch_dims(wgpu_div_ceil((uint32_t)spatial, 256), &wx, &wy);
+        wgpu_dispatch(max_pl, bg, wx, wy, 1);
+        wgpu_release_bind_group(bg);
+    }
+
+    WGPUComputePipeline scale_pl =
+        wgpu_get_pipeline("normalize_l2_scale", wgsl, "apply_scale");
+    if (scale_pl) {
+        WGPUBindGroupEntry entries[] = {
+            { .binding = 0, .buffer = data, .size = data_size },
+            { .binding = 1, .buffer = max_state, .size = sizeof(uint32_t) },
+            { .binding = 2, .buffer = pb, .size = sizeof(p) },
+        };
+        WGPUBindGroupDescriptor desc = {
+            .layout = wgpu_get_bind_group_layout("normalize_l2_scale"),
+            .entryCount = 3,
+            .entries = entries,
+        };
+        WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+        uint32_t wx, wy;
+        wgpu_dispatch_dims(
+            wgpu_div_ceil((uint32_t)(3 * spatial), 256), &wx, &wy);
+        wgpu_dispatch(scale_pl, bg, wx, wy, 1);
+        wgpu_release_bind_group(bg);
+    }
+    wgpu_release_buffer(pb);
 }
 
 /* ================================================================== */
@@ -291,7 +360,7 @@ void wgpu_affine_grid_backward(WGPUBuffer grad_grid, int D, int H, int W,
     WGPUBuffer partial_buf = wgpu_create_buffer(n_blocks * 12 * 4, u, "agb_partial");
 
     WGPUComputePipeline pl = wgpu_get_pipeline("affine_bwd", wgsl, "affine_grid_bwd");
-    if (!pl) { wgpuBufferRelease(pb); wgpuBufferRelease(partial_buf); memset(h_dL_dA,0,48); return; }
+    if (!pl) { wgpu_release_buffer(pb); wgpu_release_buffer(partial_buf); memset(h_dL_dA,0,48); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("affine_bwd");
 
     WGPUBindGroupEntry e[] = {
@@ -300,21 +369,29 @@ void wgpu_affine_grid_backward(WGPUBuffer grad_grid, int D, int H, int W,
         { .binding = 2, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = e };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
     { uint32_t wx, wy; wgpu_dispatch_dims(n_blocks, &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
+    wgpu_release_bind_group(bg);
 
     /* Read partials and sum on CPU */
     float *partials = (float *)malloc(n_blocks * 12 * 4);
+    if (!partials) {
+        wgpu_record_fatal_error("affine-gradient host reduction allocation");
+        memset(h_dL_dA, 0, 12 * sizeof(float));
+        wgpu_release_buffer(pb);
+        wgpu_release_buffer(partial_buf);
+        return;
+    }
     wgpu_read_buffer(partial_buf, 0, partials, n_blocks * 12 * 4);
 
     memset(h_dL_dA, 0, 12 * sizeof(float));
-    for (uint32_t b = 0; b < n_blocks; b++)
-        for (int k = 0; k < 12; k++)
-            h_dL_dA[k] += partials[b * 12 + k];
+    if (!wgpu_had_fatal_error())
+        for (uint32_t b = 0; b < n_blocks; b++)
+            for (int k = 0; k < 12; k++)
+                h_dL_dA[k] += partials[b * 12 + k];
 
     free(partials);
-    wgpuBufferRelease(pb);
-    wgpuBufferRelease(partial_buf);
+    wgpu_release_buffer(pb);
+    wgpu_release_buffer(partial_buf);
 }

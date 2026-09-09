@@ -15,6 +15,7 @@
  */
 
 #include "cfireants/losses.h"
+#include "cfireants/threading.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,15 +25,23 @@
  * in: source buffer, out: destination buffer (can be same pointer as in)
  * axis: 0=D, 1=H, 2=W
  * The rectangular kernel = uniform average with kernel_size=ks */
-static void box_filter_axis(const float *in, float *out,
-                            int D, int H, int W, int ks, int axis) {
+typedef struct {
+    const float *in;
+    float *out;
+    int D, H, W, ks, axis;
+} box_filter_context_t;
+
+static void box_filter_range(size_t begin, size_t end, void *opaque) {
+    box_filter_context_t *ctx = (box_filter_context_t *)opaque;
+    const float *in = ctx->in;
+    float *out = ctx->out;
+    int D = ctx->D, H = ctx->H, W = ctx->W, ks = ctx->ks;
     int r = ks / 2;
     float scale = 1.0f / ks;
 
-    if (axis == 2) { /* along W */
-        for (int d = 0; d < D; d++) {
-            for (int h = 0; h < H; h++) {
-                size_t row = (size_t)(d * H + h) * W;
+    if (ctx->axis == 2) { /* one W row per item */
+        for (size_t line = begin; line < end; line++) {
+                size_t row = line * (size_t)W;
                 for (int w = 0; w < W; w++) {
                     float sum = 0.0f;
                     for (int k = -r; k <= r; k++) {
@@ -42,11 +51,11 @@ static void box_filter_axis(const float *in, float *out,
                     }
                     out[row + w] = sum * scale;
                 }
-            }
         }
-    } else if (axis == 1) { /* along H */
-        for (int d = 0; d < D; d++) {
-            for (int w = 0; w < W; w++) {
+    } else if (ctx->axis == 1) { /* one H column per item */
+        for (size_t line = begin; line < end; line++) {
+                int d = (int)(line / (size_t)W);
+                int w = (int)(line % (size_t)W);
                 for (int h = 0; h < H; h++) {
                     float sum = 0.0f;
                     for (int k = -r; k <= r; k++) {
@@ -56,11 +65,11 @@ static void box_filter_axis(const float *in, float *out,
                     }
                     out[(size_t)(d * H + h) * W + w] = sum * scale;
                 }
-            }
         }
-    } else { /* axis == 0, along D */
-        for (int h = 0; h < H; h++) {
-            for (int w = 0; w < W; w++) {
+    } else { /* one D column per item */
+        for (size_t line = begin; line < end; line++) {
+                int h = (int)(line / (size_t)W);
+                int w = (int)(line % (size_t)W);
                 for (int d = 0; d < D; d++) {
                     float sum = 0.0f;
                     for (int k = -r; k <= r; k++) {
@@ -70,9 +79,16 @@ static void box_filter_axis(const float *in, float *out,
                     }
                     out[(size_t)(d * H + h) * W + w] = sum * scale;
                 }
-            }
         }
     }
+}
+
+static void box_filter_axis(const float *in, float *out,
+                            int D, int H, int W, int ks, int axis) {
+    box_filter_context_t context = {in, out, D, H, W, ks, axis};
+    size_t lines = axis == 2 ? (size_t)D * H
+                 : axis == 1 ? (size_t)D * W : (size_t)H * W;
+    cfireants_parallel_for(lines, 64, box_filter_range, &context);
 }
 
 /* Full separable 3D box filter (rectangular kernel, normalized).
@@ -368,115 +384,87 @@ int cpu_fused_cc_loss(const tensor_t *pred, const tensor_t *target,
     return 0;
 }
 
-/* CC loss with both pred and target gradients (for SyN fused CC) */
-int cpu_cc_loss_3d_both(const tensor_t *pred, const tensor_t *target,
-                         int kernel_size, float *loss_out,
-                         tensor_t *grad_pred, tensor_t *grad_target) {
-    int B = pred->shape[0], C = pred->shape[1];
-    int D = pred->shape[2], H = pred->shape[3], W = pred->shape[4];
-    size_t spatial = (size_t)D * H * W;
-    float smooth_nr = 1e-5f, smooth_dr = 1e-5f;
-    size_t total_count = (size_t)B * C * D * H * W;
-
-    int shape[5] = {B, C, D, H, W};
-    if (grad_pred) tensor_alloc(grad_pred, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
-    if (grad_target) tensor_alloc(grad_target, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
-
-    const float *P = tensor_data_f32(pred);
-    const float *T = tensor_data_f32(target);
-
-    float *p_sum = (float *)malloc(spatial*sizeof(float));
-    float *t_sum = (float *)malloc(spatial*sizeof(float));
-    float *p2_sum = (float *)malloc(spatial*sizeof(float));
-    float *t2_sum = (float *)malloc(spatial*sizeof(float));
-    float *tp_sum = (float *)malloc(spatial*sizeof(float));
-    float *work = (float *)malloc(spatial*sizeof(float));
-    float *tmp = (float *)malloc(spatial*sizeof(float));
-
-    double total_loss = 0;
-
-    for (int b = 0; b < B; b++) {
-        for (int c = 0; c < C; c++) {
-            const float *Pbc = P + (b*C+c)*spatial;
-            const float *Tbc = T + (b*C+c)*spatial;
-
-            separable_box_filter_3d(Pbc, p_sum, D, H, W, kernel_size, tmp);
-            separable_box_filter_3d(Tbc, t_sum, D, H, W, kernel_size, tmp);
-            for (size_t i=0;i<spatial;i++) work[i]=Pbc[i]*Pbc[i];
-            separable_box_filter_3d(work, p2_sum, D, H, W, kernel_size, tmp);
-            for (size_t i=0;i<spatial;i++) work[i]=Tbc[i]*Tbc[i];
-            separable_box_filter_3d(work, t2_sum, D, H, W, kernel_size, tmp);
-            for (size_t i=0;i<spatial;i++) work[i]=Tbc[i]*Pbc[i];
-            separable_box_filter_3d(work, tp_sum, D, H, W, kernel_size, tmp);
-
-            /* Per-voxel source terms for both pred and target gradients */
-            float *src_p=NULL, *src_p2=NULL, *src_tp_p=NULL;
-            float *src_t=NULL, *src_t2=NULL, *src_tp_t=NULL;
-            if (grad_pred)  { src_p=calloc(spatial,sizeof(float)); src_p2=calloc(spatial,sizeof(float)); src_tp_p=calloc(spatial,sizeof(float)); }
-            if (grad_target) { src_t=calloc(spatial,sizeof(float)); src_t2=calloc(spatial,sizeof(float)); src_tp_t=calloc(spatial,sizeof(float)); }
-
-            for (size_t i = 0; i < spatial; i++) {
-                float ps=p_sum[i], ts=t_sum[i];
-                float cross = tp_sum[i] - ps*ts;
-                float p_var = p2_sum[i] - ps*ps;
-                float t_var = t2_sum[i] - ts*ts;
-                if (p_var < smooth_dr) p_var = smooth_dr;
-                if (t_var < smooth_dr) t_var = smooth_dr;
-                float f = cross*cross + smooth_nr;
-                float g = p_var*t_var + smooth_dr;
-                float ncc = f/g;
-                if (ncc>1.0f) ncc=1.0f;
-                if (ncc<-1.0f) ncc=-1.0f;
-                total_loss += ncc;
-
-                float g2 = g*g;
-                if (grad_pred) {
-                    src_tp_p[i] = 2.0f*cross*g / g2;
-                    src_p2[i] = -f*t_var / g2;
-                    src_p[i] = (-2.0f*cross*ts*g + 2.0f*f*ps*t_var) / g2;
-                }
-                if (grad_target) {
-                    src_tp_t[i] = 2.0f*cross*g / g2;  /* same as pred */
-                    src_t2[i] = -f*p_var / g2;         /* swapped: p_var instead of t_var */
-                    src_t[i] = (-2.0f*cross*ps*g + 2.0f*f*ts*p_var) / g2; /* swapped */
-                }
-            }
-
-            float inv_count = 1.0f / total_count;
-            if (grad_pred) {
-                float *gp = tensor_data_f32(grad_pred) + (b*C+c)*spatial;
-                float *adj_p=malloc(spatial*4), *adj_p2=malloc(spatial*4), *adj_tp=malloc(spatial*4);
-                separable_box_filter_3d(src_p, adj_p, D, H, W, kernel_size, tmp);
-                separable_box_filter_3d(src_p2, adj_p2, D, H, W, kernel_size, tmp);
-                separable_box_filter_3d(src_tp_p, adj_tp, D, H, W, kernel_size, tmp);
-                for (size_t i=0;i<spatial;i++)
-                    gp[i] = -inv_count * (adj_p[i] + 2.0f*Pbc[i]*adj_p2[i] + Tbc[i]*adj_tp[i]);
-                free(adj_p); free(adj_p2); free(adj_tp);
-                free(src_p); free(src_p2); free(src_tp_p);
-            }
-            if (grad_target) {
-                float *gt = tensor_data_f32(grad_target) + (b*C+c)*spatial;
-                float *adj_t=malloc(spatial*4), *adj_t2=malloc(spatial*4), *adj_tp=malloc(spatial*4);
-                separable_box_filter_3d(src_t, adj_t, D, H, W, kernel_size, tmp);
-                separable_box_filter_3d(src_t2, adj_t2, D, H, W, kernel_size, tmp);
-                separable_box_filter_3d(src_tp_t, adj_tp, D, H, W, kernel_size, tmp);
-                for (size_t i=0;i<spatial;i++)
-                    gt[i] = -inv_count * (adj_t[i] + 2.0f*Tbc[i]*adj_t2[i] + Pbc[i]*adj_tp[i]);
-                free(adj_t); free(adj_t2); free(adj_tp);
-                free(src_t); free(src_t2); free(src_tp_t);
-            }
-        }
-    }
-
-    if (loss_out) *loss_out = -(float)(total_loss / total_count);
-    free(p_sum); free(t_sum); free(p2_sum); free(t2_sum);
-    free(tp_sum); free(work); free(tmp);
-    return 0;
-}
 
 /* ------------------------------------------------------------------ */
 /* Mutual Information loss (Gaussian Parzen windowing)                 */
 /* ------------------------------------------------------------------ */
+
+/* Parzen weights for one normalized intensity x: w[i] = G(x - c_i) / sum */
+static inline void mi_parzen(float x, const float *centers, int nb, float preterm, float *w) {
+    float sum = 0;
+    for (int i = 0; i < nb; i++) {
+        float d = x - centers[i];
+        w[i] = expf(-preterm * d * d);
+        sum += w[i];
+    }
+    for (int i = 0; i < nb; i++) w[i] /= sum;
+}
+
+static inline float mi_clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+typedef struct {
+    const float *P, *T, *centers;
+    double *partials;      /* [nthreads][nb*nb pab | nb pa | nb pb] */
+    size_t N, chunk, stride;
+    int nb;
+    float inv_max, preterm;
+} mi_hist_context_t;
+
+/* One item = one thread-sized chunk, so slot == item index. */
+static void mi_hist_range(size_t begin, size_t end, void *opaque) {
+    mi_hist_context_t *c = (mi_hist_context_t *)opaque;
+    int nb = c->nb;
+    float wa[nb], wb[nb];
+    for (size_t slot = begin; slot < end; slot++) {
+        double *pab = c->partials + slot * c->stride;
+        double *pa = pab + (size_t)nb * nb, *pb = pa + nb;
+        size_t n1 = (slot + 1) * c->chunk;
+        if (n1 > c->N) n1 = c->N;
+        for (size_t n = slot * c->chunk; n < n1; n++) {
+            mi_parzen(mi_clamp01(c->P[n] * c->inv_max), c->centers, nb, c->preterm, wa);
+            mi_parzen(mi_clamp01(c->T[n] * c->inv_max), c->centers, nb, c->preterm, wb);
+            for (int i = 0; i < nb; i++) {
+                pa[i] += wa[i];
+                pb[i] += wb[i];
+                for (int j = 0; j < nb; j++) pab[i * nb + j] += wa[i] * wb[j];
+            }
+        }
+    }
+}
+
+typedef struct {
+    const float *P, *T, *centers, *dmi_dpab, *dmi_dpa;
+    float *grad_out;
+    int nb;
+    float inv_max, preterm, inv_N, grad_scale;
+} mi_grad_context_t;
+
+static void mi_grad_range(size_t begin, size_t end, void *opaque) {
+    mi_grad_context_t *c = (mi_grad_context_t *)opaque;
+    int nb = c->nb;
+    float wa[nb], wb[nb];
+    for (size_t n = begin; n < end; n++) {
+        float pn = mi_clamp01(c->P[n] * c->inv_max);
+        mi_parzen(pn, c->centers, nb, c->preterm, wa);
+        mi_parzen(mi_clamp01(c->T[n] * c->inv_max), c->centers, nb, c->preterm, wb);
+
+        /* Softmax-style derivative: d(wa)/d(pn) = wa * (du_a - sum_a' wa' du_a'),
+         * du_a/dpn = -2*preterm*(pn - c_a) */
+        float weighted_deriv = 0;
+        for (int a = 0; a < nb; a++)
+            weighted_deriv += wa[a] * (-2.0f * c->preterm * (pn - c->centers[a]));
+
+        float dmi_dpn = 0;
+        for (int a = 0; a < nb; a++) {
+            float du_a = -2.0f * c->preterm * (pn - c->centers[a]);
+            float dwa_dpn = wa[a] * (du_a - weighted_deriv);
+            for (int bb = 0; bb < nb; bb++)
+                dmi_dpn += c->dmi_dpab[a * nb + bb] * c->inv_N * wb[bb] * dwa_dpn;
+            dmi_dpn += c->dmi_dpa[a] * c->inv_N * dwa_dpn;
+        }
+        c->grad_out[n] = dmi_dpn * c->grad_scale;
+    }
+}
 
 int cpu_mi_loss_3d(const tensor_t *pred, const tensor_t *target,
                    int num_bins, float *loss_out, tensor_t *grad_pred) {
@@ -520,76 +508,31 @@ int cpu_mi_loss_3d(const tensor_t *pred, const tensor_t *target,
             if (maxval <= 0) maxval = 1.0f;
             float inv_max = (maxval > 1.0f) ? 1.0f / maxval : 1.0f;
 
-            /* Compute Gaussian Parzen weights and marginal/joint probabilities.
-             * wa[n][b] = G(pred[n] - bin_centers[b]) / sum_b' G(...)
-             * pa[b] = mean_n wa[n][b]
-             * Same for wb, pb.
-             * pab[ba][bb] = (1/N) sum_n wa[n][ba] * wb[n][bb]
-             * papb[ba][bb] = pa[ba] * pb[bb]
-             */
-            size_t N = spatial;
             int nb = num_bins;
+            size_t N = spatial;
+            int nt = cfireants_num_threads();
+            size_t stride = (size_t)nb * nb + 2 * nb;
+            double *partials = (double *)calloc((size_t)nt * stride, sizeof(double));
 
-            /* Compute marginals and joint histogram */
-            float *pa = (float *)calloc(nb, sizeof(float));
-            float *pb = (float *)calloc(nb, sizeof(float));
-            float *pab = (float *)calloc(nb * nb, sizeof(float));
+            /* Pass 1: per-thread partial histograms (pab, pa, pb), merged in
+             * slot order so the result is deterministic for a given thread count. */
+            mi_hist_context_t hctx = {Pbc, Tbc, bin_centers, partials, N,
+                                      (N + nt - 1) / nt, stride, nb, inv_max, preterm};
+            cfireants_parallel_for((size_t)nt, 1, mi_hist_range, &hctx);
 
-            /* Temporary weights for gradient computation */
-            float *wa_n = (float *)malloc(nb * sizeof(float));
-            float *wb_n = (float *)malloc(nb * sizeof(float));
-
-            /* For gradient: we need d(MI)/d(pred[n]) for each voxel.
-             * This requires storing per-voxel Parzen weights. To avoid
-             * O(N*bins) memory, we do two passes:
-             * Pass 1: compute pa, pb, pab
-             * Pass 2: compute gradient per voxel */
-
-            /* Pass 1: accumulate probabilities */
-            for (size_t n = 0; n < N; n++) {
-                float pn = Pbc[n] * inv_max;
-                float tn = Tbc[n] * inv_max;
-                if (pn < 0) pn = 0; if (pn > 1) pn = 1;
-                if (tn < 0) tn = 0; if (tn > 1) tn = 1;
-
-                /* Compute Parzen weights for pred */
-                float sum_wa = 0;
-                for (int i = 0; i < nb; i++) {
-                    float d = pn - bin_centers[i];
-                    wa_n[i] = expf(-preterm * d * d);
-                    sum_wa += wa_n[i];
-                }
-                for (int i = 0; i < nb; i++) wa_n[i] /= sum_wa;
-
-                /* Compute Parzen weights for target */
-                float sum_wb = 0;
-                for (int i = 0; i < nb; i++) {
-                    float d = tn - bin_centers[i];
-                    wb_n[i] = expf(-preterm * d * d);
-                    sum_wb += wb_n[i];
-                }
-                for (int i = 0; i < nb; i++) wb_n[i] /= sum_wb;
-
-                /* Accumulate marginals */
-                for (int i = 0; i < nb; i++) {
-                    pa[i] += wa_n[i];
-                    pb[i] += wb_n[i];
-                }
-
-                /* Accumulate joint */
-                for (int i = 0; i < nb; i++)
-                    for (int j = 0; j < nb; j++)
-                        pab[i * nb + j] += wa_n[i] * wb_n[j];
-            }
-
-            /* Normalize */
+            float *pa = (float *)malloc(nb * sizeof(float));
+            float *pb = (float *)malloc(nb * sizeof(float));
+            float *pab = (float *)malloc(nb * nb * sizeof(float));
             float inv_N = 1.0f / N;
-            for (int i = 0; i < nb; i++) {
-                pa[i] *= inv_N;
-                pb[i] *= inv_N;
+            for (size_t k = 0; k < stride; k++) {
+                double acc = 0.0;
+                for (int t = 0; t < nt; t++) acc += partials[t * stride + k];
+                float v = (float)acc * inv_N;
+                if (k < (size_t)nb * nb) pab[k] = v;
+                else if (k < (size_t)nb * nb + nb) pa[k - nb * nb] = v;
+                else pb[k - nb * nb - nb] = v;
             }
-            for (int i = 0; i < nb * nb; i++)
-                pab[i] *= inv_N;
+            free(partials);
 
             /* Compute MI = sum_{a,b} pab * log(pab / (pa*pb)) */
             double mi = 0.0;
@@ -631,56 +574,16 @@ int cpu_mi_loss_3d(const tensor_t *pred, const tensor_t *target,
                     }
                 }
 
-                for (size_t n = 0; n < N; n++) {
-                    float pn = Pbc[n] * inv_max;
-                    float tn = Tbc[n] * inv_max;
-                    if (pn < 0) pn = 0; if (pn > 1) pn = 1;
-                    if (tn < 0) tn = 0; if (tn > 1) tn = 1;
-
-                    /* Recompute Parzen weights */
-                    float sum_wa = 0, sum_wb = 0;
-                    for (int i = 0; i < nb; i++) {
-                        float dp = pn - bin_centers[i];
-                        wa_n[i] = expf(-preterm * dp * dp);
-                        sum_wa += wa_n[i];
-                        float dt = tn - bin_centers[i];
-                        wb_n[i] = expf(-preterm * dt * dt);
-                        sum_wb += wb_n[i];
-                    }
-                    for (int i = 0; i < nb; i++) { wa_n[i] /= sum_wa; wb_n[i] /= sum_wb; }
-
-                    /* d(wa_n[a])/d(pn) using softmax-style derivative:
-                     * Let u_a = -preterm*(pn - c_a)^2
-                     * wa = exp(u_a) / sum(exp(u))
-                     * d(wa)/d(pn) = wa * (du_a/dpn - sum_a' wa' * du_a'/dpn)
-                     * du_a/dpn = -2*preterm*(pn - c_a) */
-                    float weighted_deriv = 0;
-                    for (int a = 0; a < nb; a++)
-                        weighted_deriv += wa_n[a] * (-2.0f * preterm * (pn - bin_centers[a]));
-
-                    float dmi_dpn = 0;
-                    for (int a = 0; a < nb; a++) {
-                        float du_a = -2.0f * preterm * (pn - bin_centers[a]);
-                        float dwa_dpn = wa_n[a] * (du_a - weighted_deriv);
-
-                        /* Through joint: d(MI)/d(pn) via pab */
-                        for (int bb = 0; bb < nb; bb++)
-                            dmi_dpn += dmi_dpab[a * nb + bb] * inv_N * wb_n[bb] * dwa_dpn;
-
-                        /* Through marginal: d(MI)/d(pn) via pa */
-                        dmi_dpn += dmi_dpa[a] * inv_N * dwa_dpn;
-                    }
-
-                    /* Chain rule for normalization: d(pn)/d(Pbc[n]) = inv_max */
-                    grad_out[n] = -dmi_dpn * inv_max / total_channels;
-                }
+                mi_grad_context_t gctx = {Pbc, Tbc, bin_centers, dmi_dpab, dmi_dpa, grad_out,
+                                          nb, inv_max, preterm, inv_N,
+                                          -inv_max / total_channels};
+                cfireants_parallel_for(N, 4096, mi_grad_range, &gctx);
 
                 free(dmi_dpab);
                 free(dmi_dpa);
             }
 
             free(pa); free(pb); free(pab);
-            free(wa_n); free(wb_n);
         }
     }
 

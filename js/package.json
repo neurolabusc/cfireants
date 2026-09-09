@@ -1,0 +1,55 @@
+{
+  "name": "cfireants",
+  "version": "0.1.20260324",
+  "description": "Browser medical image registration -- rigid, affine, SyN and greedy deformable -- as a wasm module, threaded where the page is cross-origin isolated. A C port of FireANTs.",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neurolabusc/cfireants.git",
+    "directory": "js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "makeWasm": "bash build-wasm.sh",
+    "copyWasm": "node scripts/copy-wasm.mjs",
+    "checkVersion": "node scripts/check-version.mjs",
+    "smokePackage": "node scripts/smoke-package.mjs",
+    "smokeWebgpu": "node scripts/smoke-webgpu.mjs",
+    "types": "tsc -p tsconfig.json --emitDeclarationOnly",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "bundle": "node esbuild.config.mjs",
+    "prebuild": "npm run makeWasm",
+    "build": "npm run copyWasm && npm run types && npm run bundle",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "puppeteer-core": "^25.10.0",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "registration",
+    "fireants",
+    "neuroimaging",
+    "nifti",
+    "syn",
+    "diffeomorphic",
+    "wasm"
+  ]
+}

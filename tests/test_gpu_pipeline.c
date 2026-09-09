@@ -5,6 +5,7 @@
  */
 
 #include "cfireants/tensor.h"
+#include "test_data_dir.h"
 #include "cfireants/image.h"
 #include "cfireants/backend.h"
 #include "cfireants/registration.h"
@@ -36,7 +37,7 @@ static int load_bin_f32(const char *dir, const char *name, float *buf, size_t co
 }
 
 int main(int argc, char **argv) {
-    const char *data_dir = "cfireants/tests/test_data";
+    const char *data_dir = TEST_DATA_DIR;
     const char *fixed_path = "validate/small/MNI152_T1_2mm.nii.gz";
     const char *moving_path = "validate/small/T1_head_2mm.nii.gz";
 

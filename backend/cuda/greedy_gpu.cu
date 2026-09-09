@@ -64,7 +64,7 @@ int greedy_register_gpu(const image_t *fixed, const image_t *moving,
                         const float init_affine_44[4][4],
                         greedy_opts_t opts, greedy_result_t *result)
 {
-    memset(result, 0, sizeof(greedy_result_t));
+    if (greedy_result_init(result) != 0) return -1;
     memcpy(result->affine_44, init_affine_44, 16 * sizeof(float));
 
     int fD = fixed->data.shape[2], fH = fixed->data.shape[3], fW = fixed->data.shape[4];

@@ -65,6 +65,27 @@ int cpu_trilinear_resize(const tensor_t *input, tensor_t *output,
  * Uses trilinear interpolation with zeros padding. */
 void cpu_warp_inverse(const float *u, float *inv, int D, int H, int W, int n_iters);
 
+/* Moving-image pyramid dimensions for a given fixed-image shrink factor.
+ * The shrink factor is defined on the fixed image. Applying the same integer
+ * factor to the moving image drives the moving coarser than the fixed whenever
+ * its voxels are larger: a 2mm moving against a 1mm fixed at scale 4 becomes
+ * 8mm against 4mm, and the optimiser fits blur instead of anatomy. This caps
+ * the moving factor so its physical resolution is never coarser than the
+ * fixed's at that level. Spacing is indexed [W,H,D] as in image_meta_t. */
+void moving_pyramid_size(int scale, const double fixed_spacing[3],
+                         const double moving_spacing[3], int mD, int mH, int mW,
+                         int *odD, int *odH, int *odW);
+
+/* Separable Gaussian blur of a [D,H,W,3] displacement field in place. */
+void cpu_blur_disp_dhw3(float *data, int D, int H, int W, float sigma);
+
+/* WarpAdam step on a [D,H,W,3] displacement field (matches GPU warp_adam):
+ * Adam moments -> direction, max-L2 normalize, compositive update, smooth.
+ * adam_dir is caller scratch of the same size; warp is updated in place. */
+void cpu_warp_adam_step(float *warp, const float *grad, float *exp_avg, float *exp_avg_sq,
+                        float *adam_dir, int D, int H, int W, int *step_t,
+                        float lr, float beta1, float beta2, float eps, float smooth_warp_sigma);
+
 #ifdef __cplusplus
 }
 #endif

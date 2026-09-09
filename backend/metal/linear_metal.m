@@ -30,20 +30,37 @@
 /* Allocate a Metal shared-memory buffer and register it for dispatch.
    Returns the CPU-accessible pointer (buf.contents). */
 static float *metal_alloc_buf(size_t bytes, id<MTLBuffer> *out_buf) {
+    *out_buf = nil;
+    if (metal_had_fatal_error()) return NULL;
     id<MTLBuffer> buf = [g_metal.device newBufferWithLength:bytes
                                                    options:MTLResourceStorageModeShared];
-    if (!buf) return NULL;
+    if (!buf) {
+        fprintf(stderr, "linear Metal: could not allocate %zu-byte buffer\n", bytes);
+        metal_record_fatal_error("buffer allocation");
+        return NULL;
+    }
     float *ptr = (float *)buf.contents;
+    if (!ptr) {
+        metal_record_fatal_error("buffer mapping");
+        return NULL;
+    }
     metal_register_buffer(ptr, (__bridge void *)buf, bytes);
+    if (!metal_buffer_from_ptr(ptr)) return NULL;
     *out_buf = buf;
     return ptr;
 }
 
 /* Free a Metal buffer and unregister it. */
 static void metal_free_buf(float *ptr, id<MTLBuffer> buf) {
-    if (ptr) metal_unregister_buffer(ptr);
+    if (ptr && metal_buffer_from_ptr(ptr)) metal_unregister_buffer(ptr);
     /* ARC releases the MTLBuffer when buf goes out of scope */
     (void)buf;
+}
+
+static int linear_metal_abort(const char *stage, const char *message) {
+    fprintf(stderr, "%s: %s\n", stage, message);
+    metal_context_cleanup();
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -137,6 +154,7 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
 {
     @autoreleasepool {
 
+    metal_clear_fatal_error();
     memset(result, 0, sizeof(rigid_result_t));
 
     int fD=fixed->data.shape[2], fH=fixed->data.shape[3], fW=fixed->data.shape[4];
@@ -147,10 +165,8 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
     float *d_fixed = metal_alloc_buf((size_t)fD*fH*fW*sizeof(float), &fixed_buf);
     float *d_moving = metal_alloc_buf((size_t)mD*mH*mW*sizeof(float), &moving_buf);
     if (!d_fixed || !d_moving) {
-        fprintf(stderr, "rigid_register_metal: buffer allocation failed\n");
-        if (d_fixed)  metal_free_buf(d_fixed, fixed_buf);
-        if (d_moving) metal_free_buf(d_moving, moving_buf);
-        return -1;
+        return linear_metal_abort("rigid_register_metal",
+                                  "image allocation failed");
     }
 
     /* Copy image data to shared buffers (no cudaMemcpy needed — just memcpy) */
@@ -194,10 +210,9 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
         if (dD < 8) dD = 8; if (dH < 8) dH = 8; if (dW < 8) dW = 8;
         if (scale == 1) { dD = fD; dH = fH; dW = fW; }
 
-        int mdD = (scale > 1) ? mD/scale : mD;
-        int mdH = (scale > 1) ? mH/scale : mH;
-        int mdW = (scale > 1) ? mW/scale : mW;
-        if (mdD < 8) mdD = 8; if (mdH < 8) mdH = 8; if (mdW < 8) mdW = 8;
+        int mdD, mdH, mdW;
+        moving_pyramid_size(scale, fixed->meta.spacing, moving->meta.spacing,
+                            mD, mH, mW, &mdD, &mdH, &mdW);
         if (scale == 1) { mdD = mD; mdH = mH; mdW = mW; }
 
         long spatial = (long)dD * dH * dW;
@@ -212,6 +227,9 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
         if (scale > 1) {
             d_fdown = metal_alloc_buf(spatial*sizeof(float), &fdown_buf);
             d_mdown = metal_alloc_buf(mSDown*sizeof(float), &mdown_buf);
+            if (!d_fdown || !d_mdown)
+                return linear_metal_abort("rigid_register_metal",
+                                          "pyramid allocation failed");
             if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
                 metal_blur_downsample(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
                 metal_blur_downsample(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
@@ -225,6 +243,9 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
                               0.5f * (float)fD / (float)dD,
                               0.5f * (float)fH / (float)dH,
                               0.5f * (float)fW / (float)dW);
+            if (metal_had_fatal_error())
+                return linear_metal_abort("rigid_register_metal",
+                                          "pyramid construction failed");
         } else {
             d_fdown = d_fixed;
             d_mdown = d_moving;
@@ -238,6 +259,14 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
         float *d_moved     = metal_alloc_buf(spatial*sizeof(float), &moved_buf);
         float *d_grad_moved= metal_alloc_buf(spatial*sizeof(float), &gmoved_buf);
         float *d_grad_grid = metal_alloc_buf(n3*sizeof(float), &ggrid_buf);
+        metal_cc_workspace_t cc_workspace = {0};
+        if (opts.loss_type == LOSS_CC &&
+            metal_cc_workspace_init(&cc_workspace, (int)spatial, 1) != 0)
+            return linear_metal_abort("rigid_register_metal",
+                                      "CC workspace allocation failed");
+        if (!d_aff || !d_grid || !d_moved || !d_grad_moved || !d_grad_grid)
+            return linear_metal_abort("rigid_register_metal",
+                                      "per-scale workspace allocation failed");
 
         /* Reset Adam per scale */
         adam_step = 0;
@@ -298,8 +327,9 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
                                   dD, dH, dW, nbins, &loss);
             } else {
                 metal_cc_loss_3d(d_moved, d_fdown, d_grad_moved, dD, dH, dW,
-                                  opts.cc_kernel_size, &loss);
+                                  opts.cc_kernel_size, &loss, &cc_workspace);
             }
+            if (metal_had_fatal_error()) break;
 
             metal_grid_sample_3d_bwd(d_grad_moved, d_mdown, d_grid,
                                       d_grad_grid, 1, 1, mdD, mdH, mdW, dD, dH, dW);
@@ -307,6 +337,7 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
             /* Affine grid backward: dL/dA [12 values] — GPU reduction, result on CPU */
             float dL_dA_comb[12];
             metal_affine_grid_backward(d_grad_grid, dD, dH, dW, dL_dA_comb);
+            if (metal_had_fatal_error()) break;
 
             /* Chain rule: dL/d(phys) = p2t^T @ dL/d(comb) @ t2p^T */
             mat44d dL_comb_44 = {{{0}}};
@@ -373,6 +404,10 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
 
             for (int k = 0; k < 4; k++) quat[k] = params7[k];
             for (int k = 0; k < 3; k++) transl[k] = params7[4+k];
+            float qnorm = sqrtf(quat[0]*quat[0] + quat[1]*quat[1] +
+                                quat[2]*quat[2] + quat[3]*quat[3]);
+            if (qnorm > 1e-8f)
+                for (int k = 0; k < 4; k++) quat[k] /= qnorm;
 
             if (it % 50 == 0 || it == iters - 1)
                 if (cfireants_verbose >= 2) fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
@@ -389,10 +424,14 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
         metal_free_buf(d_moved, moved_buf);
         metal_free_buf(d_grad_moved, gmoved_buf);
         metal_free_buf(d_grad_grid, ggrid_buf);
+        metal_cc_workspace_cleanup(&cc_workspace);
         if (scale > 1) {
             metal_free_buf(d_fdown, fdown_buf);
             metal_free_buf(d_mdown, mdown_buf);
         }
+        if (metal_had_fatal_error())
+            return linear_metal_abort("rigid_register_metal",
+                                      "GPU iteration failed");
     }
 
     /* Extract final rigid matrix */
@@ -415,6 +454,9 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
         float *d_aff2  = metal_alloc_buf(12*sizeof(float), &aff2_buf);
         float *d_grid2 = metal_alloc_buf((size_t)fD*fH*fW*3*sizeof(float), &grid2_buf);
         float *d_moved2= metal_alloc_buf((size_t)fD*fH*fW*sizeof(float), &moved2_buf);
+        if (!d_aff2 || !d_grid2 || !d_moved2)
+            return linear_metal_abort("rigid_register_metal",
+                                      "evaluation allocation failed");
 
         float phys44[4][4] = {{0}};
         for (int i = 0; i < 3; i++)
@@ -432,7 +474,8 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
         memcpy(d_aff2, ha, 12*sizeof(float));
         metal_affine_grid_3d(d_aff2, d_grid2, 1, fD, fH, fW);
         metal_grid_sample_3d_fwd(d_moving, d_grid2, d_moved2, 1, 1, mD, mH, mW, fD, fH, fW);
-        metal_cc_loss_3d(d_moved2, d_fixed, NULL, fD, fH, fW, 9, &result->ncc_loss);
+        metal_cc_loss_3d(d_moved2, d_fixed, NULL, fD, fH, fW, 9,
+                         &result->ncc_loss, NULL);
 
         metal_free_buf(d_aff2, aff2_buf);
         metal_free_buf(d_grid2, grid2_buf);
@@ -443,7 +486,7 @@ int rigid_register_metal(const image_t *fixed, const image_t *moving,
     metal_free_buf(d_moving, moving_buf);
 
     } /* @autoreleasepool */
-    return 0;
+    return metal_had_fatal_error() ? -1 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -456,6 +499,7 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
 {
     @autoreleasepool {
 
+    metal_clear_fatal_error();
     memset(result, 0, sizeof(affine_result_t));
 
     int fD=fixed->data.shape[2], fH=fixed->data.shape[3], fW=fixed->data.shape[4];
@@ -466,10 +510,8 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
     float *d_fixed = metal_alloc_buf((size_t)fD*fH*fW*sizeof(float), &fixed_buf);
     float *d_moving = metal_alloc_buf((size_t)mD*mH*mW*sizeof(float), &moving_buf);
     if (!d_fixed || !d_moving) {
-        fprintf(stderr, "affine_register_metal: buffer allocation failed\n");
-        if (d_fixed)  metal_free_buf(d_fixed, fixed_buf);
-        if (d_moving) metal_free_buf(d_moving, moving_buf);
-        return -1;
+        return linear_metal_abort("affine_register_metal",
+                                  "image allocation failed");
     }
 
     memcpy(d_fixed, fixed->data.data, (size_t)fD*fH*fW*sizeof(float));
@@ -501,8 +543,10 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
         int scale = opts.scales[si], iters = opts.iterations[si];
         int dD=(scale>1)?fD/scale:fD, dH=(scale>1)?fH/scale:fH, dW=(scale>1)?fW/scale:fW;
         if(dD<8)dD=8; if(dH<8)dH=8; if(dW<8)dW=8; if(scale==1){dD=fD;dH=fH;dW=fW;}
-        int mdD=(scale>1)?mD/scale:mD, mdH=(scale>1)?mH/scale:mH, mdW=(scale>1)?mW/scale:mW;
-        if(mdD<8)mdD=8; if(mdH<8)mdH=8; if(mdW<8)mdW=8; if(scale==1){mdD=mD;mdH=mH;mdW=mW;}
+        int mdD, mdH, mdW;
+        moving_pyramid_size(scale, fixed->meta.spacing, moving->meta.spacing,
+                            mD, mH, mW, &mdD, &mdH, &mdW);
+        if(scale==1){mdD=mD;mdH=mH;mdW=mW;}
 
         long spatial=(long)dD*dH*dW, n3=spatial*3, mSD=(long)mdD*mdH*mdW;
 
@@ -513,6 +557,9 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
         if (scale > 1) {
             d_fdown = metal_alloc_buf(spatial*sizeof(float), &fdown_buf);
             d_mdown = metal_alloc_buf(mSD*sizeof(float), &mdown_buf);
+            if (!d_fdown || !d_mdown)
+                return linear_metal_abort("affine_register_metal",
+                                          "pyramid allocation failed");
             if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR) {
                 metal_blur_downsample(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
                 metal_blur_downsample(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
@@ -520,6 +567,9 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
                 metal_downsample_fft(d_fixed, d_fdown, 1, 1, fD, fH, fW, dD, dH, dW);
                 metal_downsample_fft(d_moving, d_mdown, 1, 1, mD, mH, mW, mdD, mdH, mdW);
             }
+            if (metal_had_fatal_error())
+                return linear_metal_abort("affine_register_metal",
+                                          "pyramid construction failed");
         } else {
             d_fdown = d_fixed; d_mdown = d_moving;
             mdD = mD; mdH = mH; mdW = mW;
@@ -531,6 +581,14 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
         float *d_moved     = metal_alloc_buf(spatial*sizeof(float), &moved_buf);
         float *d_grad_moved= metal_alloc_buf(spatial*sizeof(float), &gmoved_buf);
         float *d_grad_grid = metal_alloc_buf(n3*sizeof(float), &ggrid_buf);
+        metal_cc_workspace_t cc_workspace = {0};
+        if (opts.loss_type == LOSS_CC &&
+            metal_cc_workspace_init(&cc_workspace, (int)spatial, 1) != 0)
+            return linear_metal_abort("affine_register_metal",
+                                      "CC workspace allocation failed");
+        if (!d_aff || !d_grid || !d_moved || !d_grad_moved || !d_grad_grid)
+            return linear_metal_abort("affine_register_metal",
+                                      "per-scale workspace allocation failed");
 
         adam_step = 0;
         memset(adam_m, 0, sizeof(adam_m));
@@ -572,14 +630,16 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
                                   dD, dH, dW, nbins, &loss);
             } else {
                 metal_cc_loss_3d(d_moved, d_fdown, d_grad_moved, dD, dH, dW,
-                                  opts.cc_kernel_size, &loss);
+                                  opts.cc_kernel_size, &loss, &cc_workspace);
             }
+            if (metal_had_fatal_error()) break;
 
             metal_grid_sample_3d_bwd(d_grad_moved, d_mdown, d_grid,
                                       d_grad_grid, 1, 1, mdD, mdH, mdW, dD, dH, dW);
 
             float dL_dA_comb[12];
             metal_affine_grid_backward(d_grad_grid, dD, dH, dW, dL_dA_comb);
+            if (metal_had_fatal_error()) break;
 
             /* Chain rule to physical space */
             mat44d dL44 = {{{0}}};
@@ -629,10 +689,14 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
         metal_free_buf(d_moved, moved_buf);
         metal_free_buf(d_grad_moved, gmoved_buf);
         metal_free_buf(d_grad_grid, ggrid_buf);
+        metal_cc_workspace_cleanup(&cc_workspace);
         if (scale > 1) {
             metal_free_buf(d_fdown, fdown_buf);
             metal_free_buf(d_mdown, mdown_buf);
         }
+        if (metal_had_fatal_error())
+            return linear_metal_abort("affine_register_metal",
+                                      "GPU iteration failed");
     }
 
     /* Extract physical affine */
@@ -648,6 +712,9 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
         float *d_a  = metal_alloc_buf(12*sizeof(float), &a_buf);
         float *d_g  = metal_alloc_buf((size_t)fD*fH*fW*3*sizeof(float), &g_buf);
         float *d_m2 = metal_alloc_buf((size_t)fD*fH*fW*sizeof(float), &m2_buf);
+        if (!d_a || !d_g || !d_m2)
+            return linear_metal_abort("affine_register_metal",
+                                      "evaluation allocation failed");
 
         float p44[4][4] = {{0}};
         for (int i = 0; i < 3; i++)
@@ -665,7 +732,8 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
         memcpy(d_a, ha, 12*sizeof(float));
         metal_affine_grid_3d(d_a, d_g, 1, fD, fH, fW);
         metal_grid_sample_3d_fwd(d_moving, d_g, d_m2, 1, 1, mD, mH, mW, fD, fH, fW);
-        metal_cc_loss_3d(d_m2, d_fixed, NULL, fD, fH, fW, 9, &result->ncc_loss);
+        metal_cc_loss_3d(d_m2, d_fixed, NULL, fD, fH, fW, 9,
+                         &result->ncc_loss, NULL);
 
         metal_free_buf(d_a, a_buf);
         metal_free_buf(d_g, g_buf);
@@ -676,5 +744,5 @@ int affine_register_metal(const image_t *fixed, const image_t *moving,
     metal_free_buf(d_moving, moving_buf);
 
     } /* @autoreleasepool */
-    return 0;
+    return metal_had_fatal_error() ? -1 : 0;
 }

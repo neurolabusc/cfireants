@@ -3,6 +3,7 @@
  */
 
 #include "cfireants/tensor.h"
+#include "test_data_dir.h"
 #include "cfireants/image.h"
 #include "cfireants/backend.h"
 #include "cfireants/registration.h"
@@ -103,7 +104,7 @@ static int test_rigid(const char *data_dir, const char *dataset,
 }
 
 int main(int argc, char **argv) {
-    const char *data_dir = "cfireants/tests/test_data";
+    const char *data_dir = TEST_DATA_DIR;
     if (argc > 1) data_dir = argv[1];
 
     cfireants_init_cpu();

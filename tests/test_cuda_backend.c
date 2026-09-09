@@ -5,6 +5,7 @@
  */
 
 #include "cfireants/tensor.h"
+#include "test_data_dir.h"
 #include "cfireants/backend.h"
 #include "cfireants/image.h"
 #include "cfireants/interpolator.h"
@@ -56,7 +57,7 @@ int main(int argc, char **argv) {
     printf("CUDA not compiled in, skipping\n");
     return 0;
 #else
-    const char *dir = "cfireants/tests/test_data";
+    const char *dir = TEST_DATA_DIR;
     if (argc > 1) dir = argv[1];
 
     cuda_print_device_info();

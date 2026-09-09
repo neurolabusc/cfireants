@@ -4,10 +4,14 @@ project(cfireants C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-option(CFIREANTS_CUDA "Build with CUDA backend" ON)
-option(CFIREANTS_WEBGPU "Build with WebGPU backend (future)" OFF)
+option(CFIREANTS_CUDA "Build with CUDA backend" OFF)
+option(CFIREANTS_WEBGPU "Build with WebGPU backend" OFF)
 option(CFIREANTS_METAL "Build with Metal backend (macOS/Apple Silicon)" OFF)
 option(CFIREANTS_EMBED_METALLIB "Embed Metal shaders in executable (for distribution)" OFF)
+option(CFIREANTS_THREADS "Enable pthread-based CPU parallelism" ON)
+option(CFIREANTS_ZLIB "Link zlib for gzip NIfTI support (off for WASM: gzip handled in JS)" ON)
+# OFF for the macOS package: Homebrew's libzstd is not on a user's machine.
+option(CFIREANTS_ZSTD "Link zstd for zstd-compressed NIfTI support" ON)
 
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter")
@@ -18,8 +22,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Find zlib (required for NIfTI gzip support)
-find_package(ZLIB REQUIRED)
+# zlib is optional: the WASM build handles gzip in the JS wrapper instead
+if(CFIREANTS_ZLIB)
+    find_package(ZLIB REQUIRED)
+endif()
+if(CFIREANTS_THREADS)
+    find_package(Threads REQUIRED)
+endif()
 
 # Core C library (always built)
 add_library(cfireants STATIC
@@ -29,24 +38,38 @@ add_library(cfireants STATIC
     src/interpolator.c
     src/losses.c
     src/utils.c
+    src/threading.c
     backend/cpu/backend_cpu.c
 )
 
 target_include_directories(cfireants PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(cfireants PUBLIC ZLIB::ZLIB m)
-
-# Check for zstd (optional)
-find_library(ZSTD_LIB zstd)
-if(ZSTD_LIB)
-    target_compile_definitions(cfireants PRIVATE HAVE_ZSTD)
-    target_link_libraries(cfireants PUBLIC ${ZSTD_LIB})
-    message(STATUS "Found zstd: ${ZSTD_LIB}")
+target_link_libraries(cfireants PUBLIC m)
+if(CFIREANTS_THREADS)
+    target_compile_definitions(cfireants PRIVATE CFIREANTS_THREADS)
+    target_link_libraries(cfireants PUBLIC Threads::Threads)
 endif()
 
-# Always define HAVE_ZLIB since we require it
-target_compile_definitions(cfireants PRIVATE HAVE_ZLIB)
+# Check for zstd (optional). Skipped when cross-compiling: find_library would
+# match the host library, which cannot link into the target.
+if(CFIREANTS_ZSTD)
+    find_library(ZSTD_LIB zstd)
+    find_path(ZSTD_INCLUDE_DIR zstd.h)
+    # Both, not just the library: linking zstd without its header made nifti_io.c
+    # fail to compile on any machine with Homebrew zstd installed.
+    if(ZSTD_LIB AND ZSTD_INCLUDE_DIR AND NOT CMAKE_CROSSCOMPILING)
+        target_compile_definitions(cfireants PRIVATE HAVE_ZSTD)
+        target_include_directories(cfireants PRIVATE ${ZSTD_INCLUDE_DIR})
+        target_link_libraries(cfireants PUBLIC ${ZSTD_LIB})
+        message(STATUS "Found zstd: ${ZSTD_LIB}")
+    endif()
+endif()
+
+if(CFIREANTS_ZLIB)
+    target_compile_definitions(cfireants PRIVATE HAVE_ZLIB)
+    target_link_libraries(cfireants PUBLIC ZLIB::ZLIB)
+endif()
 
 # CUDA backend
 if(CFIREANTS_CUDA)
@@ -147,18 +170,39 @@ target_link_libraries(test_cuda_backend cfireants cfireants_gpu)
 if(CFIREANTS_WEBGPU)
     # wgpu-native: expect pre-downloaded in third_party/wgpu/
     set(WGPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wgpu")
-    if(NOT EXISTS "${WGPU_DIR}/lib/libwgpu_native.a")
-        message(FATAL_ERROR "wgpu-native not found at ${WGPU_DIR}/lib/libwgpu_native.a\n"
-                "Download from https://github.com/gfx-rs/wgpu-native/releases and extract to third_party/wgpu/")
+    # Emscripten gets its WebGPU implementation from the emdawnwebgpu port, which
+    # forwards to the browser's own WebGPU. wgpu-native is native-only.
+    if(NOT EMSCRIPTEN)
+        if(NOT EXISTS "${WGPU_DIR}/lib/libwgpu_native.a")
+            message(FATAL_ERROR "wgpu-native not found at ${WGPU_DIR}/lib/libwgpu_native.a\n"
+                    "Download from https://github.com/gfx-rs/wgpu-native/releases and extract to third_party/wgpu/")
+        endif()
+        add_library(wgpu_native STATIC IMPORTED)
+        set_target_properties(wgpu_native PROPERTIES
+            IMPORTED_LOCATION "${WGPU_DIR}/lib/libwgpu_native.a"
+            INTERFACE_INCLUDE_DIRECTORIES "${WGPU_DIR}/include"
+        )
     endif()
 
-    add_library(wgpu_native STATIC IMPORTED)
-    set_target_properties(wgpu_native PROPERTIES
-        IMPORTED_LOCATION "${WGPU_DIR}/lib/libwgpu_native.a"
-        INTERFACE_INCLUDE_DIRECTORIES "${WGPU_DIR}/include"
-    )
+    # Regenerate the embedded shader table whenever a .wgsl changes, so the
+    # compiled-in copy can never drift from the source the pipelines expect.
+    file(GLOB WGSL_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/backend/webgpu/shaders/*.wgsl)
+    set(CFIREANTS_EMBEDDED_SHADERS_C
+        ${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_shaders.c)
+    add_custom_command(
+        OUTPUT ${CFIREANTS_EMBEDDED_SHADERS_C}
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                ${CMAKE_CURRENT_BINARY_DIR}/generated
+        COMMAND ${CMAKE_COMMAND} -E env python3
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_shaders.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/backend/webgpu/shaders
+                ${CFIREANTS_EMBEDDED_SHADERS_C}
+        DEPENDS ${WGSL_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_shaders.py
+        COMMENT "Embedding WGSL shaders")
 
     add_library(cfireants_webgpu STATIC
+        ${CFIREANTS_EMBEDDED_SHADERS_C}
         backend/webgpu/webgpu_context.c
         backend/webgpu/backend_webgpu.c
         backend/webgpu/backend_webgpu_ops.c
@@ -175,12 +219,20 @@ if(CFIREANTS_WEBGPU)
     target_include_directories(cfireants_webgpu PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/backend/webgpu
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft
-        ${WGPU_DIR}/include
     )
+    # Native only: under Emscripten these headers would shadow the emdawnwebgpu
+    # port's own webgpu.h, which is the one that declares the browser entry points.
+    if(NOT EMSCRIPTEN)
+        target_include_directories(cfireants_webgpu PRIVATE ${WGPU_DIR}/include)
+    endif()
     target_include_directories(cfireants_webgpu PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_compile_definitions(cfireants PUBLIC CFIREANTS_HAS_WEBGPU)
+    if(EMSCRIPTEN)
+        target_compile_options(cfireants_webgpu PUBLIC --use-port=emdawnwebgpu)
+        target_link_libraries(cfireants_webgpu PUBLIC cfireants m)
+    else()
     target_link_libraries(cfireants_webgpu PUBLIC cfireants wgpu_native pthread m)
     if(APPLE)
         target_link_libraries(cfireants_webgpu PUBLIC
@@ -192,8 +244,13 @@ if(CFIREANTS_WEBGPU)
     else()
         target_link_libraries(cfireants_webgpu PUBLIC dl)
     endif()
+    endif()
 
-    message(STATUS "WebGPU backend enabled (wgpu-native)")
+    if(EMSCRIPTEN)
+        message(STATUS "WebGPU backend enabled (emdawnwebgpu)")
+    else()
+        message(STATUS "WebGPU backend enabled (wgpu-native)")
+    endif()
 endif()
 
 # Metal backend (macOS only)
@@ -301,6 +358,8 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "CUDA backend: ${CFIREANTS_CUDA}")
 message(STATUS "WebGPU backend: ${CFIREANTS_WEBGPU}")
 message(STATUS "Metal backend: ${CFIREANTS_METAL}")
+message(STATUS "CPU threads: ${CFIREANTS_THREADS}")
+message(STATUS "zlib gzip:   ${CFIREANTS_ZLIB}")
 
 add_executable(test_validate_greedy tests/test_validate_all.c
     src/registration/moments.c src/registration/rigid.c src/registration/affine.c)
@@ -348,8 +407,22 @@ if(CFIREANTS_METAL)
 endif()
 
 
+# CPU/GPU numerical-equivalence regression test (all compiled-in backends)
+add_executable(test_backend_parity tests/test_backend_parity.c
+    src/registration/moments.c src/registration/rigid.c
+    src/registration/affine.c src/registration/greedy.c src/registration/syn.c)
+target_link_libraries(test_backend_parity cfireants cfireants_gpu)
+
 add_executable(test_cc_compare tests/test_cc_compare.c)
 target_link_libraries(test_cc_compare cfireants cfireants_gpu)
 
 add_executable(test_cc_compare_py tests/test_cc_compare_py.c)
 target_link_libraries(test_cc_compare_py cfireants cfireants_gpu)
+
+# Dataset paths are repo-root relative. CUDA-only and long full-dataset
+# validation programs are built but not registered.
+enable_testing()
+foreach(t test_phase2 test_phase3 test_phase4 test_phase5 test_phase6 test_backend_parity)
+    add_test(NAME ${t} COMMAND ${t} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+endforeach()
+set_tests_properties(test_backend_parity PROPERTIES SKIP_RETURN_CODE 77)

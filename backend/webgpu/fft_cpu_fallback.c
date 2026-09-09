@@ -25,6 +25,7 @@
 #include <float.h>
 
 #include "kiss_fftnd.h"
+#include "webgpu_context.h"
 
 void webgpu_downsample_fft(
     const float *input, float *output,
@@ -70,6 +71,16 @@ void webgpu_downsample_fft(
     kiss_fft_cpx *unshifted   = (kiss_fft_cpx *)malloc(spatial_out * sizeof(kiss_fft_cpx));
     kiss_fft_cpx *ifft_out    = (kiss_fft_cpx *)malloc(spatial_out * sizeof(kiss_fft_cpx));
 
+    if (!plan_fwd || !plan_inv || !fft_in || !fft_out || !shifted ||
+        !cropped || !trimmed || !unshifted || !ifft_out) {
+        fprintf(stderr, "webgpu_downsample_fft: host workspace allocation failed\n");
+        wgpu_record_fatal_error("FFT host workspace allocation");
+        free(fft_in); free(fft_out); free(shifted);
+        free(cropped); free(trimmed); free(unshifted); free(ifft_out);
+        free(plan_fwd); free(plan_inv);
+        return;
+    }
+
     for (int bc = 0; bc < B * C; bc++) {
         const float *src = input + (long)bc * spatial_in;
         float *dst = output + (long)bc * spatial_out;
@@ -104,13 +115,26 @@ void webgpu_downsample_fft(
             }
         }
 
-        /* Crop centered region */
+        /* Crop centered region.
+         * The offsets go negative whenever the output is within `padding` of the
+         * input on an axis: oD == iD gives d0 = iD/2 - (iD/2 + 1) = -1, and the
+         * unguarded read then indexed before the allocation and segfaulted. That
+         * is reachable in normal use, both from moving_pyramid_size clamping a
+         * downsample factor to 1 and from the >= 8 floor on a 9-voxel axis. The
+         * out-of-range cells fall on the padding planes, which the inverse FFT
+         * trims, so zeroing them leaves the result unchanged. */
         for (int d = 0; d < cD; d++) {
+            int sd = d + d0;
             for (int h = 0; h < cH; h++) {
+                int sh = h + h0;
                 for (int w = 0; w < cW; w++) {
-                    long si = ((long)(d + d0) * iH + (h + h0)) * iW + (w + w0);
+                    int sw = w + w0;
                     long di = ((long)d * cH + h) * cW + w;
-                    cropped[di] = shifted[si];
+                    if (sd < 0 || sd >= iD || sh < 0 || sh >= iH || sw < 0 || sw >= iW) {
+                        cropped[di].r = 0.0f; cropped[di].i = 0.0f;
+                        continue;
+                    }
+                    cropped[di] = shifted[((long)sd * iH + sh) * iW + sw];
                 }
             }
         }

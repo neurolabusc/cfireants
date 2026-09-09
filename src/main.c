@@ -17,6 +17,7 @@
 #include "cfireants/tensor.h"
 #include "cfireants/image.h"
 #include "cfireants/backend.h"
+#include "cfireants/threading.h"
 #include "cfireants/registration.h"
 #include "cfireants/losses.h"
 #include "cfireants/interpolator.h"
@@ -77,6 +78,7 @@ typedef struct {
     int downsample_mode;
     int initial_moving_transform;  /* 0=none, 1=moments */
     int try_identity;              /* 1=also try identity+COM in moments */
+    int orientation;               /* moments candidates: 0=rot, 1=antirot, 2=both */
     const char *init_affine_path;  /* optional: initial 4x4 physical affine from file */
     int verbose;  /* 0=silent (errors only), 1=summary, 2=debug (per-iter) */
 } cli_config_t;
@@ -192,6 +194,15 @@ static int parse_metric(const char *arg, stage_config_t *stage) {
         stage->metric_type = LOSS_MI;
         stage->metric_param = atoi(arg + 3);
         if (stage->metric_param <= 0) stage->metric_param = 32;
+        /* Every GPU backend caps bins below any plausible request: CUDA and
+         * Metal at MAX_BINS=64, WebGPU at exactly 32. Over the cap they do not
+         * fall back, they print and return with the loss left at 0 and the
+         * gradient buffer never written, so the stage silently does nothing and
+         * the tolerance check then declares convergence. */
+        if (stage->metric_param > 64) {
+            fprintf(stderr, "MI bins capped at 64 (requested %d)\n", stage->metric_param);
+            stage->metric_param = 64;
+        }
     } else if (strncmp(arg, "CC[", 3) == 0) {
         stage->metric_type = LOSS_CC;
         stage->metric_param = atoi(arg + 3);
@@ -245,8 +256,10 @@ static void print_usage(const char *prog) {
         "\n"
         "Backend:\n"
         "  --backend <name>            cpu, metal, webgpu, cuda (default: best available)\n"
-        "  --trilinear                 Use trilinear downsample (default: FFT)\n"
+        "  --trilinear                 Use blur + trilinear downsample (default)\n"
+        "  --fft                       Use FFT downsample (GPU backends only)\n"
         "  --try-identity              Also try identity+COM and pure-identity in moments\n"
+        "  --orientation rot|antirot|both  Moments candidates (default rot; both admits mirror images)\n"
         "\n"
         "Initial transform:\n"
         "  --moments                   Initialize with center-of-mass + orientation (default)\n"
@@ -273,6 +286,7 @@ static void print_usage(const char *prog) {
         "  --syn                       Shorthand for Rigid + Affine + SyN (default)\n"
         "  --greedy                    Shorthand for Rigid + Affine + Greedy\n"
         "\n"
+        "  --threads <n>               Cap CPU worker threads (default: all cores)\n"
         "  -v, --verbose [level]       0=silent (default), 1=summary, 2=per-iteration\n"
         "  --version                   Print version and exit\n"
         "  -h, --help                  Show this help\n"
@@ -356,6 +370,10 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
     cfg->skullstrip_threshold = 0.5f;
     cfg->initial_moving_transform = 1; /* moments by default */
     cfg->backend = BACKEND_CPU;
+    /* This is the one pyramid implementation shared by every backend. Keeping
+     * it as the public default makes --backend a compute choice, not an
+     * algorithm choice. FFT remains an explicit GPU-only option. */
+    cfg->downsample_mode = DOWNSAMPLE_TRILINEAR;
 
     /* Auto-select best backend */
 #ifdef CFIREANTS_HAS_METAL
@@ -392,8 +410,25 @@ static int parse_args(int argc, char **argv, cli_config_t *cfg) {
             exit(0);
         } else if (strcmp(arg, "--trilinear") == 0) {
             cfg->downsample_mode = DOWNSAMPLE_TRILINEAR;
+        } else if (strcmp(arg, "--fft") == 0) {
+            cfg->downsample_mode = DOWNSAMPLE_FFT;
+        } else if (strcmp(arg, "--threads") == 0) {
+            NEED_ARG();
+            char *tend = NULL;
+            long nthr = strtol(argv[++i], &tend, 10);
+            if (tend == argv[i] || *tend || nthr < 1) {
+                fprintf(stderr, "--threads needs a positive integer, got '%s'\n", argv[i]);
+                return -1;
+            }
+            cfireants_set_num_threads((int)nthr);
         } else if (strcmp(arg, "--try-identity") == 0) {
             cfg->try_identity = 1;
+        } else if (strcmp(arg, "--orientation") == 0) {
+            NEED_ARG(); const char *o = argv[++i];
+            if (strcmp(o, "rot") == 0) cfg->orientation = 0;
+            else if (strcmp(o, "antirot") == 0) cfg->orientation = 1;
+            else if (strcmp(o, "both") == 0) cfg->orientation = 2;
+            else { fprintf(stderr, "Unknown orientation: %s\n", o); return -1; }
         } else if (strcmp(arg, "--moments") == 0) {
             cfg->initial_moving_transform = 1;
         } else if (strcmp(arg, "--no-moments") == 0) {
@@ -473,40 +508,41 @@ static const char *stage_name(stage_type_t t) {
 }
 
 int main(int argc, char **argv) {
+    int exit_code = 1;   /* every goto cleanup is a failure path */
     cli_config_t cfg;
     if (parse_args(argc, argv, &cfg) != 0) return 1;
     cfireants_verbose = cfg.verbose;
+    image_t fixed = {0}, moving = {0};
+    tensor_t final_moved = {0};
 
     /* Initialize backend */
     cfireants_init_cpu();
     if (cfg.backend == BACKEND_METAL) {
 #ifdef CFIREANTS_HAS_METAL
-        if (cfireants_init_metal() != 0) { fprintf(stderr, "Metal init failed\n"); return 1; }
+        if (cfireants_init_metal() != 0) { fprintf(stderr, "Metal init failed\n"); goto cleanup; }
 #else
-        fprintf(stderr, "Metal not compiled in\n"); return 1;
+        fprintf(stderr, "Metal not compiled in\n"); goto cleanup;
 #endif
     } else if (cfg.backend == BACKEND_WEBGPU) {
 #ifdef CFIREANTS_HAS_WEBGPU
-        if (cfireants_init_webgpu() != 0) { fprintf(stderr, "WebGPU init failed\n"); return 1; }
+        if (cfireants_init_webgpu() != 0) { fprintf(stderr, "WebGPU init failed\n"); goto cleanup; }
 #else
-        fprintf(stderr, "WebGPU not compiled in\n"); return 1;
+        fprintf(stderr, "WebGPU not compiled in\n"); goto cleanup;
 #endif
     } else if (cfg.backend == BACKEND_CUDA) {
 #ifdef CFIREANTS_HAS_CUDA
-        if (cfireants_init_cuda() != 0) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+        if (cfireants_init_cuda() != 0) { fprintf(stderr, "CUDA init failed\n"); goto cleanup; }
 #else
-        fprintf(stderr, "CUDA not compiled in\n"); return 1;
+        fprintf(stderr, "CUDA not compiled in\n"); goto cleanup;
 #endif
     }
 
     /* Load images */
-    image_t fixed, moving;
     if (image_load(&fixed, cfg.fixed_path, DEVICE_CPU) != 0) {
-        fprintf(stderr, "Failed to load fixed image: %s\n", cfg.fixed_path); return 1;
+        fprintf(stderr, "Failed to load fixed image: %s\n", cfg.fixed_path); goto cleanup;
     }
     if (image_load(&moving, cfg.moving_path, DEVICE_CPU) != 0) {
-        fprintf(stderr, "Failed to load moving image: %s\n", cfg.moving_path);
-        image_free(&fixed); return 1;
+        fprintf(stderr, "Failed to load moving image: %s\n", cfg.moving_path); goto cleanup;
     }
 
     int fD = fixed.data.shape[2], fH = fixed.data.shape[3], fW = fixed.data.shape[4];
@@ -518,8 +554,14 @@ int main(int argc, char **argv) {
                 cfg.backend == BACKEND_METAL ? "Metal" :
                 cfg.backend == BACKEND_WEBGPU ? "WebGPU" :
                 cfg.backend == BACKEND_CUDA ? "CUDA" : "CPU");
+        if (cfg.backend == BACKEND_CPU)
+            fprintf(stderr, "CPU threads: %d\n", cfireants_num_threads());
         fprintf(stderr, "Stages: %d\n", cfg.n_stages);
     }
+
+    /* FFT is deliberately opt-in: the CPU has no FFT pyramid. */
+    if (cfg.backend == BACKEND_CPU && cfg.downsample_mode != DOWNSAMPLE_TRILINEAR)
+        fprintf(stderr, "note: --fft is unavailable on CPU; using blur+trilinear\n");
 
     double t_total = get_time();
 
@@ -534,6 +576,7 @@ int main(int argc, char **argv) {
         double t0 = get_time();
         moments_opts_t mopts = moments_opts_default();
         mopts.try_identity = cfg.try_identity;
+        mopts.orientation = cfg.orientation;
         moments_register(&fixed, &moving, mopts, &mom);
         if (cfireants_verbose >= 1)
             fprintf(stderr, "Moments: %.1fs (NCC %.4f)\n", get_time() - t0, mom.ncc_loss);
@@ -555,11 +598,11 @@ int main(int argc, char **argv) {
     /* Override with external affine if provided (for cross-implementation testing) */
     if (cfg.init_affine_path) {
         FILE *af = fopen(cfg.init_affine_path, "r");
-        if (!af) { fprintf(stderr, "Cannot open --init-affine file: %s\n", cfg.init_affine_path); return 1; }
+        if (!af) { fprintf(stderr, "Cannot open --init-affine file: %s\n", cfg.init_affine_path); goto cleanup; }
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++)
                 if (fscanf(af, "%f", &affine_44[i][j]) != 1) {
-                    fprintf(stderr, "Failed to read 4x4 affine from %s\n", cfg.init_affine_path); fclose(af); return 1;
+                    fprintf(stderr, "Failed to read 4x4 affine from %s\n", cfg.init_affine_path); fclose(af); goto cleanup;
                 }
         fclose(af);
         for (int i = 0; i < 3; i++)
@@ -569,8 +612,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Loaded initial affine from %s\n", cfg.init_affine_path);
     }
 
-    tensor_t final_moved = {0};
-    (void)0; /* final_ncc removed — NCC printed per-stage */
 
     for (int si = 0; si < cfg.n_stages; si++) {
         stage_config_t *s = &cfg.stages[si];
@@ -608,10 +649,26 @@ int main(int argc, char **argv) {
 #endif
                 default: rc = rigid_register(&fixed, &moving, &mom, opts, &result); break;
             }
-            (void)rc;
+            if (rc != 0) {
+                fprintf(stderr, "stage failed (%d); no output written\n", rc);
+                goto cleanup;
+            }
             memcpy(rigid_mat, result.rigid_mat, sizeof(rigid_mat));
             memcpy(affine_mat, result.rigid_mat, sizeof(affine_mat));
+            /* Keep the cumulative 4x4 transform in sync when rigid is the
+             * final linear stage (or is followed directly by deformable
+             * registration). */
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 4; j++)
+                    affine_44[i][j] = rigid_mat[i][j];
+            affine_44[3][3] = 1.0f;
             if (cfireants_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
+            if (cfireants_verbose >= 2) {
+                fprintf(stderr, "  Rigid (physical space):\n");
+                for (int i = 0; i < 3; i++)
+                    fprintf(stderr, "    [%10.6f %10.6f %10.6f %10.4f]\n",
+                            rigid_mat[i][0], rigid_mat[i][1], rigid_mat[i][2], rigid_mat[i][3]);
+            }
 
         } else if (s->type == STAGE_AFFINE) {
             affine_opts_t opts = {
@@ -640,7 +697,10 @@ int main(int argc, char **argv) {
 #endif
                 default: rc = affine_register(&fixed, &moving, rigid_mat, opts, &result); break;
             }
-            (void)rc;
+            if (rc != 0) {
+                fprintf(stderr, "stage failed (%d); no output written\n", rc);
+                goto cleanup;
+            }
             memcpy(affine_mat, result.affine_mat, sizeof(affine_mat));
             /* Update 4x4 */
             for (int i = 0; i < 3; i++)
@@ -656,11 +716,16 @@ int main(int argc, char **argv) {
             }
 
         } else if (s->type == STAGE_SYN) {
+            /* SyN and Greedy are CC-only. Passing metric_param straight through
+             * turned --metric MI[32] into CC[32] silently, and the header still
+             * printed "MI bins=32" while a 32-voxel kernel ran on a 22^3 grid. */
+            if (s->metric_type != LOSS_CC)
+                fprintf(stderr, "SyN uses CC; ignoring the requested MI metric\n");
             syn_opts_t opts = {
                 .n_scales = s->n_levels,
                 .scales = s->shrink_factors,
                 .iterations = s->iterations,
-                .cc_kernel_size = s->metric_param,
+                .cc_kernel_size = (s->metric_type == LOSS_CC) ? s->metric_param : 5,
                 .lr = s->lr,
                 .smooth_warp_sigma = s->syn_warp_sigma,
                 .smooth_grad_sigma = s->syn_grad_sigma,
@@ -682,18 +747,25 @@ int main(int argc, char **argv) {
 #endif
                 default: rc = syn_register(&fixed, &moving, affine_44, opts, &result); break;
             }
-            (void)rc;
+            if (rc != 0) {
+                fprintf(stderr, "stage failed (%d); no output written\n", rc);
+                goto cleanup;
+            }
             if (final_moved.data) tensor_free(&final_moved);
             final_moved = result.moved;
+            tensor_free(&result.fwd_disp);
+            tensor_free(&result.rev_disp);
             /* NCC printed per-stage above */
             if (cfireants_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
 
         } else if (s->type == STAGE_GREEDY) {
+            if (s->metric_type != LOSS_CC)
+                fprintf(stderr, "Greedy uses CC; ignoring the requested MI metric\n");
             greedy_opts_t opts = {
                 .n_scales = s->n_levels,
                 .scales = s->shrink_factors,
                 .iterations = s->iterations,
-                .cc_kernel_size = s->metric_param,
+                .cc_kernel_size = (s->metric_type == LOSS_CC) ? s->metric_param : 5,
                 .lr = s->lr,
                 .smooth_warp_sigma = s->syn_warp_sigma,
                 .smooth_grad_sigma = s->syn_grad_sigma,
@@ -715,9 +787,13 @@ int main(int argc, char **argv) {
 #endif
                 default: rc = greedy_register(&fixed, &moving, affine_44, opts, &result); break;
             }
-            (void)rc;
+            if (rc != 0) {
+                fprintf(stderr, "stage failed (%d); no output written\n", rc);
+                goto cleanup;
+            }
             if (final_moved.data) tensor_free(&final_moved);
             final_moved = result.moved;
+            tensor_free(&result.disp);
             /* NCC printed per-stage above */
             if (cfireants_verbose >= 1) fprintf(stderr, "  %s: %.1fs (NCC %.4f)\n", stage_name(s->type), get_time() - t0, result.ncc_loss);
         }
@@ -730,48 +806,43 @@ int main(int argc, char **argv) {
         image_t mask_img;
         if (image_load(&mask_img, cfg.skullstrip_mask, DEVICE_CPU) != 0) {
             fprintf(stderr, "Failed to load mask: %s\n", cfg.skullstrip_mask);
-        } else {
-            mat44d pd2, tm2, cb2;
-            for (int i = 0; i < 4; i++)
-                for (int j = 0; j < 4; j++) pd2.m[i][j] = affine_44[i][j];
-            mat44d_mul(&tm2, &pd2, &fixed.meta.torch2phy);
-            mat44d_mul(&cb2, &mask_img.meta.phy2torch, &tm2);
-            float ha2[12]; for (int i=0;i<3;i++) for(int j=0;j<4;j++) ha2[i*4+j]=(float)cb2.m[i][j];
+            goto cleanup;
+        }
+        mat44d pd2, tm2, cb2;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++) pd2.m[i][j] = affine_44[i][j];
+        mat44d_mul(&tm2, &pd2, &fixed.meta.torch2phy);
+        mat44d_mul(&cb2, &mask_img.meta.phy2torch, &tm2);
+        float ha2[12]; for (int i=0;i<3;i++) for(int j=0;j<4;j++) ha2[i*4+j]=(float)cb2.m[i][j];
 
-            tensor_t aff2; int as2[3]={1,3,4};
-            tensor_alloc(&aff2,3,as2,DTYPE_FLOAT32,DEVICE_CPU);
-            memcpy(tensor_data_f32(&aff2), ha2, 48);
-            int fH = fixed.data.shape[3], fW = fixed.data.shape[4];
-            int gs2[3]={fD,fH,fW};
-            tensor_t grid2; affine_grid_3d(&aff2, gs2, &grid2);
-            tensor_t warped_mask; cpu_grid_sample_3d_forward(&mask_img.data, &grid2, &warped_mask, 1);
+        tensor_t aff2; int as2[3]={1,3,4};
+        tensor_alloc(&aff2,3,as2,DTYPE_FLOAT32,DEVICE_CPU);
+        memcpy(tensor_data_f32(&aff2), ha2, 48);
+        int fH = fixed.data.shape[3], fW = fixed.data.shape[4];
+        int gs2[3]={fD,fH,fW};
+        tensor_t grid2; affine_grid_3d(&aff2, gs2, &grid2);
+        tensor_t warped_mask; cpu_grid_sample_3d_forward(&mask_img.data, &grid2, &warped_mask, 1);
 
-            int fN = fD * fH * fW;
-            const float *mask_data = tensor_data_f32(&warped_mask);
-
-            const char *out = cfg.output_path;
-            if (ensure_parent_dir(out) != 0) {
-                tensor_free(&aff2); tensor_free(&grid2);
-                tensor_free(&warped_mask); image_free(&mask_img);
-                goto cleanup;
-            }
+        int fN = fD * fH * fW;
+        const char *out = cfg.output_path;
+        int rc = ensure_parent_dir(out);
+        if (rc == 0) {
             if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s (native datatype, threshold=%.2f)\n",
                     out, cfg.skullstrip_threshold);
-            image_skullstrip_save(out, cfg.fixed_path,
-                                   mask_data, cfg.skullstrip_threshold, fN);
-
-            tensor_free(&aff2); tensor_free(&grid2);
-            tensor_free(&warped_mask);
-            image_free(&mask_img);
+            rc = image_skullstrip_save(out, cfg.fixed_path, tensor_data_f32(&warped_mask),
+                                       cfg.skullstrip_threshold, fN);
         }
-        if (final_moved.data) tensor_free(&final_moved);
+        tensor_free(&aff2); tensor_free(&grid2);
+        tensor_free(&warped_mask);
+        image_free(&mask_img);
+        if (rc != 0) goto cleanup;
     } else if (final_moved.data) {
         /* Deformable output: save warped moving image */
-        if (ensure_parent_dir(cfg.output_path) != 0) { tensor_free(&final_moved); goto cleanup; }
+        if (ensure_parent_dir(cfg.output_path) != 0) goto cleanup;
         if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", cfg.output_path);
         int fN = fD * fixed.data.shape[3] * fixed.data.shape[4];
-        image_save_like(cfg.output_path, cfg.fixed_path, tensor_data_f32(&final_moved), fN);
-        tensor_free(&final_moved);
+        if (image_save_like(cfg.output_path, cfg.fixed_path, tensor_data_f32(&final_moved), fN) != 0)
+            goto cleanup;
     } else {
         /* Affine-only output: resample moving with affine and save */
         mat44d pd, tm, cb;
@@ -788,18 +859,24 @@ int main(int argc, char **argv) {
         tensor_t grid; affine_grid_3d(&aff_t, gs, &grid);
         tensor_t moved; cpu_grid_sample_3d_forward(&moving.data, &grid, &moved, 1);
 
-        if (ensure_parent_dir(cfg.output_path) != 0) {
-            tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved); goto cleanup;
+        int rc = ensure_parent_dir(cfg.output_path);
+        if (rc == 0) {
+            if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", cfg.output_path);
+            rc = image_save_like(cfg.output_path, cfg.fixed_path, tensor_data_f32(&moved),
+                                 fD * fixed.data.shape[3] * fixed.data.shape[4]);
         }
-        if (cfireants_verbose >= 1) fprintf(stderr, "Saving: %s\n", cfg.output_path);
-        image_save_like(cfg.output_path, cfg.fixed_path, tensor_data_f32(&moved),
-                         fD * fixed.data.shape[3] * fixed.data.shape[4]);
-
         tensor_free(&aff_t); tensor_free(&grid); tensor_free(&moved);
+        if (rc != 0) goto cleanup;
     }
 
+    exit_code = 0;
+
 cleanup:
+    tensor_free(&final_moved);
     image_free(&fixed);
     image_free(&moving);
-    return 0;
+    cfireants_cleanup();
+    /* Every goto cleanup above is a failure with no output written. Returning 0
+     * there reported success for a run that produced nothing. */
+    return exit_code;
 }

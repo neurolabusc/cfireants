@@ -33,17 +33,28 @@ typedef struct { float real, imag; } cfloat_t;
 
 /* Allocate a Metal shared-memory buffer and register it for dispatch. */
 static float *fft_alloc_buf(size_t bytes, id<MTLBuffer> *out_buf) {
+    *out_buf = nil;
+    if (metal_had_fatal_error()) return NULL;
     id<MTLBuffer> buf = [g_metal.device newBufferWithLength:bytes
                                                    options:MTLResourceStorageModeShared];
-    if (!buf) return NULL;
+    if (!buf) {
+        fprintf(stderr, "metal FFT: could not allocate %zu-byte buffer\n", bytes);
+        metal_record_fatal_error("FFT buffer allocation");
+        return NULL;
+    }
     float *ptr = (float *)buf.contents;
+    if (!ptr) {
+        metal_record_fatal_error("FFT buffer mapping");
+        return NULL;
+    }
     metal_register_buffer(ptr, (__bridge void *)buf, bytes);
+    if (!metal_buffer_from_ptr(ptr)) return NULL;
     *out_buf = buf;
     return ptr;
 }
 
 static void fft_free_buf(float *ptr, id<MTLBuffer> buf) {
-    if (ptr) metal_unregister_buffer(ptr);
+    if (ptr && metal_buffer_from_ptr(ptr)) metal_unregister_buffer(ptr);
     (void)buf;
 }
 
@@ -54,67 +65,84 @@ static void fft_free_buf(float *ptr, id<MTLBuffer> buf) {
  * For inverse (inverse=1): complex [D*H*W*2 floats] → complex [D*H*W*2 floats]
  *   (caller takes real part)
  */
-static void mpsgraph_fft_3d(const void *input_data, size_t input_bytes,
-                             void *output_data, size_t output_bytes,
-                             int D, int H, int W,
-                             int inverse, int is_complex_input)
+static int mpsgraph_fft_3d(const void *input_data, size_t input_bytes,
+                            void *output_data, size_t output_bytes,
+                            int D, int H, int W,
+                            int inverse, int is_complex_input)
 {
     @autoreleasepool {
-        MPSGraph *graph = [[MPSGraph alloc] init];
+        @try {
+            size_t expected = (size_t)D * H * W * sizeof(cfloat_t);
+            if (!input_data || !output_data || !g_metal.device ||
+                !g_metal.queue || output_bytes < expected) {
+                metal_record_fatal_error("invalid MPSGraph FFT setup");
+                return -1;
+            }
+            MPSGraph *graph = [[MPSGraph alloc] init];
+            if (!graph) {
+                metal_record_fatal_error("MPSGraph FFT graph allocation");
+                return -1;
+            }
 
-        NSArray<NSNumber *> *shape = @[@(D), @(H), @(W)];
-        MPSDataType inType = is_complex_input ? MPSDataTypeComplexFloat32 : MPSDataTypeFloat32;
+            NSArray<NSNumber *> *shape = @[@(D), @(H), @(W)];
+            MPSDataType inType = is_complex_input
+                ? MPSDataTypeComplexFloat32 : MPSDataTypeFloat32;
 
-        MPSGraphTensor *inputTensor = [graph placeholderWithShape:shape
-                                                         dataType:inType
-                                                             name:@"input"];
+            MPSGraphTensor *inputTensor = [graph placeholderWithShape:shape
+                                                             dataType:inType
+                                                                 name:@"input"];
 
-        MPSGraphFFTDescriptor *desc = [MPSGraphFFTDescriptor descriptor];
-        desc.inverse = inverse ? YES : NO;
-        desc.scalingMode = inverse ? MPSGraphFFTScalingModeSize : MPSGraphFFTScalingModeNone;
+            MPSGraphFFTDescriptor *desc = [MPSGraphFFTDescriptor descriptor];
+            desc.inverse = inverse ? YES : NO;
+            desc.scalingMode = inverse
+                ? MPSGraphFFTScalingModeSize : MPSGraphFFTScalingModeNone;
 
-        NSArray<NSNumber *> *axes = @[@0, @1, @2];
-        MPSGraphTensor *fftResult = [graph fastFourierTransformWithTensor:inputTensor
-                                                                     axes:axes
-                                                               descriptor:desc
-                                                                     name:@"fft3d"];
+            NSArray<NSNumber *> *axes = @[@0, @1, @2];
+            MPSGraphTensor *fftResult =
+                [graph fastFourierTransformWithTensor:inputTensor
+                                                 axes:axes
+                                           descriptor:desc
+                                                 name:@"fft3d"];
 
-        /* Create input MTLBuffer (shared memory — wraps existing data) */
-        id<MTLBuffer> inBuf = [g_metal.device newBufferWithBytes:input_data
-                                                          length:input_bytes
-                                                         options:MTLResourceStorageModeShared];
+            id<MTLBuffer> inBuf =
+                [g_metal.device newBufferWithBytes:input_data
+                                             length:input_bytes
+                                            options:MTLResourceStorageModeShared];
+            if (!inBuf) {
+                metal_record_fatal_error("MPSGraph FFT input allocation");
+                return -1;
+            }
 
-        /* Create output MTLBuffer (shared memory) */
-        size_t complex_bytes = (size_t)D * H * W * sizeof(cfloat_t);
-        id<MTLBuffer> outBuf = [g_metal.device newBufferWithLength:complex_bytes
-                                                           options:MTLResourceStorageModeShared];
+            MPSGraphTensorData *inputData = [[MPSGraphTensorData alloc]
+                initWithMTLBuffer:inBuf shape:shape dataType:inType];
+            if (!inputData || !inputTensor || !fftResult) {
+                metal_record_fatal_error("MPSGraph FFT tensor allocation");
+                return -1;
+            }
 
-        MPSGraphTensorData *inputData = [[MPSGraphTensorData alloc]
-            initWithMTLBuffer:inBuf shape:shape dataType:inType];
+            NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds =
+                @{ inputTensor : inputData };
+            NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
+                [graph runWithMTLCommandQueue:g_metal.queue
+                                        feeds:feeds
+                                targetTensors:@[fftResult]
+                             targetOperations:nil];
 
-        /* For the output, we need to tell MPSGraph where to write.
-         * Use runWithMTLCommandQueue:feeds:targetTensors:targetOperations:
-         * and then read back from the result's underlying buffer. */
-        NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds =
-            @{ inputTensor : inputData };
+            MPSGraphTensorData *resultData = results[fftResult];
+            MPSNDArray *ndarray = [resultData mpsndarray];
+            if (!resultData || !ndarray) {
+                metal_record_fatal_error("MPSGraph FFT execution");
+                return -1;
+            }
 
-        /* Create output tensor data backed by our buffer */
-        MPSGraphTensorData *outputData = [[MPSGraphTensorData alloc]
-            initWithMTLBuffer:outBuf shape:shape dataType:MPSDataTypeComplexFloat32];
-
-        NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
-            [graph runWithMTLCommandQueue:g_metal.queue
-                                    feeds:feeds
-                            targetTensors:@[fftResult]
-                         targetOperations:nil];
-
-        /* Copy result to output buffer.
-         * The graph returns new MPSGraphTensorData; read via mpsndarray → readBytes. */
-        MPSGraphTensorData *resultData = results[fftResult];
-        MPSNDArray *ndarray = [resultData mpsndarray];
-
-        /* Read the ndarray into our output buffer */
-        [ndarray readBytes:output_data strideBytes:nil];
+            [ndarray readBytes:output_data strideBytes:nil];
+            return 0;
+        } @catch (NSException *exception) {
+            fprintf(stderr, "metal FFT: MPSGraph exception: %s\n",
+                    [[exception reason] UTF8String]);
+            metal_record_fatal_error("MPSGraph FFT execution");
+            return -1;
+        }
     }
 }
 
@@ -145,6 +173,12 @@ void metal_downsample_fft(
     cfloat_t *trimmed  = (cfloat_t *)malloc(spatial_out * sizeof(cfloat_t));
     cfloat_t *unshift  = (cfloat_t *)malloc(spatial_out * sizeof(cfloat_t));
     cfloat_t *ifft_out = (cfloat_t *)malloc(spatial_out * sizeof(cfloat_t));
+    if (!fft_out || !shifted || !cropped || !trimmed || !unshift || !ifft_out) {
+        metal_record_fatal_error("FFT host workspace allocation");
+        free(fft_out); free(shifted); free(cropped);
+        free(trimmed); free(unshift); free(ifft_out);
+        return;
+    }
 
     for (int bc = 0; bc < B * C; bc++) {
         const float *src = input + (long)bc * spatial_in;
@@ -158,9 +192,10 @@ void metal_downsample_fft(
         }
 
         /* Forward 3D FFT via MPSGraph (real → complex) */
-        mpsgraph_fft_3d(src, spatial_in * sizeof(float),
-                         fft_out, spatial_in * sizeof(cfloat_t),
-                         iD, iH, iW, 0, 0);
+        if (mpsgraph_fft_3d(src, spatial_in * sizeof(float),
+                            fft_out, spatial_in * sizeof(cfloat_t),
+                            iD, iH, iW, 0, 0) != 0)
+            break;
 
         /* fftshift: shift by ceil(N/2) along each dim */
         for (long i = 0; i < spatial_in; i++) {
@@ -178,12 +213,20 @@ void metal_downsample_fft(
         int d0 = iD / 2 - (oD / 2 + padding);
         int h0 = iH / 2 - (oH / 2 + padding);
         int w0 = iW / 2 - (oW / 2 + padding);
+        /* Offsets go negative when the output is within `padding` of the input
+         * on an axis (oD == iD gives d0 = -1), which indexed before the
+         * allocation. Those cells land on padding planes the inverse FFT trims,
+         * so zeroing them leaves the result unchanged. */
         for (long i = 0; i < spatial_crop; i++) {
             int dw = i % cW;
             int dh = (int)((i / cW) % cH);
             int dd = (int)(i / ((long)cH * cW));
-            long si = ((long)(dd + d0) * iH + (dh + h0)) * iW + (dw + w0);
-            cropped[i] = shifted[si];
+            int sd = dd + d0, sh = dh + h0, sw = dw + w0;
+            if (sd < 0 || sd >= iD || sh < 0 || sh >= iH || sw < 0 || sw >= iW) {
+                cropped[i].real = 0.0f; cropped[i].imag = 0.0f;
+                continue;
+            }
+            cropped[i] = shifted[((long)sd * iH + sh) * iW + sw];
         }
 
         /* Gaussian window + scale */
@@ -227,9 +270,10 @@ void metal_downsample_fft(
         }
 
         /* Inverse 3D FFT via MPSGraph (complex → complex, with 1/N scaling) */
-        mpsgraph_fft_3d(unshift, spatial_out * sizeof(cfloat_t),
-                         ifft_out, spatial_out * sizeof(cfloat_t),
-                         oD, oH, oW, 1, 1);
+        if (mpsgraph_fft_3d(unshift, spatial_out * sizeof(cfloat_t),
+                            ifft_out, spatial_out * sizeof(cfloat_t),
+                            oD, oH, oW, 1, 1) != 0)
+            break;
 
         /* Take real part + clamp to original range */
         for (long i = 0; i < spatial_out; i++) {
@@ -251,6 +295,10 @@ void metal_downsample_fft(
 static float *make_gauss_kernel_fft(float sigma, int *out_klen) {
     if (sigma <= 0) {
         float *k = (float *)malloc(sizeof(float));
+        if (!k) {
+            metal_record_fatal_error("Gaussian kernel allocation");
+            return NULL;
+        }
         k[0] = 1.0f;
         *out_klen = 1;
         return k;
@@ -258,6 +306,10 @@ static float *make_gauss_kernel_fft(float sigma, int *out_klen) {
     int tail = (int)(2.0f * sigma + 0.5f);
     int klen = 2 * tail + 1;
     float *h = (float *)malloc(klen * sizeof(float));
+    if (!h) {
+        metal_record_fatal_error("Gaussian kernel allocation");
+        return NULL;
+    }
     float inv = 1.0f / (sigma * sqrtf(2.0f));
     float ksum = 0;
     for (int i = 0; i < klen; i++) {
@@ -276,19 +328,29 @@ void metal_blur_volume(float *data, int D, int H, int W,
     size_t sz = (size_t)D * H * W * sizeof(float);
     id<MTLBuffer> scratch_buf;
     float *scratch = fft_alloc_buf(sz, &scratch_buf);
+    if (!scratch) return;
 
     float sigmas[3] = { sigma_d, sigma_h, sigma_w };
     for (int axis = 0; axis < 3; axis++) {
         int klen;
         float *h_k = make_gauss_kernel_fft(sigmas[axis], &klen);
+        if (!h_k) break;
 
         id<MTLBuffer> kern_buf;
         float *d_k = fft_alloc_buf(klen * sizeof(float), &kern_buf);
+        if (!d_k) {
+            free(h_k);
+            break;
+        }
         memcpy(d_k, h_k, klen * sizeof(float));
         free(h_k);
 
         metal_conv1d_axis(data, scratch, D, H, W, d_k, klen, axis);
         metal_sync();
+        if (metal_had_fatal_error()) {
+            fft_free_buf(d_k, kern_buf);
+            break;
+        }
         memcpy(data, scratch, sz);
 
         fft_free_buf(d_k, kern_buf);
@@ -307,6 +369,7 @@ void metal_blur_downsample(const float *input, float *output,
     /* Allocate temporary for blur (don't modify input) */
     id<MTLBuffer> blur_buf;
     float *blurred = fft_alloc_buf(in_sz, &blur_buf);
+    if (!blurred) return;
     memcpy(blurred, input, in_sz);
 
     /* Gaussian blur with sigma = 0.5 * (in_dim / out_dim) per axis */
@@ -314,6 +377,10 @@ void metal_blur_downsample(const float *input, float *output,
     float sig_h = 0.5f * (float)iH / (float)oH;
     float sig_w = 0.5f * (float)iW / (float)oW;
     metal_blur_volume(blurred, iD, iH, iW, sig_d, sig_h, sig_w);
+    if (metal_had_fatal_error()) {
+        fft_free_buf(blurred, blur_buf);
+        return;
+    }
 
     /* Trilinear resize via hardware 3D texture sampling */
     metal_trilinear_resize_texture(blurred, output, iD, iH, iW, oD, oH, oW, 1);

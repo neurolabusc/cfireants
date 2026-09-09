@@ -39,13 +39,18 @@ build/cfireants_reg -f validate/small/MNI152_T1_2mm.nii.gz -m validate/small/T1_
 
 ## Python vs CUDA vs WebGPU — All Datasets (NVIDIA RTX 4090)
 
-Pipeline: Moments → Rigid → Affine → SyN. FFT downsampling.
+Pipeline: Moments → Rigid → Affine → SyN. Trilinear downsampling by default;
+pass `--fft` explicitly for the GPU-only FFT comparison.
 
 | Dataset | Python NCC | CUDA NCC | WebGPU NCC | Python Time | CUDA Time | WebGPU Time |
 |---------|-----------|---------|-----------|------------|----------|------------|
-| small   | 0.9450    | 0.9530  | 0.9548    | 3.9s       | 2.7s     | 16.1s      |
+| small   | 0.9450    | 0.9533  | 0.9548    | 3.9s       | 2.7s     | 16.1s      |
 | medium  | 0.9443    | 0.9469  | 0.9465    | 3.8s       | 3.2s     | 127.6s     |
-| large   | 0.8961    | 0.8972  | 0.8886    | 16.1s      | 15.6s    | 127.7s     |
+| large   | 0.8961    | 0.8966  | 0.8886    | 16.1s      | 15.6s    | 127.7s     |
+
+The small-dataset numbers are not reproducible to the last digit: the MI histogram uses
+float atomics, and two identical runs gave 0.9539 and 0.9533. Use medium (CC-only) as the
+regression target when a value has to be compared exactly.
 
 ### Peak memory (RTX 4090)
 
@@ -65,17 +70,25 @@ Notes:
 
 Metal uses native API with unified memory on Apple Silicon.
 
-| Dataset | Python NCC | Metal NCC | Metal Time | Metal RAM |
-|---------|------------|-----------|------------|-----------|
-| small   | 0.9450     | 0.9574    | 7.4s       | 391 MB    |
-| medium  | 0.9443     | 0.9454    | 19.9s      | 2955 MB   |
-| large   | 0.8961     | 0.9022    | 44.2s      | 3123 MB   |
+> **Timings below predate the packed box filter and need a re-run.** Spot checks since
+> that change measure the small pair at 7.2s and medium at 17.0s (see `CLAUDE.md`); the
+> large figure and every RAM figure here have not been re-measured. NCC is unaffected —
+> the change was dispatch count, not arithmetic.
+
+| Dataset | Python NCC | Metal NCC | Metal Time (stale) | Metal RAM (stale) |
+|---------|------------|-----------|--------------------|-------------------|
+| small   | 0.9450     | 0.9574    | 7.4s               | 391 MB            |
+| medium  | 0.9443     | 0.9454    | 19.9s              | 2955 MB           |
+| large   | 0.8961     | 0.9022    | 44.2s              | 3123 MB           |
 
 ## Greedy vs SyN
 
 Greedy compositive (single-direction) is faster than SyN (no dual warp, no warp inversion) at 1–2% lower NCC.
 
 ### Greedy vs SyN — Metal (Apple M4 Pro, Trilinear)
+
+Metal times and RAM below are from the same pre-packed-box-filter run as above and are
+stale for the same reason; the SyN-vs-Greedy *ratio* is what this table is for.
 
 | Dataset | SyN NCC | Greedy NCC | SyN Time | Greedy Time | SyN RAM | Greedy RAM |
 |---------|---------|------------|----------|-------------|---------|------------|
@@ -92,7 +105,13 @@ Greedy uses 19–30% less memory. Use `--greedy` flag.
 | NCC After (small) | 0.9533 | 0.9548 | 0.9532 | 0.9574 |
 | Total Time | 3.0s | 3.0s | 7.6s | 7.4s |
 
-Both modes produce equivalent accuracy. Trilinear is fully GPU-native and enables like-for-like cross-backend comparison (no FFT library dependency).
+Both modes produce equivalent accuracy. Trilinear is fully GPU-native and enables
+like-for-like cross-backend comparison (no FFT library dependency). The Metal times here
+are stale for the reason noted above.
+
+This comparison is meaningless on `--backend cpu`: there is no CPU FFT downsample, so all
+four CPU stages always use the trilinear (Gaussian blur + resize) pyramid and `--trilinear`
+changes nothing there.
 
 ## Dataset-specific parameter choices
 

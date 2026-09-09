@@ -18,6 +18,12 @@
 
 int metal_tensor_alloc(tensor_t *t, size_t nbytes) {
     @autoreleasepool {
+        if (t) t->data = NULL;
+        if (!t || nbytes == 0) {
+            metal_record_fatal_error("invalid tensor allocation");
+            return -1;
+        }
+        if (metal_had_fatal_error()) return -1;
         if (!g_metal.device) {
             fprintf(stderr, "metal_tensor_alloc: Metal context not initialized\n");
             return -1;
@@ -28,20 +34,27 @@ int metal_tensor_alloc(tensor_t *t, size_t nbytes) {
                                                         options:MTLResourceStorageModeShared];
         if (!buf) {
             fprintf(stderr, "metal_tensor_alloc: failed to allocate %zu bytes\n", nbytes);
+            metal_record_fatal_error("tensor allocation");
             return -1;
         }
 
-        /* Zero-fill */
-        memset(buf.contents, 0, nbytes);
-
         /* Store the CPU-accessible pointer in tensor data */
         t->data = buf.contents;
+        if (!t->data) {
+            metal_record_fatal_error("tensor buffer mapping");
+            return -1;
+        }
+        memset(t->data, 0, nbytes);
 
         /* Register in buffer tracking table.
          * The context struct holds a strong reference (ARC) via the
          * id<MTLBuffer> member. We pass as __bridge void* — the struct
          * assignment in metal_register_buffer retains it. */
         metal_register_buffer(t->data, (__bridge void *)buf, nbytes);
+        if (!metal_buffer_from_ptr(t->data)) {
+            t->data = NULL;
+            return -1;
+        }
 
         return 0;
     }

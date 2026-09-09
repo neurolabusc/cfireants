@@ -1,3 +1,7 @@
+# agent communication
+audit*.md
+plan*.md
+
 # Prerequisites
 *.d
 
@@ -72,3 +76,14 @@ validate/*/output/
 validate/*/debug_output/
 validate/*/stage_output/
 validate/*/iter0_dump/
+
+# WASM build trees and staged artifacts
+build-wasm*/
+js/wasm/
+js/dist/
+js/node_modules/
+js/*.tgz
+gpu-wasm-test/
+build-macos/
+dist/
+.DS_Store

@@ -6,6 +6,7 @@
  */
 
 #include "webgpu_context.h"
+#include "shader_loader.h"
 #include "cfireants/backend.h"
 #include "cfireants/tensor.h"
 #include <stdio.h>
@@ -19,91 +20,6 @@ void webgpu_tensor_free(WGPUBuffer buf);
 int  webgpu_memcpy_h2d(WGPUBuffer dst, const void *src, size_t nbytes);
 int  webgpu_memcpy_d2h(void *dst, WGPUBuffer src, size_t nbytes);
 int  webgpu_memcpy_d2d(WGPUBuffer dst, WGPUBuffer src, size_t nbytes);
-
-/* --- Embedded WGSL shaders --- */
-
-static const char elementwise_wgsl[] =
-    "struct Params {\n"
-    "    n: u32,\n"
-    "    _pad0: u32,\n"
-    "    value: f32,\n"
-    "    _pad1: f32,\n"
-    "}\n"
-    "\n"
-    "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n"
-    "@group(0) @binding(1) var<uniform> params: Params;\n"
-    "\n"
-    "@compute @workgroup_size(256)\n"
-    "fn fill(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-    "    let i = gid.x + gid.y * nwg.x * 256u;\n"
-    "    if (i >= params.n) { return; }\n"
-    "    data[i] = params.value;\n"
-    "}\n"
-    "\n"
-    "@compute @workgroup_size(256)\n"
-    "fn scale(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-    "    let i = gid.x + gid.y * nwg.x * 256u;\n"
-    "    if (i >= params.n) { return; }\n"
-    "    data[i] = data[i] * params.value;\n"
-    "}\n";
-
-/* axpy needs a separate shader since it has different bindings */
-static const char axpy_wgsl[] =
-    "struct Params {\n"
-    "    n: u32,\n"
-    "    _pad0: u32,\n"
-    "    value: f32,\n"
-    "    _pad1: f32,\n"
-    "}\n"
-    "\n"
-    "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n"
-    "@group(0) @binding(1) var<uniform> params: Params;\n"
-    "@group(0) @binding(2) var<storage, read> x_data: array<f32>;\n"
-    "\n"
-    "@compute @workgroup_size(256)\n"
-    "fn axpy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-    "    let i = gid.x + gid.y * nwg.x * 256u;\n"
-    "    if (i >= params.n) { return; }\n"
-    "    data[i] = data[i] + params.value * x_data[i];\n"
-    "}\n";
-
-static const char reduction_wgsl[] =
-    "struct Params {\n"
-    "    n: u32,\n"
-    "    _pad0: u32,\n"
-    "    _pad1: u32,\n"
-    "    _pad2: u32,\n"
-    "}\n"
-    "\n"
-    "@group(0) @binding(0) var<storage, read> input: array<f32>;\n"
-    "@group(0) @binding(1) var<uniform> params: Params;\n"
-    "@group(0) @binding(2) var<storage, read_write> output: array<f32>;\n"
-    "\n"
-    "var<workgroup> shared_data: array<f32, 256>;\n"
-    "\n"
-    "@compute @workgroup_size(256)\n"
-    "fn reduce_sum(@builtin(global_invocation_id) gid: vec3<u32>,\n"
-    "              @builtin(local_invocation_id) lid: vec3<u32>,\n"
-    "              @builtin(workgroup_id) wid: vec3<u32>,\n"
-    "              @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-    "    let i = gid.x + gid.y * nwg.x * 256u;\n"
-    "    let tid = lid.x;\n"
-    "    if (i < params.n) {\n"
-    "        shared_data[tid] = input[i];\n"
-    "    } else {\n"
-    "        shared_data[tid] = 0.0;\n"
-    "    }\n"
-    "    workgroupBarrier();\n"
-    "    for (var s = 128u; s > 0u; s = s >> 1u) {\n"
-    "        if (tid < s) {\n"
-    "            shared_data[tid] = shared_data[tid] + shared_data[tid + s];\n"
-    "        }\n"
-    "        workgroupBarrier();\n"
-    "    }\n"
-    "    if (tid == 0u) {\n"
-    "        output[wid.x + wid.y * nwg.x] = shared_data[0];\n"
-    "    }\n"
-    "}\n";
 
 /* --- Helper: create uniform buffer with params --- */
 
@@ -134,7 +50,8 @@ static int wgpu_tensor_to_host(tensor_t *dst, const tensor_t *src) {
 }
 
 static int wgpu_tensor_fill(tensor_t *t, float value) {
-    WGPUComputePipeline pipeline = wgpu_get_pipeline("fill", elementwise_wgsl, "fill");
+    WGPUComputePipeline pipeline = wgpu_get_pipeline(
+        "fill", get_shader_source("elementwise.wgsl", NULL), "fill");
     if (!pipeline) return -1;
 
     elem_params_t p = { .n = (uint32_t)t->numel, .value = value };
@@ -150,18 +67,19 @@ static int wgpu_tensor_fill(tensor_t *t, float value) {
         .entryCount = 2,
         .entries = entries,
     };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &bg_desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&bg_desc, NULL);
 
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil((uint32_t)t->numel, WGPU_WORKGROUP_SIZE), &wx, &wy);
     wgpu_dispatch(pipeline, bg, wx, wy, 1); }
 
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(params_buf);
-    return 0;
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(params_buf);
+    return wgpu_had_fatal_error() ? -1 : 0;
 }
 
 static int wgpu_tensor_scale(tensor_t *t, float alpha) {
-    WGPUComputePipeline pipeline = wgpu_get_pipeline("scale", elementwise_wgsl, "scale");
+    WGPUComputePipeline pipeline = wgpu_get_pipeline(
+        "scale", get_shader_source("elementwise.wgsl", NULL), "scale");
     if (!pipeline) return -1;
 
     elem_params_t p = { .n = (uint32_t)t->numel, .value = alpha };
@@ -177,18 +95,19 @@ static int wgpu_tensor_scale(tensor_t *t, float alpha) {
         .entryCount = 2,
         .entries = entries,
     };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &bg_desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&bg_desc, NULL);
 
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil((uint32_t)t->numel, WGPU_WORKGROUP_SIZE), &wx, &wy);
     wgpu_dispatch(pipeline, bg, wx, wy, 1); }
 
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(params_buf);
-    return 0;
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(params_buf);
+    return wgpu_had_fatal_error() ? -1 : 0;
 }
 
 static int wgpu_tensor_axpy(tensor_t *y, float alpha, const tensor_t *x) {
-    WGPUComputePipeline pipeline = wgpu_get_pipeline("axpy", axpy_wgsl, "axpy");
+    WGPUComputePipeline pipeline = wgpu_get_pipeline(
+        "axpy", get_shader_source("axpy.wgsl", NULL), "axpy");
     if (!pipeline) return -1;
 
     elem_params_t p = { .n = (uint32_t)y->numel, .value = alpha };
@@ -205,14 +124,14 @@ static int wgpu_tensor_axpy(tensor_t *y, float alpha, const tensor_t *x) {
         .entryCount = 3,
         .entries = entries,
     };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &bg_desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&bg_desc, NULL);
 
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil((uint32_t)y->numel, WGPU_WORKGROUP_SIZE), &wx, &wy);
     wgpu_dispatch(pipeline, bg, wx, wy, 1); }
 
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(params_buf);
-    return 0;
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(params_buf);
+    return wgpu_had_fatal_error() ? -1 : 0;
 }
 
 static float wgpu_tensor_sum(const tensor_t *t) {
@@ -221,21 +140,20 @@ static float wgpu_tensor_sum(const tensor_t *t) {
     uint32_t n = (uint32_t)t->numel;
     uint32_t n_groups = wgpu_div_ceil(n, WGPU_WORKGROUP_SIZE);
 
-    WGPUComputePipeline pipeline = wgpu_get_pipeline("reduce_sum", reduction_wgsl, "reduce_sum");
-    if (!pipeline) {
-        /* Fallback: copy to CPU and sum there */
-        float *h = (float *)malloc(n * sizeof(float));
-        wgpu_read_buffer((WGPUBuffer)t->data, 0, h, n * sizeof(float));
-        double s = 0;
-        for (uint32_t i = 0; i < n; i++) s += h[i];
-        free(h);
-        return (float)s;
-    }
+    WGPUComputePipeline pipeline = wgpu_get_pipeline(
+        "reduce_sum", get_shader_source("reduction.wgsl", NULL),
+        "reduce_sum");
+    if (!pipeline) return 0.0f;
 
     reduce_params_t p = { .n = n };
     WGPUBuffer params_buf = create_params_buf(&p, sizeof(p));
     WGPUBuffer out_buf = wgpu_create_buffer(n_groups * sizeof(float),
         WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc, "reduce_out");
+    if (!params_buf || !out_buf) {
+        wgpu_release_buffer(params_buf);
+        wgpu_release_buffer(out_buf);
+        return 0.0f;
+    }
 
     WGPUBindGroupLayout layout = wgpu_get_bind_group_layout("reduce_sum");
     WGPUBindGroupEntry entries[] = {
@@ -248,22 +166,35 @@ static float wgpu_tensor_sum(const tensor_t *t) {
         .entryCount = 3,
         .entries = entries,
     };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &bg_desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&bg_desc, NULL);
+    if (!bg) {
+        wgpu_release_buffer(params_buf);
+        wgpu_release_buffer(out_buf);
+        return 0.0f;
+    }
 
     { uint32_t wx, wy; wgpu_dispatch_dims(n_groups, &wx, &wy);
     wgpu_dispatch(pipeline, bg, wx, wy, 1); }
 
     /* Read partials and sum on CPU */
     float *partials = (float *)malloc(n_groups * sizeof(float));
+    if (!partials) {
+        wgpu_record_fatal_error("WebGPU reduction host allocation");
+        wgpu_release_bind_group(bg);
+        wgpu_release_buffer(params_buf);
+        wgpu_release_buffer(out_buf);
+        return 0.0f;
+    }
     wgpu_read_buffer(out_buf, 0, partials, n_groups * sizeof(float));
     double s = 0;
-    for (uint32_t i = 0; i < n_groups; i++) s += partials[i];
+    if (!wgpu_had_fatal_error())
+        for (uint32_t i = 0; i < n_groups; i++) s += partials[i];
 
     free(partials);
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(params_buf);
-    wgpuBufferRelease(out_buf);
-    return (float)s;
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(params_buf);
+    wgpu_release_buffer(out_buf);
+    return wgpu_had_fatal_error() ? 0.0f : (float)s;
 }
 
 static float wgpu_tensor_mean(const tensor_t *t) {
@@ -290,6 +221,10 @@ static int wgpu_grid_sample_3d_fwd_op(
     wgpu_grid_sample_3d_fwd(
         (WGPUBuffer)input->data, (WGPUBuffer)grid->data, (WGPUBuffer)output->data,
         B, C, iD, iH, iW, oD, oH, oW);
+    if (wgpu_had_fatal_error()) {
+        tensor_free(output);
+        return -1;
+    }
     return 0;
 }
 
@@ -310,6 +245,10 @@ static int wgpu_grid_sample_3d_bwd_op(
         (WGPUBuffer)grad_output->data, (WGPUBuffer)input->data,
         (WGPUBuffer)grid->data, (WGPUBuffer)grad_grid->data,
         B, C, iD, iH, iW, oD, oH, oW);
+    if (wgpu_had_fatal_error()) {
+        tensor_free(grad_grid);
+        return -1;
+    }
     return 0;
 }
 
@@ -326,7 +265,11 @@ static int wgpu_cc_loss_3d_op(
     }
     wgpu_cc_loss_3d_raw(
         (WGPUBuffer)pred->data, (WGPUBuffer)target->data,
-        grad_buf, D, H, W, ks, loss_out);
+        grad_buf, D, H, W, ks, loss_out, NULL);
+    if (wgpu_had_fatal_error()) {
+        if (grad_pred) tensor_free(grad_pred);
+        return -1;
+    }
     return 0;
 }
 
@@ -344,6 +287,10 @@ static int wgpu_mi_loss_3d_op(
     wgpu_mi_loss_3d_raw(
         (WGPUBuffer)pred->data, (WGPUBuffer)target->data,
         grad_buf, D, H, W, bins, loss_out);
+    if (wgpu_had_fatal_error()) {
+        if (grad_pred) tensor_free(grad_pred);
+        return -1;
+    }
     return 0;
 }
 
@@ -353,7 +300,7 @@ static int wgpu_gaussian_blur_3d_op(
     int B = inout->shape[0], C = inout->shape[1];
     int D = inout->shape[2], H = inout->shape[3], W = inout->shape[4];
     wgpu_gaussian_blur_3d_raw((WGPUBuffer)inout->data, B, C, D, H, W, sigmas, truncated);
-    return 0;
+    return wgpu_had_fatal_error() ? -1 : 0;
 }
 
 static int wgpu_adam_update_op(
@@ -365,7 +312,7 @@ static int wgpu_adam_update_op(
         (WGPUBuffer)param->data, (WGPUBuffer)grad->data,
         (WGPUBuffer)exp_avg->data, (WGPUBuffer)exp_avg_sq->data,
         lr, beta1, beta2, eps, step, (int)param->numel);
-    return 0;
+    return wgpu_had_fatal_error() ? -1 : 0;
 }
 
 static int wgpu_interpolate_3d_op(
@@ -378,7 +325,7 @@ static int wgpu_interpolate_3d_op(
     wgpu_trilinear_resize(
         (WGPUBuffer)input->data, (WGPUBuffer)output->data,
         B, C, iD, iH, iW, oD, oH, oW, align_corners);
-    return 0;
+    return wgpu_had_fatal_error() ? -1 : 0;
 }
 
 static int wgpu_stub(void) {

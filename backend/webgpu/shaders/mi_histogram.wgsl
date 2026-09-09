@@ -17,10 +17,9 @@ struct HP { n: u32, num_bins: u32, inv_maxval: f32, preterm: f32, fp_scale: f32,
 
 @group(0) @binding(0) var<storage, read> h_pred: array<f32>;
 @group(0) @binding(1) var<storage, read> h_target: array<f32>;
-@group(0) @binding(2) var<storage, read_write> g_joint: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> g_pa: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> g_pb: array<atomic<u32>>;
-@group(0) @binding(5) var<uniform> hp: HP;
+// Packed as [joint:1024, pred marginal:32, target marginal:32].
+@group(0) @binding(2) var<storage, read_write> g_hist: array<atomic<u32>>;
+@group(0) @binding(3) var<uniform> hp: HP;
 
 var<workgroup> lj: array<atomic<u32>, 1024>;
 var<workgroup> la: array<atomic<u32>, 32>;
@@ -39,7 +38,8 @@ fn histogram(
 
     let i = gid.x + gid.y * nwg.x * 256u;
     if (i < hp.n) {
-        let im = hp.inv_maxval;
+        let maxval = max(bitcast<f32>(atomicLoad(&g_hist[0])), 1.0);
+        let im = 1.0 / maxval;
         let pt = hp.preterm;
         let pv = clamp(h_pred[i] * im, 0.0, 1.0);
         let tv = clamp(h_target[i] * im, 0.0, 1.0);
@@ -92,12 +92,12 @@ fn histogram(
     // Merge local -> global via native atomicAdd (no CAS, Metal-safe)
     for (var k = tid; k < NB2; k += WG) {
         let val = atomicLoad(&lj[k]);
-        if (val > 0u) { atomicAdd(&g_joint[k], val); }
+        if (val > 0u) { atomicAdd(&g_hist[1u + k], val); }
     }
     if (tid < NB) {
         let pav = atomicLoad(&la[tid]);
-        if (pav > 0u) { atomicAdd(&g_pa[tid], pav); }
+        if (pav > 0u) { atomicAdd(&g_hist[1u + NB2 + tid], pav); }
         let pbv = atomicLoad(&lb[tid]);
-        if (pbv > 0u) { atomicAdd(&g_pb[tid], pbv); }
+        if (pbv > 0u) { atomicAdd(&g_hist[1u + NB2 + NB + tid], pbv); }
     }
 }

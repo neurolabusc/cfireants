@@ -11,21 +11,20 @@ struct GP { n: u32, num_bins: u32, inv_maxval: f32, preterm: f32,
 
 @group(0) @binding(0) var<storage, read> g_pred: array<f32>;
 @group(0) @binding(1) var<storage, read> g_target: array<f32>;
-@group(0) @binding(2) var<storage, read> gjh: array<f32>;
-@group(0) @binding(3) var<storage, read> gph: array<f32>;
-@group(0) @binding(4) var<storage, read> gth: array<f32>;
-@group(0) @binding(5) var<storage, read_write> gg: array<f32>;
-@group(0) @binding(6) var<uniform> gpp: GP;
+// GPU-precomputed coefficients packed as [joint coefficients:1024,
+// marginal coefficients:32]. This removes log/division work from every voxel.
+@group(0) @binding(2) var<storage, read> coeff: array<f32>;
+@group(0) @binding(3) var<storage, read> state: array<u32>;
+@group(0) @binding(4) var<storage, read_write> gg: array<f32>;
+@group(0) @binding(5) var<uniform> gpp: GP;
 
 @compute @workgroup_size(256)
 fn mi_gradient(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let i = gid.x + gid.y * nwg.x * 256u; if (i >= gpp.n) { return; }
     let nb = gpp.num_bins;
-    let im = gpp.inv_maxval;
+    let im = 1.0 / max(bitcast<f32>(state[0]), 1.0);
     let pt = gpp.preterm;
     let inv_N = gpp.inv_n;
-    let nr = gpp.nr; let dr = gpp.dr;
-
     let pv = clamp(g_pred[i] * im, 0.0, 1.0);
     let tv = clamp(g_target[i] * im, 0.0, 1.0);
     let inv_nb = 1.0 / f32(nb);
@@ -65,19 +64,11 @@ fn mi_gradient(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
 
         // Through joint histogram: d(MI)/d(pab) * d(pab)/d(wa)
         for (var b = 0u; b < nb; b++) {
-            let p = gjh[a * nb + b];
-            let pp = gph[a] * gth[b];
-            let dm = log((p + nr) / (pp + dr) + dr) + p / (p + nr);
-            dmi += dm * inv_N * wb[b] * dwa;
+            dmi += coeff[a * nb + b] * inv_N * wb[b] * dwa;
         }
 
         // Through marginal pa: d(MI)/d(pa) * d(pa)/d(wa)
-        var dpa = 0.0f;
-        for (var b = 0u; b < nb; b++) {
-            let pp = gph[a] * gth[b];
-            dpa -= gjh[a * nb + b] * gth[b] / (pp + dr);
-        }
-        dmi += dpa * inv_N * dwa;
+        dmi += coeff[NB * NB + a] * inv_N * dwa;
     }
 
     // Chain rule: d(pn)/d(pred[i]) = inv_maxval, negate for loss=-MI

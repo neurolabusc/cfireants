@@ -15,11 +15,21 @@
 
 /* Global Metal context */
 metal_context_t g_metal = {0};
+static int g_metal_fatal = 0;
+
+int metal_had_fatal_error(void) { return g_metal_fatal; }
+void metal_clear_fatal_error(void) { g_metal_fatal = 0; }
+void metal_record_fatal_error(const char *operation) {
+    if (!g_metal_fatal)
+        fprintf(stderr, "metal: %s failed\n", operation ? operation : "GPU operation");
+    g_metal_fatal = 1;
+}
 
 /* --- Context lifecycle --- */
 
 int metal_context_init(void) {
     @autoreleasepool {
+        metal_clear_fatal_error();
         /* Create device */
         g_metal.device = MTLCreateSystemDefaultDevice();
         if (!g_metal.device) {
@@ -34,6 +44,7 @@ int metal_context_init(void) {
         g_metal.queue = [g_metal.device newCommandQueue];
         if (!g_metal.queue) {
             fprintf(stderr, "metal_context_init: failed to create command queue\n");
+            metal_context_cleanup();
             return -1;
         }
 
@@ -67,7 +78,8 @@ int metal_context_init(void) {
 #endif
             ];
             for (NSString *path in paths) {
-                g_metal.library = [g_metal.device newLibraryWithFile:path error:&error];
+                NSURL *url = [NSURL fileURLWithPath:path];
+                g_metal.library = [g_metal.device newLibraryWithURL:url error:&error];
                 if (g_metal.library) {
                     if (cfireants_verbose >= 1) fprintf(stderr, "Metal shaders: loaded from %s\n", [path UTF8String]);
                     break;
@@ -84,7 +96,9 @@ int metal_context_init(void) {
         }
 
         if (!g_metal.library) {
-            fprintf(stderr, "metal_context_init: warning: no shader library found\n");
+            fprintf(stderr, "metal_context_init: no shader library found\n");
+            metal_context_cleanup();
+            return -1;
         }
 
         g_metal.n_pipelines = 0;
@@ -94,6 +108,7 @@ int metal_context_init(void) {
 }
 
 void metal_context_cleanup(void) {
+    metal_flush_batch();
     @autoreleasepool {
         /* Release pipeline states */
         for (int i = 0; i < g_metal.n_pipelines; i++) {
@@ -104,7 +119,8 @@ void metal_context_cleanup(void) {
 
         /* Release tracked buffers */
         for (int i = 0; i < g_metal.n_buffers; i++) {
-            g_metal.buffers[i].buffer = nil;
+            if (g_metal.buffers[i].buffer) CFRelease(g_metal.buffers[i].buffer);
+            g_metal.buffers[i].buffer = NULL;
             g_metal.buffers[i].cpu_ptr = NULL;
             g_metal.buffers[i].size = 0;
         }
@@ -118,7 +134,8 @@ void metal_context_cleanup(void) {
 
 /* --- Pipeline cache --- */
 
-void *metal_get_pipeline(const char *function_name) {
+static void *metal_get_pipeline_impl(const char *function_name, int required) {
+    if (metal_had_fatal_error()) return NULL;
     /* Check cache first */
     for (int i = 0; i < g_metal.n_pipelines; i++) {
         if (strcmp(g_metal.pipelines[i].name, function_name) == 0) {
@@ -128,12 +145,14 @@ void *metal_get_pipeline(const char *function_name) {
 
     if (!g_metal.library) {
         fprintf(stderr, "metal_get_pipeline: no shader library loaded\n");
+        if (required) metal_record_fatal_error("shader library lookup");
         return NULL;
     }
 
     if (g_metal.n_pipelines >= MTL_MAX_PIPELINES) {
         fprintf(stderr, "metal_get_pipeline: pipeline cache full (%d)\n",
                 MTL_MAX_PIPELINES);
+        metal_record_fatal_error("pipeline cache allocation");
         return NULL;
     }
 
@@ -141,8 +160,11 @@ void *metal_get_pipeline(const char *function_name) {
         NSString *name = [NSString stringWithUTF8String:function_name];
         id<MTLFunction> func = [g_metal.library newFunctionWithName:name];
         if (!func) {
-            fprintf(stderr, "metal_get_pipeline: function '%s' not found in library\n",
-                    function_name);
+            if (required) {
+                fprintf(stderr, "metal_get_pipeline: function '%s' not found in library\n",
+                        function_name);
+                metal_record_fatal_error("shader function lookup");
+            }
             return NULL;
         }
 
@@ -153,6 +175,7 @@ void *metal_get_pipeline(const char *function_name) {
             fprintf(stderr, "metal_get_pipeline: failed to create pipeline for '%s': %s\n",
                     function_name,
                     error ? [[error localizedDescription] UTF8String] : "unknown error");
+            if (required) metal_record_fatal_error("compute pipeline creation");
             return NULL;
         }
 
@@ -164,15 +187,28 @@ void *metal_get_pipeline(const char *function_name) {
     }
 }
 
+void *metal_get_pipeline(const char *function_name) {
+    return metal_get_pipeline_impl(function_name, 1);
+}
+
+void *metal_get_pipeline_optional(const char *function_name) {
+    return metal_get_pipeline_impl(function_name, 0);
+}
+
 /* --- Buffer management --- */
 
 /* Buffer table uses CFBridgingRetain/Release for manual refcount management.
    ARC cannot reliably manage id<> types inside C struct arrays. */
 
 void metal_register_buffer(void *cpu_ptr, void *mtl_buffer, size_t size) {
+    if (!cpu_ptr || !mtl_buffer || size == 0) {
+        metal_record_fatal_error("invalid buffer registration");
+        return;
+    }
     if (g_metal.n_buffers >= MTL_MAX_BUFFERS) {
         fprintf(stderr, "metal_register_buffer: buffer table full (%d)\n",
                 MTL_MAX_BUFFERS);
+        metal_record_fatal_error("buffer tracking");
         return;
     }
     /* Check for duplicate registration */
@@ -180,14 +216,16 @@ void metal_register_buffer(void *cpu_ptr, void *mtl_buffer, size_t size) {
         if (g_metal.buffers[i].cpu_ptr == cpu_ptr) {
             /* Release old, retain new */
             if (g_metal.buffers[i].buffer) CFRelease(g_metal.buffers[i].buffer);
-            g_metal.buffers[i].buffer = CFBridgingRetain((__bridge id)mtl_buffer);
+            g_metal.buffers[i].buffer =
+                (void *)CFBridgingRetain((__bridge id)mtl_buffer);
             g_metal.buffers[i].size = size;
             return;
         }
     }
     int idx = g_metal.n_buffers++;
     g_metal.buffers[idx].cpu_ptr = cpu_ptr;
-    g_metal.buffers[idx].buffer = CFBridgingRetain((__bridge id)mtl_buffer);
+    g_metal.buffers[idx].buffer =
+        (void *)CFBridgingRetain((__bridge id)mtl_buffer);
     g_metal.buffers[idx].size = size;
 }
 
@@ -247,6 +285,11 @@ void metal_dispatch(void *pipeline,
                     const void **buffer_ptrs, const size_t *buffer_sizes, int n_bufs,
                     const void *params, size_t params_size,
                     uint32_t total_threads) {
+    if (metal_had_fatal_error()) return;
+    if (!pipeline || !g_metal.queue) {
+        metal_record_fatal_error("compute dispatch setup");
+        return;
+    }
     @autoreleasepool {
         id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipeline;
 
@@ -262,6 +305,10 @@ void metal_dispatch(void *pipeline,
             cmd = [g_metal.queue commandBuffer];
             enc = [cmd computeCommandEncoder];
         }
+        if (!enc || (!batched && !cmd)) {
+            metal_record_fatal_error("command encoder creation");
+            return;
+        }
         [enc setComputePipelineState:pso];
 
         /* Bind data buffers (supports sub-buffer offsets for pointer arithmetic) */
@@ -271,6 +318,7 @@ void metal_dispatch(void *pipeline,
             if (!ref) {
                 fprintf(stderr, "metal_dispatch: buffer %d (ptr=%p) not found in table\n",
                         i, buffer_ptrs[i]);
+                metal_record_fatal_error("buffer binding");
                 if (batched) {
                     /* Abort the batch to avoid corrupted encoder state */
                     metal_flush_batch();
@@ -294,7 +342,18 @@ void metal_dispatch(void *pipeline,
             threadgroupSize = MTL_THREADGROUP_SIZE;
         }
 
-        MTLSize threads = MTLSizeMake(total_threads, 1, 1);
+        /*
+         * Round the grid up to whole threadgroups. dispatchThreads makes the
+         * final group partial, so its absent lanes never write their slot of
+         * threadgroup memory, while every reduction kernel here reads all
+         * THREADGROUP_SIZE slots -- corrupting the loss for any volume whose
+         * voxel count is not a multiple of the group size, which is nearly all
+         * of them (91*109*91 leaves 229). Padding is safe because the reduction
+         * kernels seed their accumulator to zero and write it unconditionally,
+         * and every other kernel guards with an early return.
+         */
+        NSUInteger padded = ((total_threads + threadgroupSize - 1) / threadgroupSize) * threadgroupSize;
+        MTLSize threads = MTLSizeMake(padded, 1, 1);
         MTLSize tgSize = MTLSizeMake(threadgroupSize, 1, 1);
         [enc dispatchThreads:threads threadsPerThreadgroup:tgSize];
 
@@ -302,6 +361,11 @@ void metal_dispatch(void *pipeline,
             [enc endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
+            if (cmd.status == MTLCommandBufferStatusError) {
+                fprintf(stderr, "metal_dispatch: command failed: %s\n",
+                        cmd.error ? [[cmd.error localizedDescription] UTF8String] : "unknown error");
+                metal_record_fatal_error("command execution");
+            }
         }
     }
 }
@@ -314,23 +378,42 @@ void metal_dispatch_no_params(void *pipeline,
 }
 
 void metal_sync(void) {
+    if (metal_had_fatal_error()) return;
     /* If batch is active, flush it first */
     if (g_metal.batch_active)
         metal_flush_batch();
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
+        if (!cmd) {
+            metal_record_fatal_error("synchronization command-buffer creation");
+            return;
+        }
         [cmd commit];
         [cmd waitUntilCompleted];
+        if (cmd.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "metal_sync: command failed: %s\n",
+                    cmd.error ? [[cmd.error localizedDescription] UTF8String] : "unknown error");
+            metal_record_fatal_error("synchronization command execution");
+        }
     }
 }
 
 /* --- Batched dispatch mode --- */
 
 void metal_begin_batch(void) {
+    if (metal_had_fatal_error()) return;
+    if (!g_metal.queue) {
+        metal_record_fatal_error("missing command queue");
+        return;
+    }
     if (g_metal.batch_active) return;  /* already batching */
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!cmd || !enc) {
+            metal_record_fatal_error("batch encoder creation");
+            return;
+        }
         /* Retain to prevent ARC release when leaving autoreleasepool */
         g_metal.batch_cmd = (__bridge_retained void *)cmd;
         g_metal.batch_enc = (__bridge_retained void *)enc;
@@ -343,9 +426,25 @@ void metal_flush_batch(void) {
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = (__bridge_transfer id<MTLComputeCommandEncoder>)g_metal.batch_enc;
         id<MTLCommandBuffer> cmd = (__bridge_transfer id<MTLCommandBuffer>)g_metal.batch_cmd;
+        if (!enc || !cmd) {
+            g_metal.batch_cmd = NULL;
+            g_metal.batch_enc = NULL;
+            g_metal.batch_active = 0;
+            metal_record_fatal_error("invalid batched command state");
+            return;
+        }
         [enc endEncoding];
         [cmd commit];
+        /* The wait is load-bearing: removing it made SyN nondeterministic
+         * (per-stage NCC -0.8151 -> -0.7822/-0.7811 across runs). Some resource
+         * is reused or released by the CPU while the GPU still has the batch in
+         * flight. Fixing that needs resource lifetime work, not just a fence. */
         [cmd waitUntilCompleted];
+        if (cmd.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "metal_flush_batch: command failed: %s\n",
+                    cmd.error ? [[cmd.error localizedDescription] UTF8String] : "unknown error");
+            metal_record_fatal_error("batched command execution");
+        }
         g_metal.batch_cmd = NULL;
         g_metal.batch_enc = NULL;
         g_metal.batch_active = 0;

@@ -9,14 +9,47 @@
 #define CFIREANTS_WEBGPU_CONTEXT_H
 
 #include <webgpu/webgpu.h>
+
+#ifdef __EMSCRIPTEN__
+/*
+ * wgpuDevicePoll is a wgpu-native extension; browser WebGPU has no blocking
+ * poll, because progress only happens when control returns to the event loop.
+ * Under Emscripten we yield instead, which ASYNCIFY turns into a real suspend.
+ * Same signature as the native one, so the ~14 call sites are untouched.
+ */
+static inline WGPUBool wgpuDevicePoll(WGPUDevice device, WGPUBool wait,
+                                      const void *submissionIndex) {
+    (void)device; (void)wait; (void)submissionIndex;
+    /*
+     * A no-op, deliberately. WebGPU executes queue submissions in order, so any
+     * later dispatch or copy already sees earlier results without the CPU
+     * waiting. The one place the CPU must genuinely block is a buffer map, and
+     * wgpu_read_buffer waits on its own callback. Suspending here instead would
+     * add an ASYNCIFY unwind at every one of these sites, across arbitrary call
+     * stacks, for no ordering benefit.
+     */
+    return 1;
+}
+#else
 #include <webgpu/wgpu.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/* Sticky per-run failure state. Resource creation, validation, and readback
+ * failures all set it so a registration stage can unwind once at its boundary. */
+int wgpu_had_fatal_error(void);
+void wgpu_clear_fatal_error(void);
+void wgpu_record_fatal_error(const char *operation);
+
 /* Maximum number of cached compute pipelines */
 #define WGPU_MAX_PIPELINES 128
+
+/* Live buffers are tracked so a failed stage can release allocations that its
+ * local cleanup path never reached. Normal releases remove their entry. */
+#define WGPU_MAX_BUFFERS 512
 
 /* Standard workgroup size (matches CUDA BLOCK_SIZE) */
 #define WGPU_WORKGROUP_SIZE 256
@@ -35,9 +68,17 @@ typedef struct {
     } pipelines[WGPU_MAX_PIPELINES];
     int n_pipelines;
 
+    WGPUBuffer buffers[WGPU_MAX_BUFFERS];
+    int n_buffers;
+
     /* Reusable staging buffer for readback (grown as needed) */
     WGPUBuffer staging_buf;
     size_t     staging_size;
+
+    /* Tiny persistent MI workspaces. Keeping these alive across a deferred
+     * batch avoids per-iteration allocation and resource-lifetime hazards. */
+    WGPUBuffer mi_state_buf;
+    WGPUBuffer mi_coeff_buf;
 
     /* Batch mode: accumulate dispatches into a single command encoder */
     WGPUCommandEncoder  batch_encoder;
@@ -81,6 +122,12 @@ WGPUBuffer wgpu_create_buffer(size_t size, WGPUBufferUsage usage, const char *la
 WGPUBuffer wgpu_create_buffer_init(const void *data, size_t size,
                                     WGPUBufferUsage usage, const char *label);
 
+/* Create a bind group and fold a nullable WebGPU result into the sticky error. */
+WGPUBindGroup wgpu_create_bind_group(const WGPUBindGroupDescriptor *desc,
+                                     const char *label);
+void wgpu_release_bind_group(WGPUBindGroup group);
+void wgpu_release_buffer(WGPUBuffer buffer);
+
 /* Ensure the staging buffer is at least `size` bytes. */
 void wgpu_ensure_staging(size_t size);
 
@@ -112,6 +159,10 @@ void wgpu_write_buffer(WGPUBuffer dst, size_t offset, const void *src, size_t si
 
 /* Copy between GPU buffers. In batch mode, appends to batch. */
 void wgpu_copy_buffer(WGPUBuffer src, WGPUBuffer dst, size_t size);
+
+/* Copy a byte range between GPU buffers. Offsets and size must be multiples of 4. */
+void wgpu_copy_buffer_range(WGPUBuffer src, size_t src_offset,
+                            WGPUBuffer dst, size_t dst_offset, size_t size);
 
 /* Compute ceil(n / d) as uint32_t */
 static inline uint32_t wgpu_div_ceil(uint32_t n, uint32_t d) {

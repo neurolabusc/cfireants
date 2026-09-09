@@ -4,9 +4,7 @@
 struct Params { n: u32, kv: u32, nr: f32, dr: f32, gO: f32, cgt: u32, _p0: u32, _p1: u32, }
 
 @group(0) @binding(0) var<storage, read_write> interm: array<f32>;
-@group(0) @binding(1) var<storage, read> pred: array<f32>;
-@group(0) @binding(2) var<storage, read> tgt: array<f32>;
-@group(0) @binding(3) var<uniform> p: Params;
+@group(0) @binding(1) var<uniform> p: Params;
 
 @compute @workgroup_size(256)
 fn bwd_modify(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {

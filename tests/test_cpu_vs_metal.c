@@ -247,6 +247,10 @@ int main(int argc, char **argv) {
 
         tensor_free(&syn_cpu.moved);
         tensor_free(&syn_metal.moved);
+        tensor_free(&syn_cpu.fwd_disp);
+        tensor_free(&syn_cpu.rev_disp);
+        tensor_free(&syn_metal.fwd_disp);
+        tensor_free(&syn_metal.rev_disp);
     }
 
     /* ============================================================ */

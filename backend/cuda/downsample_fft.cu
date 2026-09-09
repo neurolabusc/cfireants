@@ -130,8 +130,16 @@ __global__ void crop_3d_kernel(
     int dh = (i / dW) % dH;
     int dd = i / ((long)dH * dW);
 
-    long src_idx = ((long)(dd + d0) * sH + (dh + h0)) * sW + (dw + w0);
-    dst[i] = src[src_idx];
+    /* Offsets go negative when the output is within `padding` of the source on
+     * an axis (oD == iD gives d0 = -1). Those cells land on padding planes the
+     * inverse FFT trims, so zeroing them leaves the result unchanged, while
+     * reading them walked off the allocation. */
+    int sd = dd + d0, sh = dh + h0, sw = dw + w0;
+    if (sd < 0 || sd >= sD || sh < 0 || sh >= sH || sw < 0 || sw >= sW) {
+        dst[i].x = 0.0f; dst[i].y = 0.0f;
+        return;
+    }
+    dst[i] = src[((long)sd * sH + sh) * sW + sw];
 }
 
 /* ------------------------------------------------------------------ */

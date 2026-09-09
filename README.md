@@ -6,25 +6,56 @@ Three GPU backends plus CPU reference:
 
 - **CUDA** — production quality (NVIDIA)
 - **Metal** — native macOS/Apple Silicon
-- **WebGPU** — portable via wgpu-native (Vulkan/Metal)
-- **CPU** — reference implementation, no GPU required
+- **WebGPU** — portable via wgpu-native (Vulkan/Metal), and in browsers via WebAssembly
+- **CPU** — reference implementation, no GPU required, multi-threaded
 
-All backends produce equivalent registration accuracy. See [validate/README.md](validate/README.md) for benchmarks.
+All backends produce equivalent registration accuracy. On an Apple Silicon laptop the small
+2 mm pair takes 7.2 s on Metal, 6.4 s on WebGPU and 9.1 s on 14 CPU threads; on the medium
+1 mm brain pair Metal leads at 17.0 s against WebGPU's 30.0 s and the CPU's 38.6 s. See
+[validate/README.md](validate/README.md) for accuracy benchmarks.
 
 ## Building
 
-Requires CMake >= 3.18, a C11 compiler, and zlib. Each GPU backend is optional.
+Requires CMake >= 3.18 and a C11 compiler. Each GPU backend is optional, and so is zlib.
+
+Every GPU backend is off by default, so a plain `cmake ..` gives a CPU-only build.
 
 ```bash
 mkdir -p build && cd build
 
+cmake ..                                                      # CPU only
 cmake .. -DCFIREANTS_CUDA=ON                                  # CUDA
 cmake .. -DCFIREANTS_METAL=ON                                 # Metal (macOS)
 cmake .. -DCFIREANTS_WEBGPU=ON                                # WebGPU
-cmake .. -DCFIREANTS_CUDA=OFF -DCFIREANTS_METAL=OFF           # CPU only
+cmake .. -DCFIREANTS_THREADS=OFF                              # Disable CPU threading
+cmake .. -DCFIREANTS_ZLIB=OFF                                 # No zlib: plain .nii only
 
 make -j8
 ```
+
+CPU operations use a bounded pthread worker pool by default. The pool uses the
+number of online processors and does not make per-thread copies of image data.
+On 14 cores the small 2 mm pair drops from 59.3 s single-threaded to 9.1 s.
+Limit CPU use, or force a reproducible single-thread run, with either
+`CFIREANTS_NUM_THREADS` or `--threads` (the flag exists because the environment
+variable cannot be set under Emscripten):
+
+```bash
+CFIREANTS_NUM_THREADS=4 cfireants_reg ... --backend cpu
+cfireants_reg ... --backend cpu --threads 1
+```
+
+### WebAssembly / npm
+
+```bash
+js/build-wasm.sh     # requires emscripten on PATH
+```
+
+Builds threaded and single-threaded CPU modules plus a browser WebGPU module into
+`js/wasm/`. The wrapper in `js/` selects the CPU build automatically, or the WebGPU
+build when passed `backend: 'webgpu'`, and handles gzip with `DecompressionStream`
+(the wasm modules link no zlib). See `js/README.md`.
+[edgefire](https://github.com/rordenlab/edgefire) is a browser app built on the package.
 
 WebGPU requires [wgpu-native](https://github.com/gfx-rs/wgpu-native/releases) v27+ in `third_party/wgpu/`.
 
@@ -45,8 +76,11 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz --rigid -o warped.nii.gz
 # Greedy deformable (faster than SyN, ~1% lower accuracy)
 cfireants_reg -f fixed.nii.gz -m moving.nii.gz --greedy -o warped.nii.gz
 
-# Trilinear downsample (GPU-native, no FFT dependency)
+# Explicitly select the shared CPU/GPU pyramid (also the default)
 cfireants_reg -f fixed.nii.gz -m moving.nii.gz --trilinear -o warped.nii.gz
+
+# Opt into FFT downsampling on a GPU backend
+cfireants_reg -f fixed.nii.gz -m moving.nii.gz --backend metal --fft -o warped.nii.gz
 
 # Choose backend explicitly
 cfireants_reg -f fixed.nii.gz -m moving.nii.gz --backend metal -o warped.nii.gz
@@ -76,8 +110,11 @@ cfireants_reg -f fixed.nii.gz -m moving.nii.gz \
 | `-m, --moving <file>` | Moving image to register |
 | `-o, --output <file>` | Output NIfTI filename (default: `output.nii.gz`) |
 | `--backend <name>` | `cpu`, `metal`, `webgpu`, `cuda` (default: best available) |
-| `--trilinear` | Use GPU-native trilinear downsample instead of FFT |
+| `--trilinear` | Use blur + trilinear downsampling (default and shared by every backend) |
+| `--fft` | Use FFT downsampling on a GPU backend; CPU reports that it will remain trilinear |
+| `--threads <n>` | Cap CPU worker threads (default: all cores) |
 | `--moments` / `--no-moments` | Enable/disable center-of-mass initialization |
+| `--orientation rot\|antirot\|both` | Moments candidates (default `rot`; `both` also admits mirror images) |
 | `--rigid` | Preset: Rigid only |
 | `--affine` | Preset: Rigid + Affine |
 | `--syn` | Preset: Rigid + Affine + SyN (default) |
@@ -111,9 +148,79 @@ cfireants_reg -f subject.nii.gz -m template.nii.gz --affine --trilinear \
 
 The mask (in template space) is warped into subject space, thresholded at 0.5, and applied — voxels outside the mask are set to the darkest intensity. Output preserves the native datatype (UINT16 in → UINT16 out).
 
+## Notarized macOS installer
+
+`make macos-release` builds an Apple Silicon `.pkg` that installs `cfireants_reg`
+into `/usr/local/bin`. The executable is self-contained: Metal shaders are
+embedded (`CFIREANTS_EMBED_METALLIB`), threading is pthreads from libSystem, and
+zstd is switched off because Homebrew's `libzstd` is not present on a user's
+machine. Deployment target is macOS 14.0, which MPSGraph's FFT requires.
+
+Two **different** certificates from the same Apple Developer account are needed:
+
+| Certificate | Signs |
+|---|---|
+| Developer ID **Application** | the executable |
+| Developer ID **Installer** | the `.pkg` |
+
+Installer certificates do not appear under `security find-identity -p codesigning`,
+so list them without that filter:
+
+```bash
+security find-identity -v
+```
+
+Store notarization credentials once. This prompts securely for an
+*app-specific* password (appleid.apple.com → Sign-In and Security →
+App-Specific Passwords), not your Apple ID password:
+
+```bash
+make macos-notary-profile APPLE_ID='you@example.com' TEAM_ID='ABCDE12345'
+```
+
+Then build, sign, notarize, staple, and Gatekeeper-check in one command:
+
+```bash
+make macos-release \
+  MACOS_SIGN_IDENTITY='Developer ID Application: Your Name (ABCDE12345)' \
+  MACOS_INSTALLER_IDENTITY='Developer ID Installer: Your Name (ABCDE12345)'
+```
+
+The artifact is `dist/cfireants-<version>-macos-arm64.pkg`; the version comes
+from `CFIREANTS_VERSION` in `src/main.c` and `NOTARY_PROFILE` defaults to
+`cfireants-notary`. For a local packaging test that cannot be notarized, the
+output is deliberately named `cfireants-<version>-macos-arm64-unsigned.pkg`:
+
+```bash
+make macos-pkg-adhoc
+make macos-verify-adhoc
+```
+
+`scripts/verify_macos_pkg.sh` expands the finished package **without installing
+it** and checks that the executable is correctly signed, carries no foreign
+dependency, and actually runs.
+
+Publishing a GitHub release whose tag starts with `v` runs
+`.github/workflows/release-npm.yml`, which verifies that the tag, C version,
+package manifest and lockfile agree, runs native CTest, builds all three wasm
+modules, smoke-tests both CPU variants from the packed tarball, and compares a
+short packaged browser WebGPU Rigid→Affine→SyN run with CPU. It produces a
+SHA-256 file. Public attachment is blocked until the repository variable
+`CFIREANTS_NPM_REDISTRIBUTION_APPROVED=true` records that the redistribution
+review described in `js/README.md` is complete. Release assets are never
+overwritten under an existing version. `make macos-release` writes the
+notarized `.pkg` and a sibling `.pkg.sha256`; upload both to the same release.
+
 ## Validation
 
-Run all validation tests from the repo root (requires datasets in `validate/`):
+The unit and parity tests are registered with CTest and run from the repo root
+automatically; the backend parity test is recorded as a skip when no GPU initialises:
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+Run the validation registrations from the repo root (requires datasets in `validate/`):
 
 ```bash
 # Registration — small dataset (2mm full-head, MI+SyN)
@@ -166,4 +273,6 @@ See [validate/README.md](validate/README.md) for expected NCC values, timing, an
 
 ## License
 
-See the [FireANTs](https://github.com/rohitrango/FireANTs) repository for license information.
+FireANTs License version 1.0 — see [`LICENSE`](LICENSE). This is a derivative work: no
+FireANTs source is carried over, and it is not endorsed by the FireANTs authors. If you
+publish work using it, cite the FireANTs paper.

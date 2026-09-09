@@ -400,6 +400,10 @@ int rigid_register_gpu(const image_t *fixed, const image_t *moving,
 
             for (int k = 0; k < 4; k++) quat[k] = params7[k];
             for (int k = 0; k < 3; k++) transl[k] = params7[4+k];
+            float qnorm = sqrtf(quat[0]*quat[0] + quat[1]*quat[1] +
+                                quat[2]*quat[2] + quat[3]*quat[3]);
+            if (qnorm > 1e-8f)
+                for (int k = 0; k < 4; k++) quat[k] /= qnorm;
 
             if (it % 50 == 0 || it == iters - 1)
                 fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);

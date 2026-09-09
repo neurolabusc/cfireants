@@ -6,6 +6,7 @@
  */
 
 #include "cfireants/backend.h"
+#include "cfireants/threading.h"
 
 /* Global verbosity: default 2 for backward compat with test programs */
 int cfireants_verbose = 2;
@@ -147,6 +148,26 @@ int cfireants_init_cpu(void) {
     return 0;
 }
 
+/* Declared here rather than including the backend headers, which drag in
+ * webgpu.h / Metal headers that this translation unit has no other use for. */
+#ifdef CFIREANTS_HAS_WEBGPU
+void wgpu_context_cleanup(void);
+#endif
+#ifdef CFIREANTS_HAS_METAL
+void metal_context_cleanup(void);
+#endif
+
 void cfireants_cleanup(void) {
+    cfireants_threads_cleanup();
+    /* Previously stopped the thread pool only, so every accelerator context --
+     * device, queue, cached pipelines and layouts, staging buffers -- leaked on
+     * each use. Harmless for a one-shot CLI, not for an embedder. Both are
+     * safe to call when the backend was never initialised. */
+#ifdef CFIREANTS_HAS_WEBGPU
+    wgpu_context_cleanup();
+#endif
+#ifdef CFIREANTS_HAS_METAL
+    metal_context_cleanup();
+#endif
     g_backend = NULL;
 }

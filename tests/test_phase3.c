@@ -3,6 +3,7 @@
  */
 
 #include "cfireants/tensor.h"
+#include "test_data_dir.h"
 #include "cfireants/image.h"
 #include "cfireants/backend.h"
 #include "cfireants/registration.h"
@@ -44,8 +45,9 @@ static int test_moments(const char *data_dir,
 
     /* Run moments registration */
     moments_opts_t opts = moments_opts_default();
+    opts.orientation = 2; /* the Python reference was generated with "both" (small picks a det=-1 candidate) */
     moments_result_t result;
-    moments_register(&fixed, &moving, opts, &result);
+    if (moments_register(&fixed, &moving, opts, &result) != 0) return 1;
 
     /* Load Python reference */
     char name[128];
@@ -121,7 +123,7 @@ static int test_moments(const char *data_dir,
 }
 
 int main(int argc, char **argv) {
-    const char *data_dir = "cfireants/tests/test_data";
+    const char *data_dir = TEST_DATA_DIR;
     if (argc > 1) data_dir = argv[1];
 
     cfireants_init_cpu();

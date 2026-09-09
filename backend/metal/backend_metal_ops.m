@@ -126,8 +126,8 @@ static int mtl_cc_loss_3d(
     int D = pred->shape[2], H = pred->shape[3], W = pred->shape[4];
     float *gp = grad_pred ? (float *)grad_pred->data : NULL;
     metal_cc_loss_3d((const float *)pred->data, (const float *)target->data,
-                      gp, D, H, W, ks, loss_out);
-    return 0;
+                      gp, D, H, W, ks, loss_out, NULL);
+    return metal_had_fatal_error() ? -1 : 0;
 }
 static int mtl_mi_loss_3d(const tensor_t *pred, const tensor_t *target,
                            int bins, float *loss_out, tensor_t *grad_pred) {

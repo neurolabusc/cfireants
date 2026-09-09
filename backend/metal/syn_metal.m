@@ -40,18 +40,38 @@
 /* ------------------------------------------------------------------ */
 
 static float *syn_metal_alloc_buf(size_t bytes, id<MTLBuffer> *out_buf) {
+    *out_buf = nil;
+    if (metal_had_fatal_error()) return NULL;
     id<MTLBuffer> buf = [g_metal.device newBufferWithLength:bytes
                                                    options:MTLResourceStorageModeShared];
-    if (!buf) return NULL;
+    if (!buf) {
+        fprintf(stderr, "SyN Metal: could not allocate %zu-byte buffer\n", bytes);
+        metal_record_fatal_error("buffer allocation");
+        return NULL;
+    }
     float *ptr = (float *)buf.contents;
+    if (!ptr) {
+        metal_record_fatal_error("buffer mapping");
+        return NULL;
+    }
     metal_register_buffer(ptr, (__bridge void *)buf, bytes);
+    if (!metal_buffer_from_ptr(ptr)) return NULL;
     *out_buf = buf;
     return ptr;
 }
 
 static void syn_metal_free_buf(float *ptr, id<MTLBuffer> buf) {
-    if (ptr) metal_unregister_buffer(ptr);
+    if (ptr && metal_buffer_from_ptr(ptr)) metal_unregister_buffer(ptr);
     (void)buf;
+}
+
+static int syn_metal_abort(syn_result_t *result, const char *message) {
+    fprintf(stderr, "syn_register_metal: %s\n", message);
+    tensor_free(&result->fwd_disp);
+    tensor_free(&result->rev_disp);
+    tensor_free(&result->moved);
+    metal_context_cleanup();
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -63,6 +83,7 @@ static float *syn_make_gauss_kernel(float sigma, int *out_klen) {
     int tail = (int)(2.0f * sigma + 0.5f);
     int klen = 2 * tail + 1;
     float *h_k = (float *)malloc(klen * sizeof(float));
+    if (!h_k) { *out_klen = -1; return NULL; }
     float inv = 1.0f / (sigma * sqrtf(2.0f));
     float ksum = 0;
     for (int i = 0; i < klen; i++) {
@@ -132,6 +153,7 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
 {
     @autoreleasepool {
 
+    metal_clear_fatal_error();
     memset(result, 0, sizeof(syn_result_t));
     memcpy(result->affine_44, init_affine_44, 16 * sizeof(float));
 
@@ -159,12 +181,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
     id<MTLBuffer> fixed_buf, moving_buf;
     float *d_fixed = syn_metal_alloc_buf(fSpatial * sizeof(float), &fixed_buf);
     float *d_moving = syn_metal_alloc_buf(mSpatial * sizeof(float), &moving_buf);
-    if (!d_fixed || !d_moving) {
-        fprintf(stderr, "syn_register_metal: buffer allocation failed\n");
-        if (d_fixed) syn_metal_free_buf(d_fixed, fixed_buf);
-        if (d_moving) syn_metal_free_buf(d_moving, moving_buf);
-        return -1;
-    }
+    if (!d_fixed || !d_moving)
+        return syn_metal_abort(result, "image allocation failed");
     memcpy(d_fixed, fixed->data.data, fSpatial * sizeof(float));
     memcpy(d_moving, moving->data.data, mSpatial * sizeof(float));
 
@@ -172,15 +190,27 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
     int grad_klen = 0, warp_klen = 0;
     float *h_grad_kernel = syn_make_gauss_kernel(opts.smooth_grad_sigma, &grad_klen);
     float *h_warp_kernel = syn_make_gauss_kernel(opts.smooth_warp_sigma, &warp_klen);
+    if (grad_klen < 0 || warp_klen < 0) {
+        free(h_grad_kernel); free(h_warp_kernel);
+        return syn_metal_abort(result, "host kernel allocation failed");
+    }
 
     id<MTLBuffer> grad_kern_buf = nil, warp_kern_buf = nil;
     float *d_grad_kernel = NULL, *d_warp_kernel = NULL;
     if (grad_klen > 0) {
         d_grad_kernel = syn_metal_alloc_buf(grad_klen * sizeof(float), &grad_kern_buf);
+        if (!d_grad_kernel) {
+            free(h_grad_kernel); free(h_warp_kernel);
+            return syn_metal_abort(result, "gradient-kernel allocation failed");
+        }
         memcpy(d_grad_kernel, h_grad_kernel, grad_klen * sizeof(float));
     }
     if (warp_klen > 0) {
         d_warp_kernel = syn_metal_alloc_buf(warp_klen * sizeof(float), &warp_kern_buf);
+        if (!d_warp_kernel) {
+            free(h_grad_kernel); free(h_warp_kernel);
+            return syn_metal_abort(result, "warp-kernel allocation failed");
+        }
         memcpy(d_warp_kernel, h_warp_kernel, warp_klen * sizeof(float));
     }
     free(h_grad_kernel);
@@ -213,6 +243,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         int moving_blur_owned = 0;
         if (scale > 1) {
             d_fixed_down = syn_metal_alloc_buf(spatial * sizeof(float), &fdown_buf);
+            if (!d_fixed_down)
+                return syn_metal_abort(result, "fixed-pyramid allocation failed");
             if (opts.downsample_mode == DOWNSAMPLE_TRILINEAR)
                 metal_blur_downsample(d_fixed, d_fixed_down, 1, 1, fD, fH, fW, dD, dH, dW);
             else
@@ -222,6 +254,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
              * Applies per-axis Gaussian blur at FULL resolution without downsampling.
              * sigmas[i] = 0.5 * fixed_size[i] / size_down[i] */
             d_moving_blur = syn_metal_alloc_buf(mSpatial * sizeof(float), &mblur_buf);
+            if (!d_moving_blur)
+                return syn_metal_abort(result, "moving-pyramid allocation failed");
             moving_blur_owned = 1;
 
             metal_sync();
@@ -231,6 +265,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
                               0.5f * (float)fD / (float)dD,
                               0.5f * (float)fH / (float)dH,
                               0.5f * (float)fW / (float)dW);
+            if (metal_had_fatal_error())
+                return syn_metal_abort(result, "pyramid construction failed");
         } else {
             d_fixed_down = d_fixed;
             d_moving_blur = d_moving;
@@ -240,6 +276,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         if (d_fwd_warp == NULL) {
             d_fwd_warp = syn_metal_alloc_buf(n3 * sizeof(float), &fwd_warp_buf);
             d_rev_warp = syn_metal_alloc_buf(n3 * sizeof(float), &rev_warp_buf);
+            if (!d_fwd_warp || !d_rev_warp)
+                return syn_metal_abort(result, "warp allocation failed");
             memset(d_fwd_warp, 0, n3 * sizeof(float));
             memset(d_rev_warp, 0, n3 * sizeof(float));
         } else if (prev_dD != dD || prev_dH != dH || prev_dW != dW) {
@@ -249,12 +287,16 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
             id<MTLBuffer> t1_buf, t2_buf;
             float *d_t1 = syn_metal_alloc_buf(ps * 3 * sizeof(float), &t1_buf);
             float *d_t2 = syn_metal_alloc_buf(spatial * 3 * sizeof(float), &t2_buf);
+            if (!d_t1 || !d_t2)
+                return syn_metal_abort(result, "warp-resize allocation failed");
 
             /* Resize fwd */
             metal_permute_dhw3_3dhw(d_fwd_warp, d_t1, prev_dD, prev_dH, prev_dW);
             metal_trilinear_resize(d_t1, d_t2, 1, 3, prev_dD, prev_dH, prev_dW, dD, dH, dW, 1);
             syn_metal_free_buf(d_fwd_warp, fwd_warp_buf);
             d_fwd_warp = syn_metal_alloc_buf(n3 * sizeof(float), &fwd_warp_buf);
+            if (!d_fwd_warp)
+                return syn_metal_abort(result, "forward-warp resize allocation failed");
             metal_permute_3dhw_dhw3(d_t2, d_fwd_warp, dD, dH, dW);
 
             /* Resize rev */
@@ -262,6 +304,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
             metal_trilinear_resize(d_t1, d_t2, 1, 3, prev_dD, prev_dH, prev_dW, dD, dH, dW, 1);
             syn_metal_free_buf(d_rev_warp, rev_warp_buf);
             d_rev_warp = syn_metal_alloc_buf(n3 * sizeof(float), &rev_warp_buf);
+            if (!d_rev_warp)
+                return syn_metal_abort(result, "reverse-warp resize allocation failed");
             metal_permute_3dhw_dhw3(d_t2, d_rev_warp, dD, dH, dW);
 
             syn_metal_free_buf(d_t1, t1_buf);
@@ -280,6 +324,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
             d_fwd_v = syn_metal_alloc_buf(n3 * sizeof(float), &fwd_v_buf);
             d_rev_m = syn_metal_alloc_buf(n3 * sizeof(float), &rev_m_buf);
             d_rev_v = syn_metal_alloc_buf(n3 * sizeof(float), &rev_v_buf);
+            if (!d_fwd_m || !d_fwd_v || !d_rev_m || !d_rev_v)
+                return syn_metal_abort(result, "optimizer allocation failed");
             memset(d_fwd_m, 0, n3 * sizeof(float));
             memset(d_fwd_v, 0, n3 * sizeof(float));
             memset(d_rev_m, 0, n3 * sizeof(float));
@@ -291,11 +337,15 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         id<MTLBuffer> fwd_aff_buf, rev_aff_buf, fwd_base_buf, rev_base_buf;
         float *d_fwd_aff = syn_metal_alloc_buf(12 * sizeof(float), &fwd_aff_buf);
         float *d_rev_aff = syn_metal_alloc_buf(12 * sizeof(float), &rev_aff_buf);
+        if (!d_fwd_aff || !d_rev_aff)
+            return syn_metal_abort(result, "affine allocation failed");
         memcpy(d_fwd_aff, h_aff, 12 * sizeof(float));
         memcpy(d_rev_aff, h_id, 12 * sizeof(float));
 
         float *d_fwd_base = syn_metal_alloc_buf(n3 * sizeof(float), &fwd_base_buf);
         float *d_rev_base = syn_metal_alloc_buf(n3 * sizeof(float), &rev_base_buf);
+        if (!d_fwd_base || !d_rev_base)
+            return syn_metal_abort(result, "base-grid allocation failed");
         metal_affine_grid_3d(d_fwd_aff, d_fwd_base, 1, dD, dH, dW);
         metal_affine_grid_3d(d_rev_aff, d_rev_base, 1, dD, dH, dW);
 
@@ -318,7 +368,12 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         float *d_s1 = syn_metal_alloc_buf(n3 * sizeof(float), &s1_buf);
         float *d_s2 = syn_metal_alloc_buf(n3 * sizeof(float), &s2_buf);
         float *d_cc_interm = syn_metal_alloc_buf(5L * spatial * sizeof(float), &cc_interm_buf);
-        float *d_cc_scratch = syn_metal_alloc_buf(spatial * sizeof(float), &cc_scratch_buf);
+        float *d_cc_scratch = syn_metal_alloc_buf(5L * spatial * sizeof(float), &cc_scratch_buf);
+        if (!d_sg_fwd || !d_sg_rev || !d_moved || !d_fwarped ||
+            !d_grad_moved || !d_grad_fwarped || !d_grad_fwd || !d_grad_rev ||
+            !d_adam_dir_fwd || !d_adam_dir_rev || !d_s1 || !d_s2 ||
+            !d_cc_interm || !d_cc_scratch)
+            return syn_metal_abort(result, "per-scale workspace allocation failed");
 
         if (cfireants_verbose >= 2) fprintf(stderr, "  SyN Metal scale %d: [%d,%d,%d] x %d iters\n", scale, dD, dH, dW, iters);
 
@@ -344,6 +399,7 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
                                d_grad_moved, d_grad_fwarped,
                                dD, dH, dW, opts.cc_kernel_size,
                                &loss, d_cc_interm, d_cc_scratch);
+            if (metal_had_fatal_error()) break;
 
             /* 5. Backward for fwd_warp: dL/d(fwd_sg) */
             metal_grid_sample_3d_bwd(d_grad_moved, d_moving_blur, d_sg_fwd,
@@ -402,6 +458,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         syn_metal_free_buf(d_cc_scratch, cc_scratch_buf);
         if (scale > 1) syn_metal_free_buf(d_fixed_down, fdown_buf);
         if (moving_blur_owned) syn_metal_free_buf(d_moving_blur, mblur_buf);
+        if (metal_had_fatal_error())
+            return syn_metal_abort(result, "GPU iteration failed");
     }
 
     /* ---- Evaluate: compose fwd_warp with inverse(rev_warp) ---- */
@@ -430,11 +488,15 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
             id<MTLBuffer> t1_buf, t2_buf;
             float *d_t1 = syn_metal_alloc_buf(ps * 3 * sizeof(float), &t1_buf);
             float *d_t2 = syn_metal_alloc_buf(fSpatial * 3 * sizeof(float), &t2_buf);
+            if (!d_t1 || !d_t2)
+                return syn_metal_abort(result, "full-resolution warp allocation failed");
 
             /* Resize fwd */
             metal_permute_dhw3_3dhw(d_fwd_warp, d_t1, prev_dD, prev_dH, prev_dW);
             metal_trilinear_resize(d_t1, d_t2, 1, 3, prev_dD, prev_dH, prev_dW, fD, fH, fW, 1);
             d_fwd_full = syn_metal_alloc_buf(n3 * sizeof(float), &fwd_full_buf);
+            if (!d_fwd_full)
+                return syn_metal_abort(result, "forward output-warp allocation failed");
             metal_permute_3dhw_dhw3(d_t2, d_fwd_full, fD, fH, fW);
             fwd_full_owned = 1;
 
@@ -442,6 +504,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
             metal_permute_dhw3_3dhw(d_rev_warp, d_t1, prev_dD, prev_dH, prev_dW);
             metal_trilinear_resize(d_t1, d_t2, 1, 3, prev_dD, prev_dH, prev_dW, fD, fH, fW, 1);
             d_rev_full = syn_metal_alloc_buf(n3 * sizeof(float), &rev_full_buf);
+            if (!d_rev_full)
+                return syn_metal_abort(result, "reverse output-warp allocation failed");
             metal_permute_3dhw_dhw3(d_t2, d_rev_full, fD, fH, fW);
             rev_full_owned = 1;
 
@@ -452,11 +516,15 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         /* Compute inverse of rev_warp via iterative fixed-point */
         id<MTLBuffer> inv_rev_buf;
         float *d_inv_rev = syn_metal_alloc_buf(n3 * sizeof(float), &inv_rev_buf);
+        if (!d_inv_rev)
+            return syn_metal_abort(result, "warp-inverse allocation failed");
         metal_warp_inverse(d_rev_full, d_inv_rev, fD, fH, fW, 0);
 
         /* Compose: composed = inv_rev + interp(fwd_warp, identity + inv_rev) */
         id<MTLBuffer> composed_buf;
         float *d_composed = syn_metal_alloc_buf(n3 * sizeof(float), &composed_buf);
+        if (!d_composed)
+            return syn_metal_abort(result, "composed-warp allocation failed");
         metal_sync();
         memcpy(d_composed, d_inv_rev, n3 * sizeof(float));
         metal_fused_compositive_update(d_fwd_full, d_composed, d_composed, fD, fH, fW);
@@ -467,6 +535,8 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         float *d_eval_base = syn_metal_alloc_buf(n3 * sizeof(float), &eval_base_buf);
         float *d_eval_sg = syn_metal_alloc_buf(n3 * sizeof(float), &eval_sg_buf);
         float *d_eval_moved = syn_metal_alloc_buf(fSpatial * sizeof(float), &eval_moved_buf);
+        if (!d_eval_aff || !d_eval_base || !d_eval_sg || !d_eval_moved)
+            return syn_metal_abort(result, "evaluation allocation failed");
 
         memcpy(d_eval_aff, h_aff, 12 * sizeof(float));
         metal_affine_grid_3d(d_eval_aff, d_eval_base, 1, fD, fH, fW);
@@ -477,12 +547,27 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
         /* Sample moving image */
         metal_grid_sample_3d_fwd(d_moving, d_eval_sg, d_eval_moved,
                                   1, 1, mD, mH, mW, fD, fH, fW);
-        metal_cc_loss_3d(d_eval_moved, d_fixed, NULL, fD, fH, fW, 9, &result->ncc_loss);
+        metal_cc_loss_3d(d_eval_moved, d_fixed, NULL, fD, fH, fW, 9,
+                         &result->ncc_loss, NULL);
 
         /* Download warped image */
         metal_sync();
+        int disp_shape[5] = {1, fD, fH, fW, 3};
+        if (tensor_alloc(&result->fwd_disp, 5, disp_shape,
+                         DTYPE_FLOAT32, DEVICE_CPU) != 0 ||
+            tensor_alloc(&result->rev_disp, 5, disp_shape,
+                         DTYPE_FLOAT32, DEVICE_CPU) != 0) {
+            fprintf(stderr, "syn_register_metal: displacement allocation failed\n");
+            tensor_free(&result->fwd_disp);
+            tensor_free(&result->rev_disp);
+        } else {
+            memcpy(result->fwd_disp.data, d_fwd_full, n3 * sizeof(float));
+            memcpy(result->rev_disp.data, d_rev_full, n3 * sizeof(float));
+        }
         int shape[5] = {1, 1, fD, fH, fW};
-        tensor_alloc(&result->moved, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
+        if (tensor_alloc(&result->moved, 5, shape,
+                         DTYPE_FLOAT32, DEVICE_CPU) != 0)
+            return syn_metal_abort(result, "output allocation failed");
         memcpy(result->moved.data, d_eval_moved, fSpatial * sizeof(float));
 
         if (fwd_full_owned) syn_metal_free_buf(d_fwd_full, fwd_full_buf);
@@ -506,6 +591,14 @@ int syn_register_metal(const image_t *fixed, const image_t *moving,
     if (d_warp_kernel) syn_metal_free_buf(d_warp_kernel, warp_kern_buf);
     syn_metal_free_buf(d_fixed, fixed_buf);
     syn_metal_free_buf(d_moving, moving_buf);
+
+    if (metal_had_fatal_error() || !result->fwd_disp.data ||
+        !result->rev_disp.data || !result->moved.data) {
+        tensor_free(&result->fwd_disp);
+        tensor_free(&result->rev_disp);
+        tensor_free(&result->moved);
+        return -1;
+    }
 
     } /* @autoreleasepool */
     return 0;

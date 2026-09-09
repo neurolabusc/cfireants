@@ -218,6 +218,7 @@ int main(int argc, char **argv) {
             deform_moved = greedy.moved;
             deform_ncc_loss = greedy.ncc_loss;
             deform_name = "Greedy";
+            tensor_free(&greedy.disp);
         } else {
             t1 = get_time();
             syn_opts_t sopts = {
@@ -232,6 +233,8 @@ int main(int argc, char **argv) {
             deform_moved = syn.moved;
             deform_ncc_loss = syn.ncc_loss;
             deform_name = "SyN";
+            tensor_free(&syn.fwd_disp);
+            tensor_free(&syn.rev_disp);
         }
 
         double t_total = get_time()-t0;

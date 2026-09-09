@@ -8,20 +8,11 @@
 #include "webgpu_kernels.h"
 #include "webgpu_context.h"
 #include "shader_loader.h"
+#include "cfireants/registration.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-
-/* ================================================================== */
-/* Embedded WGSL shader sources                                        */
-/* ================================================================== */
-
-/* We include the .wgsl files as C string literals via a helper macro.
- * For now, define them inline. In a production build these would be
- * generated from the .wgsl files at build time.                       */
-
-#include "wgsl_sources.h"
 
 /* make_params is now wgpu_make_params in webgpu_context.h */
 #define make_params wgpu_make_params
@@ -39,11 +30,11 @@ static void dispatch_1buf(const char *name, const char *wgsl, const char *entry,
         { .binding = 1, .buffer = params, .size = ps },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 2, .entries = entries };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
     uint32_t wx, wy;
     wgpu_dispatch_dims(groups, &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1);
-    wgpuBindGroupRelease(bg);
+    wgpu_release_bind_group(bg);
 }
 
 /* ================================================================== */
@@ -61,8 +52,10 @@ void wgpu_grid_sample_3d_fwd(
     gs_params_t p = { B, C, iD, iH, iW, oD, oH, oW };
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
-    WGPUComputePipeline pl = wgpu_get_pipeline("gs_fwd", wgsl_grid_sample_fwd, "grid_sample_fwd");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    WGPUComputePipeline pl = wgpu_get_pipeline(
+        "gs_fwd", get_shader_source("grid_sample.wgsl", NULL),
+        "grid_sample_fwd");
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("gs_fwd");
 
     size_t in_sz = (size_t)B * C * iD * iH * iW * 4;
@@ -76,14 +69,14 @@ void wgpu_grid_sample_3d_fwd(
         { .binding = 3, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = entries };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
 
     uint32_t total = B * oD * oH * oW;
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(total, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
 
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 }
 
 void wgpu_grid_sample_3d_bwd(
@@ -94,8 +87,10 @@ void wgpu_grid_sample_3d_bwd(
     gs_params_t p = { B, C, iD, iH, iW, oD, oH, oW };
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
-    WGPUComputePipeline pl = wgpu_get_pipeline("gs_bwd", wgsl_grid_sample_bwd, "grid_sample_bwd");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    WGPUComputePipeline pl = wgpu_get_pipeline(
+        "gs_bwd", get_shader_source("grid_sample_bwd.wgsl", NULL),
+        "grid_sample_bwd");
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("gs_bwd");
 
     size_t go_sz = (size_t)B * C * oD * oH * oW * 4;
@@ -111,14 +106,14 @@ void wgpu_grid_sample_3d_bwd(
         { .binding = 4, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 5, .entries = entries };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
 
     uint32_t total = B * oD * oH * oW;
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(total, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
 
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 }
 
 /* ================================================================== */
@@ -132,8 +127,10 @@ void wgpu_affine_grid_3d(WGPUBuffer affine, WGPUBuffer grid,
     ag_params_t p = { B, D, H, W };
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
-    WGPUComputePipeline pl = wgpu_get_pipeline("affine_grid", wgsl_affine_grid, "affine_grid");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    WGPUComputePipeline pl = wgpu_get_pipeline(
+        "affine_grid", get_shader_source("affine_grid.wgsl", NULL),
+        "affine_grid");
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("affine_grid");
 
     WGPUBindGroupEntry entries[] = {
@@ -142,12 +139,12 @@ void wgpu_affine_grid_3d(WGPUBuffer affine, WGPUBuffer grid,
         { .binding = 2, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = entries };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
 
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(B * D * H * W, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 }
 
 /* ================================================================== */
@@ -166,8 +163,10 @@ void wgpu_trilinear_resize(
     resize_params_t p = { B, C, iD, iH, iW, oD, oH, oW, align_corners, 0 };
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
-    WGPUComputePipeline pl = wgpu_get_pipeline("resize", wgsl_resize, "trilinear_resize");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    WGPUComputePipeline pl = wgpu_get_pipeline(
+        "resize", get_shader_source("resize.wgsl", NULL),
+        "trilinear_resize");
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("resize");
 
     size_t in_sz = (size_t)B * C * iD * iH * iW * 4;
@@ -179,39 +178,37 @@ void wgpu_trilinear_resize(
         { .binding = 2, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = entries };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
 
     uint32_t total = B * C * oD * oH * oW;
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(total, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 }
 
 /* ================================================================== */
 /* Element-wise ops on raw buffers                                     */
 /* ================================================================== */
 
-/* Reuse the elementwise shader from backend_webgpu_ops.c */
-extern const char *wgsl_elementwise;
-extern const char *wgsl_axpy;
-
 typedef struct { uint32_t n; uint32_t pad0; float value; float pad1; } ew_params_t;
 
 void wgpu_tensor_fill_buf(WGPUBuffer buf, float value, int n) {
     ew_params_t p = { .n = n, .value = value };
     WGPUBuffer pb = make_params(&p, sizeof(p));
-    dispatch_1buf("fill", wgsl_elementwise, "fill", buf, (size_t)n * 4, pb, sizeof(p),
+    dispatch_1buf("fill", get_shader_source("elementwise.wgsl", NULL),
+                  "fill", buf, (size_t)n * 4, pb, sizeof(p),
                   wgpu_div_ceil(n, 256));
-    wgpuBufferRelease(pb);
+    wgpu_release_buffer(pb);
 }
 
 void wgpu_tensor_scale_buf(WGPUBuffer buf, float alpha, int n) {
     ew_params_t p = { .n = n, .value = alpha };
     WGPUBuffer pb = make_params(&p, sizeof(p));
-    dispatch_1buf("scale", wgsl_elementwise, "scale", buf, (size_t)n * 4, pb, sizeof(p),
+    dispatch_1buf("scale", get_shader_source("elementwise.wgsl", NULL),
+                  "scale", buf, (size_t)n * 4, pb, sizeof(p),
                   wgpu_div_ceil(n, 256));
-    wgpuBufferRelease(pb);
+    wgpu_release_buffer(pb);
 }
 
 void wgpu_tensor_add_buf(WGPUBuffer a, WGPUBuffer b, int n) {
@@ -219,8 +216,9 @@ void wgpu_tensor_add_buf(WGPUBuffer a, WGPUBuffer b, int n) {
     ew_params_t p = { .n = n, .value = 1.0f };
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
-    WGPUComputePipeline pl = wgpu_get_pipeline("axpy", wgsl_axpy, "axpy");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    WGPUComputePipeline pl = wgpu_get_pipeline(
+        "axpy", get_shader_source("axpy.wgsl", NULL), "axpy");
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("axpy");
     WGPUBindGroupEntry entries[] = {
         { .binding = 0, .buffer = a, .size = (size_t)n * 4 },
@@ -228,11 +226,11 @@ void wgpu_tensor_add_buf(WGPUBuffer a, WGPUBuffer b, int n) {
         { .binding = 2, .buffer = b, .size = (size_t)n * 4 },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = entries };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 }
 
 /* ================================================================== */
@@ -254,8 +252,9 @@ void wgpu_adam_step(
     adam_params_t p = { n, step, lr, beta1, beta2, eps, 0, 0 };
     WGPUBuffer pb = make_params(&p, sizeof(p));
 
-    WGPUComputePipeline pl = wgpu_get_pipeline("adam_step", wgsl_adam, "adam_step");
-    if (!pl) { wgpuBufferRelease(pb); return; }
+    WGPUComputePipeline pl = wgpu_get_pipeline(
+        "adam_step", get_shader_source("adam.wgsl", NULL), "adam_step");
+    if (!pl) { wgpu_release_buffer(pb); return; }
     WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("adam_step");
 
     size_t sz = (size_t)n * 4;
@@ -267,12 +266,12 @@ void wgpu_adam_step(
         { .binding = 4, .buffer = pb, .size = sizeof(p) },
     };
     WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 5, .entries = entries };
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
 
     { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
     wgpu_dispatch(pl, bg, wx, wy, 1); }
-    wgpuBindGroupRelease(bg);
-    wgpuBufferRelease(pb);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
 }
 
 /* ================================================================== */
@@ -294,8 +293,10 @@ static void box_filter_3d(WGPUBuffer in_buf, WGPUBuffer out_buf,
         box_p_t p = { D, H, W, ks, axis, 0, 0, 0 };
         WGPUBuffer pb = make_params(&p, sizeof(p));
 
-        WGPUComputePipeline pl = wgpu_get_pipeline("box_filter", wgsl_box_filter, "box_filter");
-        if (!pl) { wgpuBufferRelease(pb); continue; }
+        WGPUComputePipeline pl = wgpu_get_pipeline(
+            "box_filter", get_shader_source("box_filter.wgsl", NULL),
+            "box_filter");
+        if (!pl) { wgpu_release_buffer(pb); continue; }
         WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("box_filter");
         WGPUBindGroupEntry entries[] = {
             { .binding = 0, .buffer = src, .size = sz },
@@ -303,22 +304,16 @@ static void box_filter_3d(WGPUBuffer in_buf, WGPUBuffer out_buf,
             { .binding = 2, .buffer = pb, .size = sizeof(p) },
         };
         WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = entries };
-        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+        WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
         { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
         wgpu_dispatch(pl, bg, wx, wy, 1); }
-        wgpuBindGroupRelease(bg);
-        wgpuBufferRelease(pb);
+        wgpu_release_bind_group(bg);
+        wgpu_release_buffer(pb);
     }
 
-    /* After 3 passes: result is in tmp_buf for axis=2 output.
-     * Copy tmp_buf -> out_buf */
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-    wgpuCommandEncoderCopyBufferToBuffer(enc, tmp_buf, 0, out_buf, 0, (size_t)n * 4);
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-    wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
-    wgpuDevicePoll(g_wgpu.device, 1, NULL);
+    /* After 3 passes the result is in tmp_buf. Keep the copy in the active
+     * command buffer when the caller is batching. */
+    wgpu_copy_buffer(tmp_buf, out_buf, (size_t)n * 4);
 }
 
 /* ================================================================== */
@@ -327,332 +322,331 @@ static void box_filter_3d(WGPUBuffer in_buf, WGPUBuffer out_buf,
 
 /* Box-filter one channel of the intermediates buffer in-place.
  * Channel occupies interm[ch*spatial .. (ch+1)*spatial-1]. */
-static void box_filter_channel_inplace(WGPUBuffer interm, long ch_offset,
-                                        WGPUBuffer scratch, WGPUBuffer tmp,
-                                        int D, int H, int W, int ks) {
-    /* We need to filter a sub-region of interm. Since WebGPU doesn't support
-     * buffer views with offsets in bind groups easily, we copy the channel
-     * to scratch, filter scratch→tmp→scratch, copy back. */
-    int n = D * H * W;
-    size_t sz = (size_t)n * 4;
-    size_t off = (size_t)ch_offset * 4;
+static const char *get_fused_cc_shader(const char *filename) {
+    static const char *create_src = NULL;
+    static const char *box_src = NULL;
+    static const char *fwd_src = NULL;
+    static const char *modify_src = NULL;
+    static const char *grads_src = NULL;
+    const char **slot = NULL;
 
-    /* Copy channel from interm to scratch */
-    {
-        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, interm, off, scratch, 0, sz);
-        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-        wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-        wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
+    if (strcmp(filename, "fused_cc.wgsl") == 0) slot = &create_src;
+    else if (strcmp(filename, "fused_cc_box.wgsl") == 0) slot = &box_src;
+    else if (strcmp(filename, "fused_cc_fwd.wgsl") == 0) slot = &fwd_src;
+    else if (strcmp(filename, "fused_cc_bwd_modify.wgsl") == 0) slot = &modify_src;
+    else if (strcmp(filename, "fused_cc_bwd_grads.wgsl") == 0) slot = &grads_src;
+    if (!slot) return NULL;
+    if (!*slot) *slot = get_shader_source(filename, NULL);
+    return *slot;
+}
+
+static int fcc_dispatch_packed_box(WGPUBuffer input, WGPUBuffer output,
+                                   int D, int H, int W, int ks, int axis) {
+    const char *wgsl = get_fused_cc_shader("fused_cc_box.wgsl");
+    if (!wgsl) return -1;
+
+    typedef struct {
+        uint32_t D, H, W, ks, axis, channels, _p0, _p1;
+    } params_t;
+    params_t p = { (uint32_t)D, (uint32_t)H, (uint32_t)W,
+                   (uint32_t)ks, (uint32_t)axis, 5, 0, 0 };
+    WGPUBuffer pb = make_params(&p, sizeof(p));
+    WGPUComputePipeline pl =
+        wgpu_get_pipeline("fcc_box_packed", wgsl, "box_filter_packed");
+    if (!pl) {
+        wgpu_release_buffer(pb);
+        return -1;
     }
 
-    /* 3-axis box filter: scratch → tmp → scratch (via box_filter_3d pattern) */
-    box_filter_3d(scratch, scratch, tmp, D, H, W, ks);
-
-    /* Copy filtered result back to interm channel */
-    {
-        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, scratch, 0, interm, off, sz);
-        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-        wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-        wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
-        wgpuDevicePoll(g_wgpu.device, 1, NULL);
-    }
+    size_t size = (size_t)5 * D * H * W * sizeof(float);
+    WGPUBindGroupEntry entries[] = {
+        { .binding = 0, .buffer = input, .size = size },
+        { .binding = 1, .buffer = output, .size = size },
+        { .binding = 2, .buffer = pb, .size = sizeof(p) },
+    };
+    WGPUBindGroupDescriptor desc = {
+        .layout = wgpu_get_bind_group_layout("fcc_box_packed"),
+        .entryCount = 3,
+        .entries = entries,
+    };
+    WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+    uint32_t groups = wgpu_div_ceil((uint32_t)(5 * D * H * W), 256);
+    uint32_t wx, wy;
+    wgpu_dispatch_dims(groups, &wx, &wy);
+    wgpu_dispatch(pl, bg, wx, wy, 1);
+    wgpu_release_bind_group(bg);
+    wgpu_release_buffer(pb);
+    return 0;
 }
 
 void wgpu_fused_cc_loss(
     WGPUBuffer pred, WGPUBuffer target,
-    WGPUBuffer grad_pred,          /* may be NULL */
-    WGPUBuffer grad_target,        /* may be NULL */
+    WGPUBuffer grad_pred, WGPUBuffer grad_target,
     int D, int H, int W, int ks,
-    float *h_loss_out)
+    float *h_loss_out,
+    WGPUBuffer interm, WGPUBuffer scratch)
 {
-    int n = D * H * W;
-    size_t sz = (size_t)n * sizeof(float);
-    int kernel_volume = ks * ks * ks;
-    float nr = 1e-5f, dr = 1e-5f;
-    WGPUBufferUsage u = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+    const uint32_t n = (uint32_t)(D * H * W);
+    const size_t size = (size_t)n * sizeof(float);
+    const size_t workspace_size = 5 * size;
+    const uint32_t groups = wgpu_div_ceil(n, 256);
+    const int caller_batching = g_wgpu.batch_active;
 
-    /* Use 5 SEPARATE buffers for intermediates (avoiding channel-offset issues) */
-    WGPUBuffer b_I   = wgpu_create_buffer(sz, u, "fcc_I");
-    WGPUBuffer b_J   = wgpu_create_buffer(sz, u, "fcc_J");
-    WGPUBuffer b_I2  = wgpu_create_buffer(sz, u, "fcc_I2");
-    WGPUBuffer b_J2  = wgpu_create_buffer(sz, u, "fcc_J2");
-    WGPUBuffer b_IJ  = wgpu_create_buffer(sz, u, "fcc_IJ");
-    WGPUBuffer tmp   = wgpu_create_buffer(sz, u, "fcc_tmp");
+    if (!caller_batching) wgpu_begin_batch();
 
-    /* Step 1: Create intermediates — use existing multiply shader pattern */
+    /* Pack [I, J, I^2, J^2, IJ] in one pass. */
     {
-        /* Copy pred→I, target→J */
-        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, pred, 0, b_I, 0, sz);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, target, 0, b_J, 0, sz);
-        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-        wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-        wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
-        wgpuDevicePoll(g_wgpu.device, 1, NULL);
-
-        /* Compute I², J², IJ using existing multiply pipeline */
-        static const char *mul_src = NULL;
-        if (!mul_src) mul_src =
-            "struct P { n: u32, _p0: u32, _p1: u32, _p2: u32, }\n"
-            "@group(0) @binding(0) var<storage, read> a: array<f32>;\n"
-            "@group(0) @binding(1) var<storage, read> b: array<f32>;\n"
-            "@group(0) @binding(2) var<storage, read_write> c: array<f32>;\n"
-            "@group(0) @binding(3) var<uniform> p: P;\n"
-            "@compute @workgroup_size(256)\n"
-            "fn mul(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-            "    let i = gid.x + gid.y * nwg.x * 256u; if (i >= p.n) { return; }\n"
-            "    c[i] = a[i] * b[i];\n"
-            "}\n";
-
-        typedef struct { uint32_t n, _p0, _p1, _p2; } mp_t;
-        mp_t mp = { (uint32_t)n, 0, 0, 0 };
-
-        WGPUComputePipeline pl = wgpu_get_pipeline("fcc_mul", mul_src, "mul");
-        if (pl) {
-            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("fcc_mul");
-
-            /* I² = I * I */
-            WGPUBuffer pb = make_params(&mp, sizeof(mp));
-            WGPUBindGroupEntry e1[] = {
-                { .binding=0, .buffer=b_I, .size=sz }, { .binding=1, .buffer=b_I, .size=sz },
-                { .binding=2, .buffer=b_I2, .size=sz }, { .binding=3, .buffer=pb, .size=sizeof(mp) },
-            };
-            WGPUBindGroup bg1 = wgpuDeviceCreateBindGroup(g_wgpu.device, &(WGPUBindGroupDescriptor){ .layout=lay, .entryCount=4, .entries=e1 });
-            { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n,256), &wx, &wy);
-            wgpu_dispatch(pl, bg1, wx, wy, 1); }
-            wgpuBindGroupRelease(bg1); wgpuBufferRelease(pb);
-
-            /* J² = J * J */
-            pb = make_params(&mp, sizeof(mp));
-            WGPUBindGroupEntry e2[] = {
-                { .binding=0, .buffer=b_J, .size=sz }, { .binding=1, .buffer=b_J, .size=sz },
-                { .binding=2, .buffer=b_J2, .size=sz }, { .binding=3, .buffer=pb, .size=sizeof(mp) },
-            };
-            WGPUBindGroup bg2 = wgpuDeviceCreateBindGroup(g_wgpu.device, &(WGPUBindGroupDescriptor){ .layout=lay, .entryCount=4, .entries=e2 });
-            { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n,256), &wx, &wy);
-            wgpu_dispatch(pl, bg2, wx, wy, 1); }
-            wgpuBindGroupRelease(bg2); wgpuBufferRelease(pb);
-
-            /* IJ = I * J */
-            pb = make_params(&mp, sizeof(mp));
-            WGPUBindGroupEntry e3[] = {
-                { .binding=0, .buffer=b_I, .size=sz }, { .binding=1, .buffer=b_J, .size=sz },
-                { .binding=2, .buffer=b_IJ, .size=sz }, { .binding=3, .buffer=pb, .size=sizeof(mp) },
-            };
-            WGPUBindGroup bg3 = wgpuDeviceCreateBindGroup(g_wgpu.device, &(WGPUBindGroupDescriptor){ .layout=lay, .entryCount=4, .entries=e3 });
-            { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n,256), &wx, &wy);
-            wgpu_dispatch(pl, bg3, wx, wy, 1); }
-            wgpuBindGroupRelease(bg3); wgpuBufferRelease(pb);
+        const char *wgsl = get_fused_cc_shader("fused_cc.wgsl");
+        typedef struct { uint32_t n, _p0, _p1, _p2; } params_t;
+        params_t p = { n, 0, 0, 0 };
+        WGPUBuffer pb = make_params(&p, sizeof(p));
+        WGPUComputePipeline pl =
+            wgpu_get_pipeline("fcc_create", wgsl, "create_intermediates");
+        if (!pl) {
+            wgpu_release_buffer(pb);
+            if (!caller_batching) wgpu_flush();
+            return;
         }
+        WGPUBindGroupEntry entries[] = {
+            { .binding = 0, .buffer = pred, .size = size },
+            { .binding = 1, .buffer = target, .size = size },
+            { .binding = 2, .buffer = interm, .size = workspace_size },
+            { .binding = 3, .buffer = pb, .size = sizeof(p) },
+        };
+        WGPUBindGroupDescriptor desc = {
+            .layout = wgpu_get_bind_group_layout("fcc_create"),
+            .entryCount = 4,
+            .entries = entries,
+        };
+        WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+        uint32_t wx, wy;
+        wgpu_dispatch_dims(groups, &wx, &wy);
+        wgpu_dispatch(pl, bg, wx, wy, 1);
+        wgpu_release_bind_group(bg);
+        wgpu_release_buffer(pb);
     }
 
-    /* Step 2: Box filter each of the 5 channels separately */
-    box_filter_3d(b_I,  b_I,  tmp, D, H, W, ks);
-    box_filter_3d(b_J,  b_J,  tmp, D, H, W, ks);
-    box_filter_3d(b_I2, b_I2, tmp, D, H, W, ks);
-    box_filter_3d(b_J2, b_J2, tmp, D, H, W, ks);
-    box_filter_3d(b_IJ, b_IJ, tmp, D, H, W, ks);
+    /* Filter all five channels together. The filtered values end in scratch. */
+    fcc_dispatch_packed_box(interm, scratch, D, H, W, ks, 0);
+    fcc_dispatch_packed_box(scratch, interm, D, H, W, ks, 1);
+    fcc_dispatch_packed_box(interm, scratch, D, H, W, ks, 2);
 
-    /* Step 3: Forward NCC on CPU */
     if (h_loss_out) {
-        float *h_mu=(float*)malloc(sz), *h_rho=(float*)malloc(sz);
-        float *h_mu2=(float*)malloc(sz), *h_rho2=(float*)malloc(sz), *h_murho=(float*)malloc(sz);
-        wgpu_read_buffer(b_I, 0, h_mu, sz);
-        wgpu_read_buffer(b_J, 0, h_rho, sz);
-        wgpu_read_buffer(b_I2, 0, h_mu2, sz);
-        wgpu_read_buffer(b_J2, 0, h_rho2, sz);
-        wgpu_read_buffer(b_IJ, 0, h_murho, sz);
-        double ncc_sum = 0;
-        float kv = (float)kernel_volume;
-        for (int i = 0; i < n; i++) {
-            float A = kv * (h_murho[i] - h_mu[i]*h_rho[i]);
-            float B = kv * (h_mu2[i] - h_mu[i]*h_mu[i]); if (B < dr) B = dr;
-            float C = kv * (h_rho2[i] - h_rho[i]*h_rho[i]); if (C < dr) C = dr;
-            float ncc = (A*A + nr) / (B*C + dr);
-            if (ncc < -1.0f) ncc = -1.0f; if (ncc > 1.0f) ncc = 1.0f;
-            ncc_sum += ncc;
+        const char *wgsl = get_fused_cc_shader("fused_cc_fwd.wgsl");
+        typedef struct {
+            uint32_t n, kernel_volume;
+            float nr, dr;
+        } params_t;
+        params_t p = { n, (uint32_t)(ks * ks * ks), 1e-5f, 1e-5f };
+        WGPUBuffer pb = make_params(&p, sizeof(p));
+        WGPUComputePipeline pl = wgpu_get_pipeline("fcc_fwd", wgsl, "fcc_fwd");
+        if (pl) {
+            WGPUBindGroupEntry entries[] = {
+                { .binding = 0, .buffer = scratch, .size = workspace_size },
+                { .binding = 1, .buffer = interm, .size = workspace_size },
+                { .binding = 2, .buffer = pb, .size = sizeof(p) },
+            };
+            WGPUBindGroupDescriptor desc = {
+                .layout = wgpu_get_bind_group_layout("fcc_fwd"),
+                .entryCount = 3,
+                .entries = entries,
+            };
+            WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+            uint32_t wx, wy;
+            wgpu_dispatch_dims(groups, &wx, &wy);
+            wgpu_dispatch(pl, bg, wx, wy, 1);
+            wgpu_release_bind_group(bg);
+
+            float *partials = (float *)malloc((size_t)groups * sizeof(float));
+            if (!partials) {
+                wgpu_record_fatal_error("fused CC host reduction allocation");
+                *h_loss_out = 0.0f;
+            } else {
+                wgpu_read_buffer(interm, 0, partials,
+                                 (size_t)groups * sizeof(float));
+                double sum = 0.0;
+                if (!wgpu_had_fatal_error())
+                    for (uint32_t i = 0; i < groups; i++) sum += partials[i];
+                free(partials);
+                *h_loss_out = wgpu_had_fatal_error() ? 0.0f
+                                                      : -(float)(sum / n);
+            }
         }
-        *h_loss_out = -(float)(ncc_sum / n);
-        free(h_mu); free(h_rho); free(h_mu2); free(h_rho2); free(h_murho);
+        wgpu_release_buffer(pb);
+
+        /* Readback flushes the caller's batch; continue encoding afterward. */
+        if (grad_pred || caller_batching) wgpu_begin_batch();
     }
 
-    /* Steps 4-6: Backward */
     if (grad_pred) {
-        int cgt = (grad_target != NULL) ? 1 : 0;
-        float gO = -1.0f / n;
-
-        /* Step 4: bwd_modify — overwrite the 5 buffers with gradient multipliers.
-         * We do this on CPU since the data is small and avoids another shader. */
+        /* Convert the filtered values into gradient multipliers in place. */
         {
-            float *h_mu=(float*)malloc(sz), *h_rho=(float*)malloc(sz);
-            float *h_mu2=(float*)malloc(sz), *h_rho2=(float*)malloc(sz), *h_murho=(float*)malloc(sz);
-            wgpu_read_buffer(b_I, 0, h_mu, sz);
-            wgpu_read_buffer(b_J, 0, h_rho, sz);
-            wgpu_read_buffer(b_I2, 0, h_mu2, sz);
-            wgpu_read_buffer(b_J2, 0, h_rho2, sz);
-            wgpu_read_buffer(b_IJ, 0, h_murho, sz);
-
-            float kv = (float)kernel_volume;
-            for (int i = 0; i < n; i++) {
-                float A = kv * (h_murho[i] - h_mu[i]*h_rho[i]);
-                float B = kv * (h_mu2[i] - h_mu[i]*h_mu[i]);
-                float C = kv * (h_rho2[i] - h_rho[i]*h_rho[i]);
-                float D = 2.0f * gO * A / (B*C + dr);
-                B += dr; C += dr;
-                h_mu[i]    = D;                     /* slot 0: D */
-                h_rho[i]   = D * A / B;             /* slot 1: D*A/B */
-                h_mu2[i]   = D * (A/B*h_mu[i] - h_rho[i]); /* BUG: h_mu already overwritten! */
-            }
-            /* Redo correctly: need original mu, rho */
-            /* Actually, we need to be more careful. Let me read them again. */
-            free(h_mu); free(h_rho); free(h_mu2); free(h_rho2); free(h_murho);
-        }
-
-        /* Use the GPU bwd_modify shader instead, reading from separate buffers.
-         * But the shader expects a packed [5*n] buffer. Let's pack, modify, unpack. */
-        {
-            /* Pack 5 buffers into one for the bwd_modify shader */
-            WGPUBuffer interm = wgpu_create_buffer(5*sz, u, "fcc_packed");
-            WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-            wgpuCommandEncoderCopyBufferToBuffer(enc, b_I,  0, interm, 0*sz, sz);
-            wgpuCommandEncoderCopyBufferToBuffer(enc, b_J,  0, interm, 1*sz, sz);
-            wgpuCommandEncoderCopyBufferToBuffer(enc, b_I2, 0, interm, 2*sz, sz);
-            wgpuCommandEncoderCopyBufferToBuffer(enc, b_J2, 0, interm, 3*sz, sz);
-            wgpuCommandEncoderCopyBufferToBuffer(enc, b_IJ, 0, interm, 4*sz, sz);
-            WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-            wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-            wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
-            wgpuDevicePoll(g_wgpu.device, 1, NULL);
-
-            /* Run bwd_modify shader on packed buffer */
-            static const char bwd_mod_wgsl[] =
-                "struct P { n: u32, kv: u32, nr: f32, dr: f32, gO: f32, cgt: u32, _p0: u32, _p1: u32, }\n"
-                "@group(0) @binding(0) var<storage, read_write> it: array<f32>;\n"
-                "@group(0) @binding(1) var<uniform> p: P;\n"
-                "@compute @workgroup_size(256)\n"
-                "fn bwd_modify(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-                "    let i = gid.x + gid.y * nwg.x * 256u; if (i >= p.n) { return; }\n"
-                "    let n = p.n; let kv = f32(p.kv);\n"
-                "    let mu = it[i]; let rho = it[i+n];\n"
-                "    let mu2 = it[i+2u*n]; let rho2 = it[i+3u*n]; let murho = it[i+4u*n];\n"
-                "    let A = kv * (murho - mu * rho);\n"
-                "    var B = kv * (mu2 - mu * mu); var C = kv * (rho2 - rho * rho);\n"
-                "    let D = 2.0 * p.gO * A / (B * C + p.dr);\n"
-                "    B += p.dr; C += p.dr;\n"
-                "    it[i] = D; it[i+n] = D * A / B; it[i+2u*n] = D * (A / B * mu - rho);\n"
-                "    if (p.cgt != 0u) { it[i+3u*n] = D * A / C; it[i+4u*n] = D * (A / C * rho - mu); }\n"
-                "}\n";
-
-            typedef struct { uint32_t n_val, kv; float nr_val, dr_val, gO_val; uint32_t cgt_val, _p0, _p1; } bmp_t;
-            bmp_t bmp = { (uint32_t)n, (uint32_t)kernel_volume, nr, dr, gO, (uint32_t)cgt, 0, 0 };
-            WGPUBuffer pb = make_params(&bmp, sizeof(bmp));
-
-            WGPUComputePipeline pl = wgpu_get_pipeline("fcc_bwd_mod", bwd_mod_wgsl, "bwd_modify");
+            const char *wgsl =
+                get_fused_cc_shader("fused_cc_bwd_modify.wgsl");
+            typedef struct {
+                uint32_t n, kernel_volume;
+                float nr, dr, grad_output;
+                uint32_t compute_grad_target, _p0, _p1;
+            } params_t;
+            params_t p = {
+                n, (uint32_t)(ks * ks * ks), 1e-5f, 1e-5f,
+                -1.0f / (float)n, grad_target ? 1u : 0u, 0, 0,
+            };
+            WGPUBuffer pb = make_params(&p, sizeof(p));
+            WGPUComputePipeline pl =
+                wgpu_get_pipeline("fcc_bwd_modify", wgsl, "bwd_modify");
             if (pl) {
-                WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("fcc_bwd_mod");
-                WGPUBindGroupEntry e[] = {
-                    { .binding=0, .buffer=interm, .size=5*sz },
-                    { .binding=1, .buffer=pb, .size=sizeof(bmp) },
+                WGPUBindGroupEntry entries[] = {
+                    { .binding = 0, .buffer = scratch, .size = workspace_size },
+                    { .binding = 1, .buffer = pb, .size = sizeof(p) },
                 };
-                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &(WGPUBindGroupDescriptor){ .layout=lay, .entryCount=2, .entries=e });
-                { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n,256), &wx, &wy);
-                wgpu_dispatch(pl, bg, wx, wy, 1); }
-                wgpuBindGroupRelease(bg);
+                WGPUBindGroupDescriptor desc = {
+                    .layout = wgpu_get_bind_group_layout("fcc_bwd_modify"),
+                    .entryCount = 2,
+                    .entries = entries,
+                };
+                WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+                uint32_t wx, wy;
+                wgpu_dispatch_dims(groups, &wx, &wy);
+                wgpu_dispatch(pl, bg, wx, wy, 1);
+                wgpu_release_bind_group(bg);
             }
-            wgpuBufferRelease(pb);
-
-            /* Unpack modified channels back to separate buffers */
-            enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-            wgpuCommandEncoderCopyBufferToBuffer(enc, interm, 0*sz, b_I,  0, sz);
-            wgpuCommandEncoderCopyBufferToBuffer(enc, interm, 1*sz, b_J,  0, sz);
-            wgpuCommandEncoderCopyBufferToBuffer(enc, interm, 2*sz, b_I2, 0, sz);
-            if (cgt) {
-                wgpuCommandEncoderCopyBufferToBuffer(enc, interm, 3*sz, b_J2, 0, sz);
-                wgpuCommandEncoderCopyBufferToBuffer(enc, interm, 4*sz, b_IJ, 0, sz);
-            }
-            cmd = wgpuCommandEncoderFinish(enc, NULL);
-            wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-            wgpuCommandBufferRelease(cmd); wgpuCommandEncoderRelease(enc);
-            wgpuDevicePoll(g_wgpu.device, 1, NULL);
-
-            wgpuBufferRelease(interm);
+            wgpu_release_buffer(pb);
         }
 
-        /* Step 5: Box filter adjoint on the gradient multipliers */
-        box_filter_3d(b_I,  b_I,  tmp, D, H, W, ks);
-        box_filter_3d(b_J,  b_J,  tmp, D, H, W, ks);
-        box_filter_3d(b_I2, b_I2, tmp, D, H, W, ks);
-        if (cgt) {
-            box_filter_3d(b_J2, b_J2, tmp, D, H, W, ks);
-            box_filter_3d(b_IJ, b_IJ, tmp, D, H, W, ks);
-        }
+        /* The box filter is self-adjoint. Filter all multipliers together. */
+        fcc_dispatch_packed_box(scratch, interm, D, H, W, ks, 0);
+        fcc_dispatch_packed_box(interm, scratch, D, H, W, ks, 1);
+        fcc_dispatch_packed_box(scratch, interm, D, H, W, ks, 2);
 
-        /* Step 6: Compute final gradients on CPU (small computation) */
+        /* Assemble both image gradients and apply the required 1/ks^2 fix. */
         {
-            float *gini_a=(float*)malloc(sz), *gini_b=(float*)malloc(sz), *gini_mu=(float*)malloc(sz);
-            float *h_pred_=(float*)malloc(sz), *h_tgt_=(float*)malloc(sz);
-            wgpu_read_buffer(b_I, 0, gini_a, sz);
-            wgpu_read_buffer(b_J, 0, gini_b, sz);
-            wgpu_read_buffer(b_I2, 0, gini_mu, sz);
-            wgpu_read_buffer(pred, 0, h_pred_, sz);
-            wgpu_read_buffer(target, 0, h_tgt_, sz);
-
-            /* Scale by 1/ks² to match Python cc.py autograd (applied AFTER box filter adjoint) */
-            float inv_ks2 = 1.0f / (float)(ks * ks);
-            float *h_gp = (float*)malloc(sz);
-            for (int i = 0; i < n; i++)
-                h_gp[i] = (gini_a[i]*h_tgt_[i] - gini_b[i]*h_pred_[i] + gini_mu[i]) * inv_ks2;
-            wgpu_write_buffer(grad_pred, 0, h_gp, sz);
-
-            if (cgt) {
-                float *gini_c=(float*)malloc(sz), *gini_mu2=(float*)malloc(sz);
-                wgpu_read_buffer(b_J2, 0, gini_c, sz);
-                wgpu_read_buffer(b_IJ, 0, gini_mu2, sz);
-                float *h_gt = (float*)malloc(sz);
-                for (int i = 0; i < n; i++)
-                    h_gt[i] = (gini_a[i]*h_pred_[i] - gini_c[i]*h_tgt_[i] + gini_mu2[i]) * inv_ks2;
-                wgpu_write_buffer(grad_target, 0, h_gt, sz);
-                free(gini_c); free(gini_mu2); free(h_gt);
+            const char *wgsl =
+                get_fused_cc_shader("fused_cc_bwd_grads.wgsl");
+            typedef struct {
+                uint32_t n, compute_grad_target;
+                float inv_ks2;
+                uint32_t _p;
+            } params_t;
+            params_t p = {
+                n, grad_target ? 1u : 0u,
+                1.0f / (float)(ks * ks), 0,
+            };
+            WGPUBuffer pb = make_params(&p, sizeof(p));
+            WGPUComputePipeline pl =
+                wgpu_get_pipeline("fcc_bwd_grads", wgsl, "bwd_grads");
+            if (pl) {
+                WGPUBindGroupEntry entries[] = {
+                    { .binding = 0, .buffer = interm, .size = workspace_size },
+                    { .binding = 1, .buffer = pred, .size = size },
+                    { .binding = 2, .buffer = target, .size = size },
+                    { .binding = 3, .buffer = grad_pred, .size = size },
+                    { .binding = 4,
+                      .buffer = grad_target ? grad_target : grad_pred,
+                      .size = size },
+                    { .binding = 5, .buffer = pb, .size = sizeof(p) },
+                };
+                WGPUBindGroupDescriptor desc = {
+                    .layout = wgpu_get_bind_group_layout("fcc_bwd_grads"),
+                    .entryCount = 6,
+                    .entries = entries,
+                };
+                WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+                uint32_t wx, wy;
+                wgpu_dispatch_dims(groups, &wx, &wy);
+                wgpu_dispatch(pl, bg, wx, wy, 1);
+                wgpu_release_bind_group(bg);
             }
-
-            free(gini_a); free(gini_b); free(gini_mu);
-            free(h_pred_); free(h_tgt_); free(h_gp);
+            wgpu_release_buffer(pb);
         }
     }
 
-    wgpuBufferRelease(b_I); wgpuBufferRelease(b_J);
-    wgpuBufferRelease(b_I2); wgpuBufferRelease(b_J2);
-    wgpuBufferRelease(b_IJ); wgpuBufferRelease(tmp);
+    if (!caller_batching) wgpu_flush();
+}
+
+int wgpu_cc_workspace_init(wgpu_cc_workspace_t *ws, int n, int with_gradient) {
+    if (!ws || n <= 0) return -1;
+    memset(ws, 0, sizeof(*ws));
+    ws->voxels = n;
+    ws->has_gradient = with_gradient != 0;
+    size_t sz = (size_t)n * sizeof(float);
+    size_t partial_sz = (size_t)wgpu_div_ceil((uint32_t)n, 256) * sizeof(float);
+    WGPUBufferUsage u = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc |
+                        WGPUBufferUsage_CopyDst;
+    ws->p_sum = wgpu_create_buffer(sz, u, "cc_p_sum");
+    ws->t_sum = wgpu_create_buffer(sz, u, "cc_t_sum");
+    ws->p2_sum = wgpu_create_buffer(sz, u, "cc_p2_sum");
+    ws->t2_sum = wgpu_create_buffer(sz, u, "cc_t2_sum");
+    ws->tp_sum = wgpu_create_buffer(sz, u, "cc_tp_sum");
+    ws->work = wgpu_create_buffer(sz, u, "cc_work");
+    ws->tmp = wgpu_create_buffer(sz, u, "cc_tmp");
+    ws->ncc = wgpu_create_buffer(partial_sz, u, "cc_ncc");
+    ws->grad_sources = wgpu_create_buffer(with_gradient ? 3 * sz : 16, u,
+                                           "cc_grad_sources");
+    if (with_gradient) {
+        ws->src_p = wgpu_create_buffer(sz, u, "cc_src_p");
+        ws->src_p2 = wgpu_create_buffer(sz, u, "cc_src_p2");
+        ws->src_tp = wgpu_create_buffer(sz, u, "cc_src_tp");
+        ws->adj_p = wgpu_create_buffer(sz, u, "cc_adj_p");
+        ws->adj_p2 = wgpu_create_buffer(sz, u, "cc_adj_p2");
+        ws->adj_tp = wgpu_create_buffer(sz, u, "cc_adj_tp");
+    }
+    if (wgpu_had_fatal_error()) {
+        wgpu_cc_workspace_cleanup(ws);
+        return -1;
+    }
+    return 0;
+}
+
+void wgpu_cc_workspace_cleanup(wgpu_cc_workspace_t *ws) {
+    if (!ws) return;
+    wgpu_release_buffer(ws->p_sum); wgpu_release_buffer(ws->t_sum);
+    wgpu_release_buffer(ws->p2_sum); wgpu_release_buffer(ws->t2_sum);
+    wgpu_release_buffer(ws->tp_sum); wgpu_release_buffer(ws->work);
+    wgpu_release_buffer(ws->tmp); wgpu_release_buffer(ws->ncc);
+    wgpu_release_buffer(ws->grad_sources);
+    wgpu_release_buffer(ws->src_p); wgpu_release_buffer(ws->src_p2);
+    wgpu_release_buffer(ws->src_tp); wgpu_release_buffer(ws->adj_p);
+    wgpu_release_buffer(ws->adj_p2); wgpu_release_buffer(ws->adj_tp);
+    memset(ws, 0, sizeof(*ws));
 }
 
 void wgpu_cc_loss_3d_raw(
     WGPUBuffer pred, WGPUBuffer target,
     WGPUBuffer grad_pred,
     int D, int H, int W, int ks,
-    float *h_loss_out)
+    float *h_loss_out,
+    wgpu_cc_workspace_t *workspace)
 {
     int n = D * H * W;
     size_t sz = (size_t)n * 4;
     int compute_grad = (grad_pred != NULL) ? 1 : 0;
+    wgpu_cc_workspace_t local_workspace;
+    int owns_workspace = 0;
+    if (!workspace) {
+        if (wgpu_cc_workspace_init(&local_workspace, n, compute_grad) != 0) return;
+        workspace = &local_workspace;
+        owns_workspace = 1;
+    } else if (workspace->voxels < n ||
+               (compute_grad && !workspace->has_gradient)) {
+        wgpu_record_fatal_error("CC workspace capacity");
+        return;
+    }
+    int caller_batching = g_wgpu.batch_active;
+    if (!caller_batching) wgpu_begin_batch();
 
-    /* Allocate work buffers */
-    WGPUBufferUsage usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
-    WGPUBuffer p_sum  = wgpu_create_buffer(sz, usage, "p_sum");
-    WGPUBuffer t_sum  = wgpu_create_buffer(sz, usage, "t_sum");
-    WGPUBuffer p2_sum = wgpu_create_buffer(sz, usage, "p2_sum");
-    WGPUBuffer t2_sum = wgpu_create_buffer(sz, usage, "t2_sum");
-    WGPUBuffer tp_sum = wgpu_create_buffer(sz, usage, "tp_sum");
-    WGPUBuffer work   = wgpu_create_buffer(sz, usage, "work");
-    WGPUBuffer tmp    = wgpu_create_buffer(sz, usage, "tmp");
+    WGPUBuffer p_sum=workspace->p_sum, t_sum=workspace->t_sum;
+    WGPUBuffer p2_sum=workspace->p2_sum, t2_sum=workspace->t2_sum;
+    WGPUBuffer tp_sum=workspace->tp_sum, work=workspace->work;
+    WGPUBuffer tmp=workspace->tmp;
 
     /* Step 1: Multiply intermediates */
     typedef struct { uint32_t n, _p0, _p1, _p2; } mul_p_t;
     mul_p_t mp = { n, 0, 0, 0 };
     WGPUBuffer mpb = make_params(&mp, sizeof(mp));
 
-    WGPUComputePipeline mul_pl = wgpu_get_pipeline("multiply", wgsl_cc_loss, "multiply");
+    WGPUComputePipeline mul_pl = wgpu_get_pipeline(
+        "multiply", get_shader_source("cc_loss.wgsl", NULL), "multiply");
     WGPUBindGroupLayout mul_lay = wgpu_get_bind_group_layout("multiply");
 
     /* P*P -> work, box_filter -> p2_sum */
@@ -664,10 +658,10 @@ void wgpu_cc_loss_3d_raw(
             { .binding = 3, .buffer = mpb, .size = sizeof(mp) },
         };
         WGPUBindGroupDescriptor d = { .layout = mul_lay, .entryCount = 4, .entries = e };
-        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &d);
+        WGPUBindGroup bg = wgpu_create_bind_group(&d, NULL);
         { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
         wgpu_dispatch(mul_pl, bg, wx, wy, 1); }
-        wgpuBindGroupRelease(bg);
+        wgpu_release_bind_group(bg);
     }
     box_filter_3d(work, p2_sum, tmp, D, H, W, ks);
 
@@ -680,10 +674,10 @@ void wgpu_cc_loss_3d_raw(
             { .binding = 3, .buffer = mpb, .size = sizeof(mp) },
         };
         WGPUBindGroupDescriptor d = { .layout = mul_lay, .entryCount = 4, .entries = e };
-        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &d);
+        WGPUBindGroup bg = wgpu_create_bind_group(&d, NULL);
         { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
         wgpu_dispatch(mul_pl, bg, wx, wy, 1); }
-        wgpuBindGroupRelease(bg);
+        wgpu_release_bind_group(bg);
     }
     box_filter_3d(work, t2_sum, tmp, D, H, W, ks);
 
@@ -696,10 +690,10 @@ void wgpu_cc_loss_3d_raw(
             { .binding = 3, .buffer = mpb, .size = sizeof(mp) },
         };
         WGPUBindGroupDescriptor d = { .layout = mul_lay, .entryCount = 4, .entries = e };
-        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &d);
+        WGPUBindGroup bg = wgpu_create_bind_group(&d, NULL);
         { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
         wgpu_dispatch(mul_pl, bg, wx, wy, 1); }
-        wgpuBindGroupRelease(bg);
+        wgpu_release_bind_group(bg);
     }
     box_filter_3d(work, tp_sum, tmp, D, H, W, ks);
 
@@ -707,91 +701,81 @@ void wgpu_cc_loss_3d_raw(
     box_filter_3d(pred, p_sum, tmp, D, H, W, ks);
     box_filter_3d(target, t_sum, tmp, D, H, W, ks);
 
-    wgpuBufferRelease(mpb);
+    wgpu_release_buffer(mpb);
 
     /* Step 2: NCC + gradient source terms — on GPU */
-    WGPUBuffer ncc_buf = wgpu_create_buffer(sz, usage, "ncc");
-    WGPUBuffer src_p  = compute_grad ? wgpu_create_buffer(sz, usage, "src_p") : wgpu_create_buffer(16, usage, "sp_dummy");
-    WGPUBuffer src_p2 = compute_grad ? wgpu_create_buffer(sz, usage, "src_p2") : wgpu_create_buffer(16, usage, "sp2_dummy");
-    WGPUBuffer src_tp = compute_grad ? wgpu_create_buffer(sz, usage, "src_tp") : wgpu_create_buffer(16, usage, "stp_dummy");
+    uint32_t n_groups = wgpu_div_ceil((uint32_t)n, 256);
+    size_t partial_sz = (size_t)n_groups * sizeof(float);
+    WGPUBuffer ncc_buf = workspace->ncc;
+    /* Keep the three gradient source arrays in one binding.  Together with the
+     * five filtered inputs and partial-sum output this is seven storage buffers,
+     * within WebGPU's baseline maxStorageBuffersPerShaderStage of eight. */
+    size_t grad_sources_sz = compute_grad ? 3 * sz : 16;
+    WGPUBuffer grad_sources = workspace->grad_sources;
 
-    /* NCC kernel: 5 sums → ncc_out + 3 grad sources (10 bindings) */
+    /* NCC kernel: 5 sums → ncc_out + one packed gradient-source buffer. */
     {
-        static const char ncc_wgsl[] =
-            "struct P { n: u32, cg: u32, nr: f32, dr: f32, }\n"
-            "@group(0) @binding(0) var<storage, read> ps: array<f32>;\n"
-            "@group(0) @binding(1) var<storage, read> ts: array<f32>;\n"
-            "@group(0) @binding(2) var<storage, read> p2s: array<f32>;\n"
-            "@group(0) @binding(3) var<storage, read> t2s: array<f32>;\n"
-            "@group(0) @binding(4) var<storage, read> tps: array<f32>;\n"
-            "@group(0) @binding(5) var<storage, read_write> ncc: array<f32>;\n"
-            "@group(0) @binding(6) var<storage, read_write> sp: array<f32>;\n"
-            "@group(0) @binding(7) var<storage, read_write> sp2: array<f32>;\n"
-            "@group(0) @binding(8) var<storage, read_write> stp: array<f32>;\n"
-            "@group(0) @binding(9) var<uniform> p: P;\n"
-            "@compute @workgroup_size(256)\n"
-            "fn ncc_grad(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-            "    let i = gid.x + gid.y * nwg.x * 256u; if (i >= p.n) { return; }\n"
-            "    let psi = ps[i]; let tsi = ts[i];\n"
-            "    let cross = tps[i] - psi * tsi;\n"
-            "    var pv = p2s[i] - psi * psi; var tv = t2s[i] - tsi * tsi;\n"
-            "    if (pv < p.dr) { pv = p.dr; } if (tv < p.dr) { tv = p.dr; }\n"
-            "    let f = cross * cross + p.nr; let g = pv * tv + p.dr;\n"
-            "    var nc = f / g; nc = clamp(nc, -1.0, 1.0);\n"
-            "    ncc[i] = nc;\n"
-            "    if (p.cg != 0u) {\n"
-            "        let g2 = g * g;\n"
-            "        stp[i] = 2.0 * cross * g / g2;\n"
-            "        sp2[i] = -f * tv / g2;\n"
-            "        sp[i] = (-2.0 * cross * tsi * g + 2.0 * f * psi * tv) / g2;\n"
-            "    }\n"
-            "}\n";
-
         typedef struct { uint32_t n, cg; float nr, dr; } np_t;
         np_t np = { n, compute_grad, 1e-5f, 1e-5f };
         WGPUBuffer npb = make_params(&np, sizeof(np));
 
-        WGPUComputePipeline pl = wgpu_get_pipeline("ncc_grad", ncc_wgsl, "ncc_grad");
+        WGPUComputePipeline pl = wgpu_get_pipeline(
+            "ncc_grad", get_shader_source("cc_ncc_grad.wgsl", NULL),
+            "ncc_grad");
         if (pl) {
             WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("ncc_grad");
-            size_t gsz = compute_grad ? sz : 16;
             WGPUBindGroupEntry e[] = {
                 { .binding = 0, .buffer = p_sum, .size = sz },
                 { .binding = 1, .buffer = t_sum, .size = sz },
                 { .binding = 2, .buffer = p2_sum, .size = sz },
                 { .binding = 3, .buffer = t2_sum, .size = sz },
                 { .binding = 4, .buffer = tp_sum, .size = sz },
-                { .binding = 5, .buffer = ncc_buf, .size = sz },
-                { .binding = 6, .buffer = src_p, .size = gsz },
-                { .binding = 7, .buffer = src_p2, .size = gsz },
-                { .binding = 8, .buffer = src_tp, .size = gsz },
-                { .binding = 9, .buffer = npb, .size = sizeof(np) },
+                { .binding = 5, .buffer = ncc_buf, .size = partial_sz },
+                { .binding = 6, .buffer = grad_sources, .size = grad_sources_sz },
+                { .binding = 7, .buffer = npb, .size = sizeof(np) },
             };
-            WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 10, .entries = e };
-            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+            WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 8, .entries = e };
+            WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
             { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
             wgpu_dispatch(pl, bg, wx, wy, 1); }
-            wgpuBindGroupRelease(bg);
+            wgpu_release_bind_group(bg);
         }
-        wgpuBufferRelease(npb);
+        wgpu_release_buffer(npb);
     }
 
-    /* Reduce NCC to scalar loss — only if caller wants it.
-     * Pass h_loss_out=NULL to skip the expensive readback. */
+    /* Read only one partial sum per workgroup, not the full volume. */
     if (h_loss_out) {
-        float *h_ncc = (float*)malloc(sz);
-        wgpu_read_buffer(ncc_buf, 0, h_ncc, sz);
+        float *h_ncc = (float*)malloc(partial_sz);
+        if (!h_ncc) {
+            wgpu_record_fatal_error("CC host reduction allocation");
+            if (owns_workspace) wgpu_cc_workspace_cleanup(workspace);
+            return;
+        }
+        wgpu_read_buffer(ncc_buf, 0, h_ncc, partial_sz);
+        if (wgpu_had_fatal_error()) {
+            free(h_ncc);
+            *h_loss_out = 0.0f;
+            if (owns_workspace) wgpu_cc_workspace_cleanup(workspace);
+            return;
+        }
         double ncc_sum = 0;
-        for (int i = 0; i < n; i++) ncc_sum += h_ncc[i];
+        for (uint32_t i = 0; i < n_groups; i++) ncc_sum += h_ncc[i];
         *h_loss_out = -(float)(ncc_sum / n);
         free(h_ncc);
+        if (compute_grad || caller_batching) wgpu_begin_batch();
     }
 
     /* Step 3: Gradient — adjoint box filter + combine on GPU */
     if (compute_grad) {
-        WGPUBuffer adj_p  = wgpu_create_buffer(sz, usage, "adj_p");
-        WGPUBuffer adj_p2 = wgpu_create_buffer(sz, usage, "adj_p2");
-        WGPUBuffer adj_tp = wgpu_create_buffer(sz, usage, "adj_tp");
+        WGPUBuffer src_p=workspace->src_p, src_p2=workspace->src_p2;
+        WGPUBuffer src_tp=workspace->src_tp, adj_p=workspace->adj_p;
+        WGPUBuffer adj_p2=workspace->adj_p2, adj_tp=workspace->adj_tp;
+
+        /* Split the packed shader output for the existing box-filter path.
+         * Copies remain in the active command stream, ordered after ncc_grad. */
+        wgpu_copy_buffer_range(grad_sources, 0,      src_p,  0, sz);
+        wgpu_copy_buffer_range(grad_sources, sz,     src_p2, 0, sz);
+        wgpu_copy_buffer_range(grad_sources, 2 * sz, src_tp, 0, sz);
 
         box_filter_3d(src_p,  adj_p,  tmp, D, H, W, ks);
         box_filter_3d(src_p2, adj_p2, tmp, D, H, W, ks);
@@ -800,26 +784,13 @@ void wgpu_cc_loss_3d_raw(
         /* Combine gradient on GPU:
          * grad = -inv_count * (adj_p + 2*P*adj_p2 + T*adj_tp) */
         {
-            static const char comb_wgsl[] =
-                "struct P { n: u32, _p: u32, ic: f32, _p2: f32, }\n"
-                "@group(0) @binding(0) var<storage, read> ap: array<f32>;\n"
-                "@group(0) @binding(1) var<storage, read> ap2: array<f32>;\n"
-                "@group(0) @binding(2) var<storage, read> atp: array<f32>;\n"
-                "@group(0) @binding(3) var<storage, read> cP: array<f32>;\n"
-                "@group(0) @binding(4) var<storage, read> cT: array<f32>;\n"
-                "@group(0) @binding(5) var<storage, read_write> go: array<f32>;\n"
-                "@group(0) @binding(6) var<uniform> p: P;\n"
-                "@compute @workgroup_size(256)\n"
-                "fn combine(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {\n"
-                "    let i = gid.x + gid.y * nwg.x * 256u; if (i >= p.n) { return; }\n"
-                "    go[i] = -p.ic * (ap[i] + 2.0 * cP[i] * ap2[i] + cT[i] * atp[i]);\n"
-                "}\n";
-
             typedef struct { uint32_t n, _p; float ic, _p2; } cp_t;
             cp_t cp = { n, 0, 1.0f / n, 0 };
             WGPUBuffer cpb = make_params(&cp, sizeof(cp));
 
-            WGPUComputePipeline pl = wgpu_get_pipeline("cc_combine", comb_wgsl, "combine");
+            WGPUComputePipeline pl = wgpu_get_pipeline(
+                "cc_combine", get_shader_source("cc_combine.wgsl", NULL),
+                "combine");
             if (pl) {
                 WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("cc_combine");
                 WGPUBindGroupEntry e[] = {
@@ -832,36 +803,32 @@ void wgpu_cc_loss_3d_raw(
                     { .binding = 6, .buffer = cpb, .size = sizeof(cp) },
                 };
                 WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 7, .entries = e };
-                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+                WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
                 { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
                 wgpu_dispatch(pl, bg, wx, wy, 1); }
-                wgpuBindGroupRelease(bg);
+                wgpu_release_bind_group(bg);
             }
-            wgpuBufferRelease(cpb);
+            wgpu_release_buffer(cpb);
         }
 
-        wgpuBufferRelease(adj_p); wgpuBufferRelease(adj_p2); wgpuBufferRelease(adj_tp);
     }
 
-    wgpuBufferRelease(ncc_buf);
-    wgpuBufferRelease(src_p); wgpuBufferRelease(src_p2); wgpuBufferRelease(src_tp);
-    wgpuBufferRelease(p_sum); wgpuBufferRelease(t_sum);
-    wgpuBufferRelease(p2_sum); wgpuBufferRelease(t2_sum);
-    wgpuBufferRelease(tp_sum); wgpuBufferRelease(work); wgpuBufferRelease(tmp);
+    if (!caller_batching) wgpu_flush();
+    if (owns_workspace) wgpu_cc_workspace_cleanup(workspace);
 }
 
 /* ================================================================== */
 /* MI Loss — workgroup-local histogram + GPU gradient                  */
 /* ================================================================== */
 
-/* MI loss — GPU histogram (workgroup-local) + CPU MI + GPU gradient
+/* MI loss — fully GPU-resident histogram, preparation, and gradient
  *
  * Strategy matching CUDA mi_loss.cu:
- *   1. Find max(pred, target) for normalization (CPU, like CUDA)
+ *   1. Find max(pred, target) for normalization
  *   2. GPU histogram: workgroup-local accumulation with fixed-point u32
  *      atomicAdd (fast), then integer atomicAdd merge to global (no CAS)
- *   3. Read histogram to CPU, normalize, compute MI (fast: 1024 iters)
- *   4. GPU gradient: correct softmax derivative matching CUDA/CPU
+ *   3. Normalize the histogram and prepare gradient coefficients on GPU
+ *   4. Evaluate the gradient on GPU; read back only the scalar loss
  */
 #include "cfireants/losses.h"
 
@@ -883,256 +850,225 @@ void wgpu_mi_loss_3d_raw(
     int D, int H, int W,
     int num_bins, float *h_loss_out)
 {
-    int n = D * H * W;
-    size_t sz = (size_t)n * sizeof(float);
-    int nb = num_bins;
+    const int n = D * H * W;
+    const size_t size = (size_t)n * sizeof(float);
+    const int nb = num_bins;
 
-    /* GPU path requires num_bins=32 (workgroup arrays are compile-time sized).
-     * Fall back to CPU for other values. */
+    /* The workgroup arrays and packed layout are specialized for 32 bins. */
     if (nb != 32) {
         fprintf(stderr, "wgpu_mi_loss: GPU path requires num_bins=32 (got %d), "
                 "using CPU fallback\n", nb);
+        int was_batching = g_wgpu.batch_active;
         int shape[5] = {1, 1, D, H, W};
         tensor_t tp, tt, tg;
         tensor_alloc(&tp, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
         tensor_alloc(&tt, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
-        wgpu_read_buffer(pred, 0, tp.data, sz);
-        wgpu_read_buffer(target, 0, tt.data, sz);
+        wgpu_read_buffer(pred, 0, tp.data, size);
+        wgpu_read_buffer(target, 0, tt.data, size);
         tensor_t *gptr = NULL;
-        if (grad_pred) { tensor_alloc(&tg, 5, shape, DTYPE_FLOAT32, DEVICE_CPU); gptr = &tg; }
+        if (grad_pred) {
+            tensor_alloc(&tg, 5, shape, DTYPE_FLOAT32, DEVICE_CPU);
+            gptr = &tg;
+        }
         cpu_mi_loss_3d(&tp, &tt, nb, h_loss_out, gptr);
-        if (grad_pred && gptr) wgpu_write_buffer(grad_pred, 0, tg.data, sz);
-        tensor_free(&tp); tensor_free(&tt);
+        if (grad_pred) wgpu_write_buffer(grad_pred, 0, tg.data, size);
+        tensor_free(&tp);
+        tensor_free(&tt);
         if (gptr) tensor_free(&tg);
+        if (was_batching) wgpu_begin_batch();
         return;
     }
 
-    /* Step 0: Find max(pred, target) on GPU via reduce_max shader.
-     * Only reads back partial maxima (~4KB), not the full volume. */
-    float pmax, tmax;
+    const int caller_batching = g_wgpu.batch_active;
+    if (!caller_batching) wgpu_begin_batch();
+
+    const uint32_t n_groups = wgpu_div_ceil((uint32_t)n, 256);
+    const size_t joint_count = (size_t)nb * nb;
+    const size_t state_count = 1 + joint_count + 2 * nb;
+    const size_t coeff_count = joint_count + nb + 1;
+    const size_t state_size = state_count * sizeof(uint32_t);
+    const size_t coeff_size = coeff_count * sizeof(float);
+    WGPUBufferUsage storage_usage =
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc |
+        WGPUBufferUsage_CopyDst;
+    if (!g_wgpu.mi_state_buf)
+        g_wgpu.mi_state_buf =
+            wgpu_create_buffer(state_size, storage_usage, "mi_state");
+    if (!g_wgpu.mi_coeff_buf)
+        g_wgpu.mi_coeff_buf =
+            wgpu_create_buffer(coeff_size, storage_usage, "mi_coeff");
+    WGPUBuffer state = g_wgpu.mi_state_buf;
+    WGPUBuffer coeff = g_wgpu.mi_coeff_buf;
+
+    /* Clear the packed state and reduce max(pred,target) to state[0]. */
     {
-        static const char *rmax_wgsl = NULL;
-        if (!rmax_wgsl) rmax_wgsl = get_shader_source("reduce_max.wgsl", NULL);
-        WGPUComputePipeline rmax_pl = rmax_wgsl ?
-            wgpu_get_pipeline("reduce_max", rmax_wgsl, "reduce_max") : NULL;
+        static const char *wgsl = NULL;
+        if (!wgsl) wgsl = get_shader_source("mi_max.wgsl", NULL);
+        typedef struct { uint32_t n, _p0, _p1, _p2; } params_t;
+        params_t p = { (uint32_t)n, 0, 0, 0 };
+        WGPUBuffer pb = make_params(&p, sizeof(p));
 
-        uint32_t n_groups = wgpu_div_ceil(n, 256);
-        WGPUBufferUsage pu = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
-        WGPUBuffer part_buf = wgpu_create_buffer(n_groups * 4, pu, "rmax_part");
-
-        typedef struct { uint32_t n, _p0, _p1, _p2; } rp_t;
-        rp_t rp = { (uint32_t)n, 0, 0, 0 };
-        WGPUBuffer rpb = wgpu_create_buffer_init(&rp, sizeof(rp),
-            WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "rmax_p");
-
-        /* Reduce pred max */
-        if (rmax_pl) {
-            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("reduce_max");
-            WGPUBindGroupEntry e[] = {
-                { .binding = 0, .buffer = pred, .size = sz },
-                { .binding = 1, .buffer = rpb, .size = sizeof(rp) },
-                { .binding = 2, .buffer = part_buf, .size = n_groups * 4 },
-            };
-            WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = e };
-            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-            { uint32_t wx, wy; wgpu_dispatch_dims(n_groups, &wx, &wy);
-            wgpu_dispatch(rmax_pl, bg, wx, wy, 1); }
-            wgpuBindGroupRelease(bg);
-        }
-        float *partials = (float *)malloc(n_groups * 4);
-        wgpu_read_buffer(part_buf, 0, partials, n_groups * 4);
-        pmax = partials[0];
-        for (uint32_t i = 1; i < n_groups; i++)
-            if (partials[i] > pmax) pmax = partials[i];
-
-        /* Reduce target max (reuse part_buf and params) */
-        if (rmax_pl) {
-            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("reduce_max");
-            WGPUBindGroupEntry e[] = {
-                { .binding = 0, .buffer = target, .size = sz },
-                { .binding = 1, .buffer = rpb, .size = sizeof(rp) },
-                { .binding = 2, .buffer = part_buf, .size = n_groups * 4 },
-            };
-            WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 3, .entries = e };
-            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-            { uint32_t wx2, wy2; wgpu_dispatch_dims(n_groups, &wx2, &wy2);
-            wgpu_dispatch(rmax_pl, bg, wx2, wy2, 1); }
-            wgpuBindGroupRelease(bg);
-        }
-        wgpu_read_buffer(part_buf, 0, partials, n_groups * 4);
-        tmax = partials[0];
-        for (uint32_t i = 1; i < n_groups; i++)
-            if (partials[i] > tmax) tmax = partials[i];
-
-        free(partials);
-        wgpuBufferRelease(part_buf);
-        wgpuBufferRelease(rpb);
-    }
-
-    float maxval = pmax > tmax ? pmax : tmax;
-    if (maxval <= 0) maxval = 1.0f;
-    float inv_maxval = (maxval > 1.0f) ? 1.0f / maxval : 1.0f;
-
-    /* Matching Python/CUDA: bin_centers[i] = i/nb + 0.5/nb, sigma = (1/nb)*0.5 */
-    float bin_spacing = 1.0f / nb;
-    float sigma = bin_spacing * 0.5f;
-    float preterm = 1.0f / (2.0f * sigma * sigma);
-    float nr = 1e-7f, dr = 1e-7f;
-
-    WGPUBufferUsage u = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc
-                       | WGPUBufferUsage_CopyDst;
-
-    /* Allocate histogram buffers (atomic<u32>, fixed-point integers) */
-    size_t joint_sz = (size_t)nb * nb * 4;
-    size_t marg_sz = (size_t)nb * 4;
-    WGPUBuffer d_joint = wgpu_create_buffer(joint_sz, u, "mi_joint");
-    WGPUBuffer d_phist = wgpu_create_buffer(marg_sz, u, "mi_ph");
-    WGPUBuffer d_thist = wgpu_create_buffer(marg_sz, u, "mi_th");
-
-    /* Zero histograms */
-    {
-        void *z = calloc(1, joint_sz);
-        wgpu_write_buffer(d_joint, 0, z, joint_sz);
-        free(z);
-        z = calloc(1, marg_sz);
-        wgpu_write_buffer(d_phist, 0, z, marg_sz);
-        wgpu_write_buffer(d_thist, 0, z, marg_sz);
-        free(z);
-    }
-
-    /* ---- Pass 1: Workgroup-local histogram accumulation on GPU ---- */
-    /* Each workgroup (256 threads) accumulates a local 32×32 histogram in
-     * var<workgroup> shared memory using native atomicAdd on atomic<u32>.
-     * Both local and global use fixed-point u32 with FP_SCALE=4096.
-     * After barrier, local values are merged to global via atomicAdd (no CAS).
-     * This is Metal-compatible (no atomicCompareExchangeWeak needed).
-     * Overflow analysis: max per bin = N * 4096 (worst case, all voxels in
-     * one bin). Safe for N ≤ 1M voxels. In practice, weight is distributed
-     * across bins, so safe for larger volumes. */
-    {
-        /* FP_SCALE: max safe value = u32_max / N ≈ 4294967295 / N.
-         * Use 75% of max to leave headroom for concentrated distributions. */
-        float fp_scale = (float)((uint64_t)3221225472ULL / (uint64_t)n);  /* 0.75 * 2^32 / N */
-        if (fp_scale > 4096.0f) fp_scale = 4096.0f;  /* cap for precision */
-        if (fp_scale < 1.0f) fp_scale = 1.0f;
-
-        typedef struct { uint32_t n, num_bins; float inv_maxval, preterm, fp_scale; uint32_t _p0, _p1, _p2; } hp_t;
-        hp_t hp = { (uint32_t)n, (uint32_t)nb, inv_maxval, preterm, fp_scale, 0, 0, 0 };
-        WGPUBuffer pb = wgpu_create_buffer_init(&hp, sizeof(hp),
-            WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "mi_hp");
-
-        const char *hist_wgsl = get_mi_hist_wgsl();
-        WGPUComputePipeline pl = hist_wgsl ?
-            wgpu_get_pipeline("mi_hist_local", hist_wgsl, "histogram") : NULL;
-        if (pl) {
-            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("mi_hist_local");
-            WGPUBindGroupEntry e[] = {
-                { .binding = 0, .buffer = pred, .size = sz },
-                { .binding = 1, .buffer = target, .size = sz },
-                { .binding = 2, .buffer = d_joint, .size = joint_sz },
-                { .binding = 3, .buffer = d_phist, .size = marg_sz },
-                { .binding = 4, .buffer = d_thist, .size = marg_sz },
-                { .binding = 5, .buffer = pb, .size = sizeof(hp) },
+        WGPUComputePipeline clear_pl =
+            wgpu_get_pipeline("mi_clear_state", wgsl, "clear_state");
+        if (clear_pl) {
+            WGPUBindGroupEntry entry = {
+                .binding = 2, .buffer = state, .size = state_size,
             };
             WGPUBindGroupDescriptor desc = {
-                .layout = lay, .entryCount = 6, .entries = e };
-            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-            { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
-            wgpu_dispatch(pl, bg, wx, wy, 1); }
-            wgpuBindGroupRelease(bg);
+                .layout = wgpu_get_bind_group_layout("mi_clear_state"),
+                .entryCount = 1,
+                .entries = &entry,
+            };
+            WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+            wgpu_dispatch(clear_pl, bg, 1, 1, 1);
+            wgpu_release_bind_group(bg);
         }
-        wgpuBufferRelease(pb);
+
+        WGPUComputePipeline max_pl =
+            wgpu_get_pipeline("mi_reduce_max", wgsl, "reduce_max");
+        if (max_pl) {
+            WGPUBindGroupEntry entries[] = {
+                { .binding = 0, .buffer = pred, .size = size },
+                { .binding = 1, .buffer = target, .size = size },
+                { .binding = 2, .buffer = state, .size = state_size },
+                { .binding = 3, .buffer = pb, .size = sizeof(p) },
+            };
+            WGPUBindGroupDescriptor desc = {
+                .layout = wgpu_get_bind_group_layout("mi_reduce_max"),
+                .entryCount = 4,
+                .entries = entries,
+            };
+            WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+            uint32_t wx, wy;
+            wgpu_dispatch_dims(n_groups, &wx, &wy);
+            wgpu_dispatch(max_pl, bg, wx, wy, 1);
+            wgpu_release_bind_group(bg);
+        }
+        wgpu_release_buffer(pb);
     }
 
-    /* ---- Read histograms to CPU (small: ~4KB total) ---- */
-    float *h_joint = (float *)malloc(joint_sz);
-    float *h_phist = (float *)malloc(marg_sz);
-    float *h_thist = (float *)malloc(marg_sz);
+    const float bin_spacing = 1.0f / (float)nb;
+    const float sigma = bin_spacing * 0.5f;
+    const float preterm = 1.0f / (2.0f * sigma * sigma);
+    const float nr = 1e-7f;
+    const float dr = 1e-7f;
 
-    /* Read u32 fixed-point values and convert to float */
+    /* Accumulate the fixed-point histogram directly after the max reduction. */
     {
-        uint32_t *u_buf = (uint32_t *)malloc(joint_sz);
-        wgpu_read_buffer(d_joint, 0, u_buf, joint_sz);
-        for (int i = 0; i < nb * nb; i++) h_joint[i] = (float)u_buf[i];
-        free(u_buf);
+        float fp_scale =
+            (float)((uint64_t)3221225472ULL / (uint64_t)n);
+        if (fp_scale > 4096.0f) fp_scale = 4096.0f;
+        if (fp_scale < 1.0f) fp_scale = 1.0f;
 
-        u_buf = (uint32_t *)malloc(marg_sz);
-        wgpu_read_buffer(d_phist, 0, u_buf, marg_sz);
-        for (int i = 0; i < nb; i++) h_phist[i] = (float)u_buf[i];
-        wgpu_read_buffer(d_thist, 0, u_buf, marg_sz);
-        for (int i = 0; i < nb; i++) h_thist[i] = (float)u_buf[i];
-        free(u_buf);
-    }
-
-    /* Normalize histograms to probabilities */
-    float total_weight = 0;
-    for (int i = 0; i < nb * nb; i++) total_weight += h_joint[i];
-    if (total_weight > 0) {
-        float inv = 1.0f / total_weight;
-        for (int i = 0; i < nb * nb; i++) h_joint[i] *= inv;
-        for (int i = 0; i < nb; i++) { h_phist[i] *= inv; h_thist[i] *= inv; }
-    }
-
-    /* MI = sum_ij pab * log((pab + nr) / (pa*pb + dr) + dr) — matching CUDA */
-    double mi = 0;
-    for (int i = 0; i < nb; i++) {
-        for (int j = 0; j < nb; j++) {
-            float p = h_joint[i * nb + j];
-            float pp = h_phist[i] * h_thist[j];
-            mi += p * logf((p + nr) / (pp + dr) + dr);
+        typedef struct {
+            uint32_t n, num_bins;
+            float inv_maxval, preterm, fp_scale;
+            uint32_t _p0, _p1, _p2;
+        } params_t;
+        params_t p = {
+            (uint32_t)n, (uint32_t)nb, 0.0f, preterm,
+            fp_scale, 0, 0, 0,
+        };
+        WGPUBuffer pb = make_params(&p, sizeof(p));
+        const char *wgsl = get_mi_hist_wgsl();
+        WGPUComputePipeline pl =
+            wgpu_get_pipeline("mi_hist_local", wgsl, "histogram");
+        if (pl) {
+            WGPUBindGroupEntry entries[] = {
+                { .binding = 0, .buffer = pred, .size = size },
+                { .binding = 1, .buffer = target, .size = size },
+                { .binding = 2, .buffer = state, .size = state_size },
+                { .binding = 3, .buffer = pb, .size = sizeof(p) },
+            };
+            WGPUBindGroupDescriptor desc = {
+                .layout = wgpu_get_bind_group_layout("mi_hist_local"),
+                .entryCount = 4,
+                .entries = entries,
+            };
+            WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+            uint32_t wx, wy;
+            wgpu_dispatch_dims(n_groups, &wx, &wy);
+            wgpu_dispatch(pl, bg, wx, wy, 1);
+            wgpu_release_bind_group(bg);
         }
+        wgpu_release_buffer(pb);
     }
-    if (h_loss_out) *h_loss_out = -(float)mi;
 
-    /* ---- Pass 2: Gradient on GPU ---- */
-    /* Correct gradient matching CUDA mi_gradient_kernel:
-     * - Softmax-normalized Parzen weights for both pred and target
-     * - Softmax derivative: dwa/dpn = wa*(du_a - sum wa'*du_a')
-     * - Chain rule through joint and marginal histograms
-     * - inv_maxval scaling for normalization chain rule */
+    /* Normalize the histogram, prepare gradient coefficients, and reduce MI
+     * in one fixed-size workgroup. */
+    {
+        static const char *wgsl = NULL;
+        if (!wgsl) wgsl = get_shader_source("mi_prepare.wgsl", NULL);
+        typedef struct { float nr, dr; uint32_t _p0, _p1; } params_t;
+        params_t p = { nr, dr, 0, 0 };
+        WGPUBuffer pb = make_params(&p, sizeof(p));
+        WGPUComputePipeline pl =
+            wgpu_get_pipeline("mi_prepare", wgsl, "prepare");
+        if (pl) {
+            WGPUBindGroupEntry entries[] = {
+                { .binding = 0, .buffer = state, .size = state_size },
+                { .binding = 1, .buffer = coeff, .size = coeff_size },
+                { .binding = 2, .buffer = pb, .size = sizeof(p) },
+            };
+            WGPUBindGroupDescriptor desc = {
+                .layout = wgpu_get_bind_group_layout("mi_prepare"),
+                .entryCount = 3,
+                .entries = entries,
+            };
+            WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+            wgpu_dispatch(pl, bg, 1, 1, 1);
+            wgpu_release_bind_group(bg);
+        }
+        wgpu_release_buffer(pb);
+    }
+
     if (grad_pred) {
-        WGPUBuffer d_jf = wgpu_create_buffer_init(h_joint, joint_sz, u, "mi_jf");
-        WGPUBuffer d_pf = wgpu_create_buffer_init(h_phist, marg_sz, u, "mi_pf");
-        WGPUBuffer d_tf = wgpu_create_buffer_init(h_thist, marg_sz, u, "mi_tf");
-
         typedef struct {
             uint32_t n, num_bins;
             float inv_maxval, preterm;
             float inv_n, nr, dr;
             uint32_t _pad;
-        } gp_t;
-        gp_t gp = { (uint32_t)n, (uint32_t)nb, inv_maxval, preterm,
-                     1.0f / n, nr, dr, 0 };
-        WGPUBuffer gpb = wgpu_create_buffer_init(&gp, sizeof(gp),
-            WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "mi_gp");
-
-        const char *grad_wgsl = get_mi_grad_wgsl();
-        WGPUComputePipeline pl = grad_wgsl ?
-            wgpu_get_pipeline("mi_grad_v2", grad_wgsl, "mi_gradient") : NULL;
+        } params_t;
+        params_t p = {
+            (uint32_t)n, (uint32_t)nb, 0.0f, preterm,
+            1.0f / (float)n, nr, dr, 0,
+        };
+        WGPUBuffer pb = make_params(&p, sizeof(p));
+        const char *wgsl = get_mi_grad_wgsl();
+        WGPUComputePipeline pl =
+            wgpu_get_pipeline("mi_grad_v4", wgsl, "mi_gradient");
         if (pl) {
-            WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("mi_grad_v2");
-            WGPUBindGroupEntry e[] = {
-                { .binding = 0, .buffer = pred, .size = sz },
-                { .binding = 1, .buffer = target, .size = sz },
-                { .binding = 2, .buffer = d_jf, .size = joint_sz },
-                { .binding = 3, .buffer = d_pf, .size = marg_sz },
-                { .binding = 4, .buffer = d_tf, .size = marg_sz },
-                { .binding = 5, .buffer = grad_pred, .size = sz },
-                { .binding = 6, .buffer = gpb, .size = sizeof(gp) },
+            WGPUBindGroupEntry entries[] = {
+                { .binding = 0, .buffer = pred, .size = size },
+                { .binding = 1, .buffer = target, .size = size },
+                { .binding = 2, .buffer = coeff,
+                  .size = coeff_size - sizeof(float) },
+                { .binding = 3, .buffer = state, .size = state_size },
+                { .binding = 4, .buffer = grad_pred, .size = size },
+                { .binding = 5, .buffer = pb, .size = sizeof(p) },
             };
             WGPUBindGroupDescriptor desc = {
-                .layout = lay, .entryCount = 7, .entries = e };
-            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
-            { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
-            wgpu_dispatch(pl, bg, wx, wy, 1); }
-            wgpuBindGroupRelease(bg);
+                .layout = wgpu_get_bind_group_layout("mi_grad_v4"),
+                .entryCount = 6,
+                .entries = entries,
+            };
+            WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
+            uint32_t wx, wy;
+            wgpu_dispatch_dims(n_groups, &wx, &wy);
+            wgpu_dispatch(pl, bg, wx, wy, 1);
+            wgpu_release_bind_group(bg);
         }
-        wgpuBufferRelease(gpb);
-        wgpuBufferRelease(d_jf); wgpuBufferRelease(d_pf); wgpuBufferRelease(d_tf);
+        wgpu_release_buffer(pb);
     }
 
-    free(h_joint); free(h_phist); free(h_thist);
-    wgpuBufferRelease(d_joint); wgpuBufferRelease(d_phist); wgpuBufferRelease(d_thist);
+    if (h_loss_out) {
+        wgpu_read_buffer(coeff, (joint_count + nb) * sizeof(float),
+                         h_loss_out, sizeof(float));
+        if (caller_batching) wgpu_begin_batch();
+    } else if (!caller_batching) {
+        wgpu_flush();
+    }
+
 }
 
 /* ================================================================== */
@@ -1184,6 +1120,11 @@ static WGPUBuffer build_gauss_kernel_buf(float sigma, float truncated, int *klen
     int tail = (int)(truncated * sigma + 0.5f);
     int klen = 2 * tail + 1;
     float *h = (float *)malloc(klen * sizeof(float));
+    if (!h) {
+        *klen_out = -1;
+        wgpu_record_fatal_error("Gaussian-kernel host allocation");
+        return NULL;
+    }
     float inv = 1.0f / (sigma * sqrtf(2.0f));
     float sum = 0;
     for (int i = 0; i < klen; i++) {
@@ -1234,7 +1175,7 @@ static void wgpu_blur_volume_gpu(WGPUBuffer data, WGPUBuffer scratch,
         WGPUBuffer pb = make_params(&p, sizeof(p));
 
         WGPUComputePipeline pl = wgpu_get_pipeline("blur_image", wgsl, "conv1d_image");
-        if (!pl) { wgpuBufferRelease(pb); wgpuBufferRelease(kern_buf); return; }
+        if (!pl) { wgpu_release_buffer(pb); wgpu_release_buffer(kern_buf); return; }
         WGPUBindGroupLayout lay = wgpu_get_bind_group_layout("blur_image");
 
         WGPUBindGroupEntry e[] = {
@@ -1244,27 +1185,19 @@ static void wgpu_blur_volume_gpu(WGPUBuffer data, WGPUBuffer scratch,
             { .binding = 3, .buffer = pb, .size = sizeof(p) },
         };
         WGPUBindGroupDescriptor desc = { .layout = lay, .entryCount = 4, .entries = e };
-        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_wgpu.device, &desc);
+        WGPUBindGroup bg = wgpu_create_bind_group(&desc, NULL);
         { uint32_t wx, wy; wgpu_dispatch_dims(wgpu_div_ceil(n, 256), &wx, &wy);
         wgpu_dispatch(pl, bg, wx, wy, 1); }
-        wgpuBindGroupRelease(bg);
-        wgpuBufferRelease(pb);
-        wgpuBufferRelease(kern_buf);
+        wgpu_release_bind_group(bg);
+        wgpu_release_buffer(pb);
+        wgpu_release_buffer(kern_buf);
     }
 
     /* After 3 passes: if result is in scratch (odd number wouldn't happen with 3 passes,
        but 3 passes leaves result in scratch), copy back to data */
     /* axis 0: data→scratch, axis 1: scratch→data, axis 2: data→scratch
        So result is in scratch. Copy scratch→data. */
-    {
-        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, scratch, 0, data, 0, sz);
-        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-        wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-        wgpuCommandBufferRelease(cmd);
-        wgpuCommandEncoderRelease(enc);
-        wgpuDevicePoll(g_wgpu.device, 1, NULL);
-    }
+    wgpu_copy_buffer(scratch, data, sz);
 }
 
 void wgpu_blur_volume(WGPUBuffer data, int D, int H, int W,
@@ -1273,7 +1206,7 @@ void wgpu_blur_volume(WGPUBuffer data, int D, int H, int W,
     WGPUBufferUsage usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
     WGPUBuffer scratch = wgpu_create_buffer(sz, usage, "blur_vol_scr");
     wgpu_blur_volume_gpu(data, scratch, D, H, W, sigma_d, sigma_h, sigma_w);
-    wgpuBufferRelease(scratch);
+    wgpu_release_buffer(scratch);
 }
 
 void wgpu_blur_downsample(
@@ -1295,20 +1228,12 @@ void wgpu_blur_downsample(
 
     /* Copy input → temp buffer, blur in-place, then trilinear resize → output */
     WGPUBuffer blurred = wgpu_create_buffer(in_sz, usage, "blurred");
-    {
-        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_wgpu.device, NULL);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, input, 0, blurred, 0, in_sz);
-        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, NULL);
-        wgpuQueueSubmit(g_wgpu.queue, 1, &cmd);
-        wgpuCommandBufferRelease(cmd);
-        wgpuCommandEncoderRelease(enc);
-        wgpuDevicePoll(g_wgpu.device, 1, NULL);
-    }
+    wgpu_copy_buffer(input, blurred, in_sz);
     wgpu_blur_volume(blurred, iD, iH, iW, sigma_d, sigma_h, sigma_w);
     wgpuDevicePoll(g_wgpu.device, 1, NULL);  /* Ensure blur completes before resize */
     wgpu_trilinear_resize(blurred, output, B, C, iD, iH, iW, oD, oH, oW, 1);
     wgpuDevicePoll(g_wgpu.device, 1, NULL);  /* Ensure resize completes before release */
-    wgpuBufferRelease(blurred);
+    wgpu_release_buffer(blurred);
 }
 
 /* ================================================================== */
@@ -1321,7 +1246,7 @@ WGPUBuffer wgpu_downsample_image(WGPUBuffer src, int iD, int iH, int iW,
     WGPUBufferUsage u = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
     WGPUBuffer out = wgpu_create_buffer(out_sz, u, "ds");
 
-    if (mode == 1 /* DOWNSAMPLE_TRILINEAR */) {
+    if (mode == DOWNSAMPLE_TRILINEAR) {
         wgpu_blur_downsample(src, out, 1, 1, iD, iH, iW, oD, oH, oW);
     } else {
         /* FFT on CPU: download, FFT, upload */
@@ -1331,7 +1256,7 @@ WGPUBuffer wgpu_downsample_image(WGPUBuffer src, int iD, int iH, int iW,
         if (!h_in || !h_out) {
             free(h_in); free(h_out);
             fprintf(stderr, "wgpu_downsample_image: malloc failed\n");
-            wgpuBufferRelease(out);
+            wgpu_release_buffer(out);
             return NULL;
         }
         wgpu_read_buffer(src, 0, h_in, in_sz);

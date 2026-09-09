@@ -25,10 +25,6 @@ extern "C" {
 int cpu_cc_loss_3d(const tensor_t *pred, const tensor_t *target,
                    int kernel_size, float *loss_out, tensor_t *grad_pred);
 
-/* CC loss with both pred AND target gradients (for SyN) */
-int cpu_cc_loss_3d_both(const tensor_t *pred, const tensor_t *target,
-                         int kernel_size, float *loss_out,
-                         tensor_t *grad_pred, tensor_t *grad_target);
 
 /* Fused CC loss matching CUDA fused_cc.cu / Metal fcc_* exactly.
  * Uses kernel_volume (kv=ks³) scaling in the gradient formula.

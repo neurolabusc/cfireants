@@ -18,6 +18,68 @@
 #include "metal_context.h"
 #include "metal_kernels.h"
 
+static float *metal_cc_workspace_alloc(size_t bytes) {
+    if (metal_had_fatal_error()) return NULL;
+    id<MTLBuffer> buffer = [g_metal.device newBufferWithLength:bytes
+                                                    options:MTLResourceStorageModeShared];
+    if (!buffer) {
+        metal_record_fatal_error("CC workspace allocation");
+        return NULL;
+    }
+    float *ptr = (float *)buffer.contents;
+    if (!ptr) {
+        metal_record_fatal_error("CC workspace mapping");
+        return NULL;
+    }
+    metal_register_buffer(ptr, (__bridge void *)buffer, bytes);
+    if (!metal_buffer_from_ptr(ptr)) return NULL;
+    return ptr;
+}
+
+int metal_cc_workspace_init(metal_cc_workspace_t *ws, int n, int with_gradient) {
+    if (!ws || n <= 0) return -1;
+    memset(ws, 0, sizeof(*ws));
+    ws->voxels = n;
+    ws->has_gradient = with_gradient != 0;
+    size_t bytes = (size_t)n * sizeof(float);
+    size_t partial_bytes = (size_t)metal_div_ceil((uint32_t)n,
+                                                  MTL_THREADGROUP_SIZE) * sizeof(float);
+    ws->p_sum = metal_cc_workspace_alloc(bytes);
+    ws->t_sum = metal_cc_workspace_alloc(bytes);
+    ws->p2_sum = metal_cc_workspace_alloc(bytes);
+    ws->t2_sum = metal_cc_workspace_alloc(bytes);
+    ws->tp_sum = metal_cc_workspace_alloc(bytes);
+    ws->work = metal_cc_workspace_alloc(bytes);
+    ws->tmp = metal_cc_workspace_alloc(bytes);
+    ws->partial = metal_cc_workspace_alloc(partial_bytes);
+    if (with_gradient) {
+        ws->src_p = metal_cc_workspace_alloc(bytes);
+        ws->src_p2 = metal_cc_workspace_alloc(bytes);
+        ws->src_tp = metal_cc_workspace_alloc(bytes);
+    }
+    if (metal_had_fatal_error()) {
+        metal_cc_workspace_cleanup(ws);
+        return -1;
+    }
+    return 0;
+}
+
+void metal_cc_workspace_cleanup(metal_cc_workspace_t *ws) {
+    if (!ws) return;
+    if (ws->p_sum) metal_unregister_buffer(ws->p_sum);
+    if (ws->t_sum) metal_unregister_buffer(ws->t_sum);
+    if (ws->p2_sum) metal_unregister_buffer(ws->p2_sum);
+    if (ws->t2_sum) metal_unregister_buffer(ws->t2_sum);
+    if (ws->tp_sum) metal_unregister_buffer(ws->tp_sum);
+    if (ws->work) metal_unregister_buffer(ws->work);
+    if (ws->tmp) metal_unregister_buffer(ws->tmp);
+    if (ws->partial) metal_unregister_buffer(ws->partial);
+    if (ws->src_p) metal_unregister_buffer(ws->src_p);
+    if (ws->src_p2) metal_unregister_buffer(ws->src_p2);
+    if (ws->src_tp) metal_unregister_buffer(ws->src_tp);
+    memset(ws, 0, sizeof(*ws));
+}
+
 /* --- Param structs matching Metal shader buffer layouts --- */
 
 /* Must match shader struct layouts exactly (field order matters!) */
@@ -44,9 +106,11 @@ typedef struct { uint32_t D, H, W, klen, axis, _pad0, _pad1, _pad2; } conv1d_par
 /* --- Element-wise operations --- */
 
 void metal_tensor_fill(float *data, float value, int n) {
-    void *pso = metal_get_pipeline("tensor_fill");
+    void *pso = metal_get_pipeline_optional("tensor_fill");
     if (!pso) {
         /* CPU fallback */
+        metal_sync();
+        if (metal_had_fatal_error()) return;
         for (int i = 0; i < n; i++) data[i] = value;
         return;
     }
@@ -59,9 +123,11 @@ void metal_tensor_fill(float *data, float value, int n) {
 }
 
 void metal_tensor_scale(float *data, float alpha, int n) {
-    void *pso = metal_get_pipeline("tensor_scale");
+    void *pso = metal_get_pipeline_optional("tensor_scale");
     if (!pso) {
         /* CPU fallback */
+        metal_sync();
+        if (metal_had_fatal_error()) return;
         for (int i = 0; i < n; i++) data[i] *= alpha;
         return;
     }
@@ -74,9 +140,11 @@ void metal_tensor_scale(float *data, float alpha, int n) {
 }
 
 void metal_tensor_axpy(float *y, float alpha, const float *x, int n) {
-    void *pso = metal_get_pipeline("tensor_axpy");
+    void *pso = metal_get_pipeline_optional("tensor_axpy");
     if (!pso) {
         /* CPU fallback */
+        metal_sync();
+        if (metal_had_fatal_error()) return;
         for (int i = 0; i < n; i++) y[i] += alpha * x[i];
         return;
     }
@@ -103,6 +171,7 @@ void metal_tensor_axpy(float *y, float alpha, const float *x, int n) {
 float metal_tensor_sum(const float *data, int n) {
     /* Sync to ensure GPU writes are visible */
     metal_sync();
+    if (metal_had_fatal_error()) return 0.0f;
 
     /* CPU reduction (data is in shared memory, CPU-accessible) */
     double sum = 0.0;
@@ -229,7 +298,7 @@ void metal_trilinear_resize(const float *input, float *output,
 void metal_trilinear_resize_texture(const float *input, float *output,
                                      int iD, int iH, int iW,
                                      int oD, int oH, int oW, int align_corners) {
-    void *pso = metal_get_pipeline("trilinear_resize_texture");
+    void *pso = metal_get_pipeline_optional("trilinear_resize_texture");
     if (!pso) {
         fprintf(stderr, "metal_trilinear_resize_texture: pipeline not found, falling back\n");
         metal_trilinear_resize(input, output, 1, 1, iD, iH, iW, oD, oH, oW, align_corners);
@@ -275,6 +344,11 @@ void metal_trilinear_resize_texture(const float *input, float *output,
         id<MTLBuffer> param_buf = [g_metal.device newBufferWithBytes:&params
                                                               length:sizeof(params)
                                                              options:MTLResourceStorageModeShared];
+        if (!param_buf) {
+            metal_trilinear_resize(input, output, 1, 1, iD, iH, iW,
+                                   oD, oH, oW, align_corners);
+            return;
+        }
         uint32_t total = (uint32_t)(oD * oH * oW);
         id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)pso;
         NSUInteger tw = pipeline.maxTotalThreadsPerThreadgroup;
@@ -282,6 +356,10 @@ void metal_trilinear_resize_texture(const float *input, float *output,
 
         id<MTLCommandBuffer> cmd = [g_metal.queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!cmd || !enc) {
+            metal_record_fatal_error("texture resize command creation");
+            return;
+        }
         [enc setComputePipelineState:pipeline];
         [enc setTexture:tex atIndex:0];
         [enc setBuffer:out_buf offset:0 atIndex:0];
@@ -290,6 +368,11 @@ void metal_trilinear_resize_texture(const float *input, float *output,
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
+        if (cmd.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "metal_trilinear_resize_texture: command failed: %s\n",
+                    cmd.error ? [[cmd.error localizedDescription] UTF8String] : "unknown error");
+            metal_record_fatal_error("texture resize command execution");
+        }
     }
 }
 
@@ -326,6 +409,8 @@ typedef struct { uint32_t spatial; int32_t kernel_volume; float nr, dr; } fcc_fw
 typedef struct { uint32_t spatial; int32_t kernel_volume; float nr, dr, grad_output_val; int32_t compute_grad_target; } fcc_bwd_params_t;
 typedef struct { uint32_t spatial, has_grad_target; } fcc_grad_params_t;
 typedef struct { uint32_t D, H, W, klen; } blur_params_t;
+typedef struct { uint32_t D, H, W, klen, axis, channels, _pad0, _pad1; } box_packed_params_t;
+typedef struct { uint32_t n, _pad0, _pad1, _pad2; } copy_params_t;
 
 void metal_box_filter_axis(const float *in, float *out,
                             int D, int H, int W, int ks, int axis, float scale) {
@@ -334,13 +419,23 @@ void metal_box_filter_axis(const float *in, float *out,
         id<MTLDevice> device = g_metal.device;
         id<MTLBuffer> kern_buf = [device newBufferWithLength:(NSUInteger)(ks * sizeof(float))
                                                     options:MTLResourceStorageModeShared];
+        if (!kern_buf) {
+            fprintf(stderr, "metal_box_filter_axis: kernel allocation failed\n");
+            metal_record_fatal_error("box-filter kernel allocation");
+            return;
+        }
         float *kern_ptr = (float *)[kern_buf contents];
+        if (!kern_ptr) {
+            metal_record_fatal_error("box-filter kernel mapping");
+            return;
+        }
         for (int i = 0; i < ks; i++) {
             kern_ptr[i] = scale;
         }
 
         /* Register the temporary buffer so metal_dispatch can find it */
         metal_register_buffer(kern_ptr, (__bridge void *)kern_buf, (size_t)(ks * sizeof(float)));
+        if (!metal_buffer_from_ptr(kern_ptr)) return;
 
         metal_conv1d_axis(in, out, D, H, W, kern_ptr, ks, axis);
 
@@ -354,38 +449,56 @@ void metal_box_filter_axis(const float *in, float *out,
 /* --- Phase 3: CC loss + Gaussian blur --- */
 
 /*
- * box_filter_intermediates_metal — apply 3-pass separable box filter to each
- * of 5 channels packed in interm[5*spatial].  For each channel, filters along
- * axes D, H, W in order (matching CUDA's separable_box_filter_gpu).
- * Uses scratch as temporary.
+ * metal_box_filter_packed — box filter all `channels` planes of a packed
+ * [C,D,H,W] buffer along one axis in a single dispatch.
+ */
+void metal_box_filter_packed(const float *in, float *out,
+                              int D, int H, int W, int ks, int axis,
+                              int channels) {
+    void *pso = metal_get_pipeline("box_filter_axis_packed");
+    if (!pso) {
+        fprintf(stderr, "metal_box_filter_packed: pipeline not found\n");
+        return;
+    }
+    box_packed_params_t params = {
+        .D = (uint32_t)D, .H = (uint32_t)H, .W = (uint32_t)W,
+        .klen = (uint32_t)ks, .axis = (uint32_t)axis,
+        .channels = (uint32_t)channels, ._pad0 = 0, ._pad1 = 0
+    };
+    size_t bytes = (size_t)channels * D * H * W * sizeof(float);
+    const void *bufs[] = { in, out };
+    size_t sizes[] = { bytes, bytes };
+    metal_dispatch(pso, bufs, sizes, 2, &params, sizeof(params),
+                   (uint32_t)((size_t)channels * D * H * W));
+}
+
+void metal_copy_f32(float *dst, const float *src, int n) {
+    void *pso = metal_get_pipeline("copy_f32");
+    if (!pso) {
+        fprintf(stderr, "metal_copy_f32: pipeline not found\n");
+        return;
+    }
+    copy_params_t params = { .n = (uint32_t)n, ._pad0 = 0, ._pad1 = 0, ._pad2 = 0 };
+    const void *bufs[] = { src, dst };
+    size_t sizes[] = { (size_t)n * sizeof(float), (size_t)n * sizeof(float) };
+    metal_dispatch(pso, bufs, sizes, 2, &params, sizeof(params), (uint32_t)n);
+}
+
+/*
+ * box_filter_intermediates_metal — 3-pass separable box filter over the 5
+ * channels packed in interm[5*spatial], one dispatch per axis.  scratch must
+ * hold 5*spatial floats.
  */
 static void box_filter_intermediates_metal(float *interm, int spatial,
                                             int D, int H, int W, int ks,
                                             float *scratch) {
-    @autoreleasepool {
-        /* Pre-allocate uniform kernel buffer once (shared across all 15 dispatches) */
-        float scale = 1.0f / (float)ks;
-        id<MTLBuffer> kern_buf = [g_metal.device newBufferWithLength:(NSUInteger)(ks * sizeof(float))
-                                                             options:MTLResourceStorageModeShared];
-        float *kern_ptr = (float *)[kern_buf contents];
-        for (int i = 0; i < ks; i++) kern_ptr[i] = scale;
-        metal_register_buffer(kern_ptr, (__bridge void *)kern_buf, (size_t)(ks * sizeof(float)));
-
-        /* Batch all 15 box filter dispatches (5 channels × 3 axes) */
-        metal_begin_batch();
-        for (int ch = 0; ch < 5; ch++) {
-            float *chan = interm + (size_t)ch * spatial;
-            metal_conv1d_axis(chan, scratch, D, H, W, kern_ptr, ks, 0);    /* D: chan→scratch */
-            metal_conv1d_axis(scratch, chan, D, H, W, kern_ptr, ks, 1);    /* H: scratch→chan */
-            metal_conv1d_axis(chan, scratch, D, H, W, kern_ptr, ks, 2);    /* W: chan→scratch */
-            /* Must flush before memcpy since batch is still pending */
-            metal_flush_batch();
-            memcpy(chan, scratch, (size_t)spatial * sizeof(float));
-            if (ch < 4) metal_begin_batch();  /* start next batch for remaining channels */
-        }
-
-        metal_unregister_buffer(kern_ptr);
-    }
+    int total = 5 * spatial;
+    metal_begin_batch();
+    metal_box_filter_packed(interm, scratch, D, H, W, ks, 0, 5);
+    metal_box_filter_packed(scratch, interm, D, H, W, ks, 1, 5);
+    metal_box_filter_packed(interm, scratch, D, H, W, ks, 2, 5);
+    metal_copy_f32(interm, scratch, total);
+    metal_flush_batch();
 }
 
 /*
@@ -598,47 +711,33 @@ void metal_blur_disp_dhw3(float *data, float *scratch,
  */
 static void metal_cc_loss_3d_v2(const float *pred, const float *target,
                                  float *grad_pred,
-                                 int D, int H, int W, int ks, float *h_loss_out) {
+                                 int D, int H, int W, int ks, float *h_loss_out,
+                                 metal_cc_workspace_t *workspace) {
     @autoreleasepool {
         uint32_t n = (uint32_t)(D * H * W);
         size_t buf_bytes = (size_t)n * sizeof(float);
         float nr = 1e-5f, dr = 1e-5f;
 
-        /* Declare all ARC variables up front to avoid goto-past-init errors */
-        id<MTLBuffer> src_p_buf = nil, src_p2_buf = nil, src_tp_buf = nil;
-        float *src_p = NULL, *src_p2 = NULL, *src_tp = NULL;
         int compute_grad = (grad_pred != NULL);
-
-        /* Allocate 7 work buffers: p_sum, t_sum, p2_sum, t2_sum, tp_sum, work, tmp */
-        id<MTLBuffer> p_sum_buf  = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> t_sum_buf  = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> p2_sum_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> t2_sum_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tp_sum_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> work_buf   = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tmp_buf    = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-
-        if (!p_sum_buf || !t_sum_buf || !p2_sum_buf || !t2_sum_buf ||
-            !tp_sum_buf || !work_buf || !tmp_buf) {
-            fprintf(stderr, "metal_cc_loss_3d_v2: failed to allocate workspace\n");
+        metal_cc_workspace_t local_workspace;
+        int owns_workspace = 0;
+        if (!workspace) {
+            if (metal_cc_workspace_init(&local_workspace, (int)n, compute_grad) != 0)
+                return;
+            workspace = &local_workspace;
+            owns_workspace = 1;
+        } else if (workspace->voxels < (int)n ||
+                   (compute_grad && !workspace->has_gradient)) {
+            metal_record_fatal_error("CC workspace capacity");
             return;
         }
 
-        float *p_sum  = (float *)[p_sum_buf contents];
-        float *t_sum  = (float *)[t_sum_buf contents];
-        float *p2_sum = (float *)[p2_sum_buf contents];
-        float *t2_sum = (float *)[t2_sum_buf contents];
-        float *tp_sum = (float *)[tp_sum_buf contents];
-        float *work   = (float *)[work_buf contents];
-        float *tmp    = (float *)[tmp_buf contents];
-
-        metal_register_buffer(p_sum,  (__bridge void *)p_sum_buf,  buf_bytes);
-        metal_register_buffer(t_sum,  (__bridge void *)t_sum_buf,  buf_bytes);
-        metal_register_buffer(p2_sum, (__bridge void *)p2_sum_buf, buf_bytes);
-        metal_register_buffer(t2_sum, (__bridge void *)t2_sum_buf, buf_bytes);
-        metal_register_buffer(tp_sum, (__bridge void *)tp_sum_buf, buf_bytes);
-        metal_register_buffer(work,   (__bridge void *)work_buf,   buf_bytes);
-        metal_register_buffer(tmp,    (__bridge void *)tmp_buf,    buf_bytes);
+        float *p_sum=workspace->p_sum, *t_sum=workspace->t_sum;
+        float *p2_sum=workspace->p2_sum, *t2_sum=workspace->t2_sum;
+        float *tp_sum=workspace->tp_sum, *work=workspace->work;
+        float *tmp=workspace->tmp;
+        float *src_p=workspace->src_p, *src_p2=workspace->src_p2;
+        float *src_tp=workspace->src_tp;
 
         /* --- Step 1: Box filter the 5 forward intermediates --- */
 
@@ -685,19 +784,10 @@ static void metal_cc_loss_3d_v2(const float *pred, const float *target,
         float *ncc_buf = work;
 
         if (compute_grad) {
-            src_p_buf  = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-            src_p2_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-            src_tp_buf = [g_metal.device newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
-            if (!src_p_buf || !src_p2_buf || !src_tp_buf) {
-                fprintf(stderr, "metal_cc_loss_3d_v2: failed to allocate gradient source buffers\n");
+            if (!src_p || !src_p2 || !src_tp) {
+                metal_record_fatal_error("CC gradient workspace");
                 goto cleanup;
             }
-            src_p  = (float *)[src_p_buf contents];
-            src_p2 = (float *)[src_p2_buf contents];
-            src_tp = (float *)[src_tp_buf contents];
-            metal_register_buffer(src_p,  (__bridge void *)src_p_buf,  buf_bytes);
-            metal_register_buffer(src_p2, (__bridge void *)src_p2_buf, buf_bytes);
-            metal_register_buffer(src_tp, (__bridge void *)src_tp_buf, buf_bytes);
         }
 
         {
@@ -727,19 +817,12 @@ static void metal_cc_loss_3d_v2(const float *pred, const float *target,
             uint32_t n_groups = metal_div_ceil(n, MTL_THREADGROUP_SIZE);
             size_t partial_bytes = (size_t)n_groups * sizeof(float);
 
-            id<MTLBuffer> partial_buf = [g_metal.device newBufferWithLength:partial_bytes
-                                                                    options:MTLResourceStorageModeShared];
-            if (!partial_buf) {
-                fprintf(stderr, "metal_cc_loss_3d_v2: failed to allocate partial sum buffer\n");
-                goto cleanup_grad;
-            }
-            float *partial = (float *)[partial_buf contents];
-            metal_register_buffer(partial, (__bridge void *)partial_buf, partial_bytes);
+            float *partial = workspace->partial;
 
             {
                 void *pso = metal_get_pipeline("cc_ncc_partial_sum");
                 if (!pso) { fprintf(stderr, "metal_cc_loss_3d_v2: cc_ncc_partial_sum pipeline not found\n");
-                    metal_unregister_buffer(partial); goto cleanup_grad; }
+                    goto cleanup_grad; }
                 struct { uint32_t n, _pad; } params = { .n = n, ._pad = 0 };
                 const void *bufs[] = { ncc_buf, partial };
                 size_t sizes[] = { buf_bytes, partial_bytes };
@@ -754,7 +837,6 @@ static void metal_cc_loss_3d_v2(const float *pred, const float *target,
             }
             *h_loss_out = -(float)(sum / (double)n);
 
-            metal_unregister_buffer(partial);
         }
 
         /* --- Step 3: Compute gradient if requested --- */
@@ -783,26 +865,18 @@ static void metal_cc_loss_3d_v2(const float *pred, const float *target,
         }
 
     cleanup_grad:
-        if (src_tp)  metal_unregister_buffer(src_tp);
-        if (src_p2)  metal_unregister_buffer(src_p2);
-        if (src_p)   metal_unregister_buffer(src_p);
-
     cleanup:
         metal_sync();
-        metal_unregister_buffer(tmp);
-        metal_unregister_buffer(work);
-        metal_unregister_buffer(tp_sum);
-        metal_unregister_buffer(t2_sum);
-        metal_unregister_buffer(p2_sum);
-        metal_unregister_buffer(t_sum);
-        metal_unregister_buffer(p_sum);
+        if (owns_workspace) metal_cc_workspace_cleanup(workspace);
     }
 }
 
 void metal_cc_loss_3d(const float *pred, const float *target,
                        float *grad_pred,
-                       int D, int H, int W, int ks, float *h_loss_out) {
-    metal_cc_loss_3d_v2(pred, target, grad_pred, D, H, W, ks, h_loss_out);
+                       int D, int H, int W, int ks, float *h_loss_out,
+                       metal_cc_workspace_t *workspace) {
+    metal_cc_loss_3d_v2(pred, target, grad_pred, D, H, W, ks, h_loss_out,
+                        workspace);
 }
 
 /* ================================================================== */
@@ -887,6 +961,7 @@ void metal_mi_loss_3d(const float *pred, const float *target,
                                                              options:MTLResourceStorageModeShared];
         if (!pab_buf || !pa_buf || !pb_buf || !bins_buf) {
             fprintf(stderr, "metal_mi_loss: buffer allocation failed\n");
+            metal_record_fatal_error("MI workspace allocation");
             if (h_loss_out) *h_loss_out = 0;
             return;
         }
@@ -894,10 +969,16 @@ void metal_mi_loss_3d(const float *pred, const float *target,
         float *d_pa   = (float *)pa_buf.contents;
         float *d_pb   = (float *)pb_buf.contents;
         float *d_bins = (float *)bins_buf.contents;
+        if (!d_pab || !d_pa || !d_pb || !d_bins) {
+            metal_record_fatal_error("MI workspace mapping");
+            if (h_loss_out) *h_loss_out = 0;
+            return;
+        }
         metal_register_buffer(d_pab, (__bridge void *)pab_buf, pab_sz);
         metal_register_buffer(d_pa, (__bridge void *)pa_buf, marg_sz);
         metal_register_buffer(d_pb, (__bridge void *)pb_buf, marg_sz);
         metal_register_buffer(d_bins, (__bridge void *)bins_buf, marg_sz);
+        if (metal_had_fatal_error()) goto cleanup;
 
         /* Initialize: zero histograms, copy bin centers */
         memset(d_pab, 0, (size_t)nb * nb * sizeof(float));
@@ -975,10 +1056,10 @@ void metal_mi_loss_3d(const float *pred, const float *target,
         }
 
     cleanup:
-        metal_unregister_buffer(d_bins);
-        metal_unregister_buffer(d_pb);
-        metal_unregister_buffer(d_pa);
-        metal_unregister_buffer(d_pab);
+        if (metal_buffer_from_ptr(d_bins)) metal_unregister_buffer(d_bins);
+        if (metal_buffer_from_ptr(d_pb)) metal_unregister_buffer(d_pb);
+        if (metal_buffer_from_ptr(d_pa)) metal_unregister_buffer(d_pa);
+        if (metal_buffer_from_ptr(d_pab)) metal_unregister_buffer(d_pab);
         /* ARC releases the MTLBuffers when they go out of scope */
     }
 }
@@ -989,10 +1070,11 @@ void metal_mi_loss_3d(const float *pred, const float *target,
 
 void metal_warp_adam_moments(const float *grad, float *exp_avg, float *exp_avg_sq,
                               float beta1, float beta2, int n) {
-    void *pso = metal_get_pipeline("warp_adam_moments");
+    void *pso = metal_get_pipeline_optional("warp_adam_moments");
     if (!pso) {
         /* CPU fallback */
         metal_sync();
+        if (metal_had_fatal_error()) return;
         for (int i = 0; i < n; i++) {
             float g = grad[i];
             exp_avg[i] = beta1 * exp_avg[i] + (1.0f - beta1) * g;
@@ -1008,10 +1090,11 @@ void metal_warp_adam_moments(const float *grad, float *exp_avg, float *exp_avg_s
 
 void metal_warp_adam_direction(float *output, const float *exp_avg, const float *exp_avg_sq,
                                 float bc1, float bc2, float eps, int n) {
-    void *pso = metal_get_pipeline("warp_adam_direction");
+    void *pso = metal_get_pipeline_optional("warp_adam_direction");
     if (!pso) {
         /* CPU fallback */
         metal_sync();
+        if (metal_had_fatal_error()) return;
         for (int i = 0; i < n; i++) {
             float m_hat = exp_avg[i] / bc1;
             float v_hat = exp_avg_sq[i] / bc2;
@@ -1093,10 +1176,11 @@ void metal_fused_compositive_update(const float *warp, const float *update,
 
 float metal_max_l2_norm(const float *data, int spatial) {
     float eps = 1e-8f;
-    void *pso = metal_get_pipeline("max_l2_norm");
+    void *pso = metal_get_pipeline_optional("max_l2_norm");
     if (!pso) {
         /* CPU fallback */
         metal_sync();
+        if (metal_had_fatal_error()) return eps;
         float maxval = 0;
         for (int i = 0; i < spatial; i++) {
             float dx = data[i*3], dy = data[i*3+1], dz = data[i*3+2];
@@ -1114,6 +1198,7 @@ float metal_max_l2_norm(const float *data, int spatial) {
         if (!partial_buf) {
             /* CPU fallback */
             metal_sync();
+            if (metal_had_fatal_error()) return eps;
             float maxval = 0;
             for (int i = 0; i < spatial; i++) {
                 float dx = data[i*3], dy = data[i*3+1], dz = data[i*3+2];
@@ -1124,7 +1209,12 @@ float metal_max_l2_norm(const float *data, int spatial) {
         }
 
         float *d_partial = (float *)partial_buf.contents;
+        if (!d_partial) {
+            metal_record_fatal_error("max-L2 workspace mapping");
+            return eps;
+        }
         metal_register_buffer(d_partial, (__bridge void *)partial_buf, (size_t)(n_groups * sizeof(float)));
+        if (!metal_buffer_from_ptr(d_partial)) return eps;
 
         struct { uint32_t spatial, _pad; float eps, _pad1; } params = {
             .spatial = (uint32_t)spatial, ._pad = 0, .eps = eps, ._pad1 = 0
@@ -1158,10 +1248,11 @@ void metal_warp_inverse(const float *u, float *inv_u, int D, int H, int W, int n
     uint32_t n3 = spatial * 3;
 
     /* Initialize inv_u = -u */
-    void *negate_pso = metal_get_pipeline("negate_field");
+    void *negate_pso = metal_get_pipeline_optional("negate_field");
     if (!negate_pso) {
         /* CPU fallback */
         metal_sync();
+        if (metal_had_fatal_error()) return;
         for (uint32_t i = 0; i < n3; i++)
             inv_u[i] = -u[i];
     } else {
@@ -1183,10 +1274,16 @@ void metal_warp_inverse(const float *u, float *inv_u, int D, int H, int W, int n
                                                              options:MTLResourceStorageModeShared];
         if (!tmp_buf) {
             fprintf(stderr, "metal_warp_inverse: failed to allocate temp buffer\n");
+            metal_record_fatal_error("warp inverse allocation");
             return;
         }
         float *d_tmp = (float *)tmp_buf.contents;
+        if (!d_tmp) {
+            metal_record_fatal_error("warp inverse mapping");
+            return;
+        }
         metal_register_buffer(d_tmp, (__bridge void *)tmp_buf, (size_t)(n3 * sizeof(float)));
+        if (!metal_buffer_from_ptr(d_tmp)) return;
 
         warp_params_t params = { .D = (uint32_t)D, .H = (uint32_t)H, .W = (uint32_t)W, ._pad = 0 };
 

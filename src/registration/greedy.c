@@ -48,7 +48,7 @@ static void build_combined_affine(const float phys44[4][4],
 int greedy_register(const image_t *fixed, const image_t *moving,
                     const float init_affine_44[4][4],
                     greedy_opts_t opts, greedy_result_t *result) {
-    memset(result, 0, sizeof(greedy_result_t));
+    if (greedy_result_init(result) != 0) return -1;
 
     int fD = fixed->data.shape[2], fH = fixed->data.shape[3], fW = fixed->data.shape[4];
 
@@ -78,10 +78,9 @@ int greedy_register(const image_t *fixed, const image_t *moving,
         if (dD < 8) dD = 8; if (dH < 8) dH = 8; if (dW < 8) dW = 8;
         if (scale == 1) { dD = fD; dH = fH; dW = fW; }
 
-        int mdD = (scale > 1) ? mD / scale : mD;
-        int mdH = (scale > 1) ? mH / scale : mH;
-        int mdW = (scale > 1) ? mW / scale : mW;
-        if (mdD < 8) mdD = 8; if (mdH < 8) mdH = 8; if (mdW < 8) mdW = 8;
+        int mdD, mdH, mdW;
+        moving_pyramid_size(scale, fixed->meta.spacing, moving->meta.spacing,
+                            mD, mH, mW, &mdD, &mdH, &mdW);
         if (scale == 1) { mdD = mD; mdH = mH; mdW = mW; }
 
         /* Downsample images (matching GPU pipeline) */
@@ -158,7 +157,7 @@ int greedy_register(const image_t *fixed, const image_t *moving,
         int adam_step_t = 0;
         float beta1 = 0.9f, beta2 = 0.99f, eps = 1e-8f;
 
-        fprintf(stderr, "  Greedy scale %d: fixed[%d,%d,%d] moving[%d,%d,%d] x %d iters\n",
+        if (cfireants_verbose >= 2) fprintf(stderr, "  Greedy scale %d: fixed[%d,%d,%d] moving[%d,%d,%d] x %d iters\n",
                 scale, dD, dH, dW, mdD, mdH, mdW, iters);
 
         /* Generate base grid from affine (stays constant within scale) */
@@ -166,11 +165,9 @@ int greedy_register(const image_t *fixed, const image_t *moving,
         tensor_t base_grid;
         affine_grid_3d(&combined_aff, grid_shape, &base_grid);
 
-        float half_res = 1.0f / (float)((dD > dH ? (dD > dW ? dD : dW) : (dH > dW ? dH : dW)) - 1);
         float prev_loss = 1e30f;
         int converge_count = 0;
         size_t nvox3 = (size_t)dD * dH * dW * 3;
-        long spatial = (long)dD * dH * dW;
 
         /* Scratch for blur in [D,H,W,3] layout */
         float *adam_dir = (float *)calloc(nvox3, sizeof(float));
@@ -202,170 +199,16 @@ int greedy_register(const image_t *fixed, const image_t *moving,
             cpu_grid_sample_3d_backward(&grad_moved, &moving_down, &sampling_grid,
                                         &grad_grid, 1);
 
-            /* 5. Smooth gradient (in [D,H,W,3] layout) */
+            /* 5-10. Smooth gradient, WarpAdam compositive update, smooth warp */
             float *grad_dhw3 = tensor_data_f32(&grad_grid);
-            if (opts.smooth_grad_sigma > 0) {
-                /* blur_disp_dhw3 equivalent: blur each of 3 channels in-place */
-                float *scratch = (float *)malloc(nvox3 * sizeof(float));
-                float *kern = NULL; int klen = 0;
-                make_gaussian_kernel(opts.smooth_grad_sigma, 2.0f, &kern, &klen);
-                /* Axis 0 (D): data→scratch */
-                for (long s = 0; s < spatial; s++) {
-                    int w = s % dW, h = (int)((s / dW) % dH), d = (int)(s / ((long)dH * dW));
-                    int r = klen / 2;
-                    float s0=0,s1=0,s2=0;
-                    for (int k = 0; k < klen; k++) {
-                        int dd = d + k - r;
-                        if (dd >= 0 && dd < dD) {
-                            long si = ((long)dd*dH+h)*dW*3+w*3;
-                            s0 += grad_dhw3[si]*kern[k]; s1 += grad_dhw3[si+1]*kern[k]; s2 += grad_dhw3[si+2]*kern[k];
-                        }
-                    }
-                    long di = s*3; scratch[di]=s0; scratch[di+1]=s1; scratch[di+2]=s2;
-                }
-                /* Axis 1 (H): scratch→grad_dhw3 */
-                for (long s = 0; s < spatial; s++) {
-                    int w = s % dW, h = (int)((s / dW) % dH), d = (int)(s / ((long)dH * dW));
-                    int r = klen / 2;
-                    float s0=0,s1=0,s2=0;
-                    for (int k = 0; k < klen; k++) {
-                        int hh = h + k - r;
-                        if (hh >= 0 && hh < dH) {
-                            long si = ((long)d*dH+hh)*dW*3+w*3;
-                            s0 += scratch[si]*kern[k]; s1 += scratch[si+1]*kern[k]; s2 += scratch[si+2]*kern[k];
-                        }
-                    }
-                    long di = s*3; grad_dhw3[di]=s0; grad_dhw3[di+1]=s1; grad_dhw3[di+2]=s2;
-                }
-                /* Axis 2 (W): grad_dhw3→scratch */
-                for (long s = 0; s < spatial; s++) {
-                    int w = s % dW, h = (int)((s / dW) % dH), d = (int)(s / ((long)dH * dW));
-                    int r = klen / 2;
-                    float s0=0,s1=0,s2=0;
-                    for (int k = 0; k < klen; k++) {
-                        int ww = w + k - r;
-                        if (ww >= 0 && ww < dW) {
-                            long si = ((long)d*dH+h)*dW*3+ww*3;
-                            s0 += grad_dhw3[si]*kern[k]; s1 += grad_dhw3[si+1]*kern[k]; s2 += grad_dhw3[si+2]*kern[k];
-                        }
-                    }
-                    long di = s*3; scratch[di]=s0; scratch[di+1]=s1; scratch[di+2]=s2;
-                }
-                memcpy(grad_dhw3, scratch, nvox3 * sizeof(float));
-                free(scratch); free(kern);
-            }
-
-            /* 6. WarpAdam: moments update + direction computation */
-            adam_step_t++;
-            float bc1 = 1.0f - powf(beta1, (float)adam_step_t);
-            float bc2 = 1.0f - powf(beta2, (float)adam_step_t);
-            float *m = tensor_data_f32(&adam_m);
-            float *v = tensor_data_f32(&adam_v);
-            for (size_t i = 0; i < nvox3; i++) {
-                float g = grad_dhw3[i];
-                m[i] = beta1 * m[i] + (1.0f - beta1) * g;
-                v[i] = beta2 * v[i] + (1.0f - beta2) * g * g;
-                adam_dir[i] = (m[i] / bc1) / (sqrtf(v[i] / bc2) + eps);
-            }
-
-            /* 7. Normalize by max_l2_norm, scale */
-            float gradmax = eps;
-            for (long s = 0; s < spatial; s++) {
-                float dx = adam_dir[s*3], dy = adam_dir[s*3+1], dz = adam_dir[s*3+2];
-                float l2 = sqrtf(dx*dx + dy*dy + dz*dz);
-                if (l2 > gradmax) gradmax = l2;
-            }
-            if (gradmax < 1.0f) gradmax = 1.0f;
-            float sf = half_res / gradmax * (-opts.lr);
-            for (size_t i = 0; i < nvox3; i++)
-                adam_dir[i] *= sf;
-
-            /* 8. Compositive update: adam_dir = adam_dir + interp(warp, identity + adam_dir) */
-            {
-                float *warp = tensor_data_f32(&disp);
-                for (long s = 0; s < spatial; s++) {
-                    int w = s % dW, h = (int)((s / dW) % dH), d = (int)(s / ((long)dH * dW));
-                    float nx = (dW > 1) ? 2.0f * w / (dW - 1) - 1.0f : 0.0f;
-                    float ny = (dH > 1) ? 2.0f * h / (dH - 1) - 1.0f : 0.0f;
-                    float nz = (dD > 1) ? 2.0f * d / (dD - 1) - 1.0f : 0.0f;
-                    float sx = nx + adam_dir[s*3];
-                    float sy = ny + adam_dir[s*3+1];
-                    float sz = nz + adam_dir[s*3+2];
-                    /* Trilinear interpolation of warp at (sx, sy, sz) */
-                    float ix = (sx + 1.0f) * 0.5f * (dW - 1);
-                    float iy = (sy + 1.0f) * 0.5f * (dH - 1);
-                    float iz = (sz + 1.0f) * 0.5f * (dD - 1);
-                    int x0 = (int)floorf(ix), y0 = (int)floorf(iy), z0 = (int)floorf(iz);
-                    float fx = ix - x0, fy = iy - y0, fz = iz - z0;
-                    #define W3(dd,hh,ww,c) ((dd)>=0&&(dd)<dD&&(hh)>=0&&(hh)<dH&&(ww)>=0&&(ww)<dW?\
-                        warp[((long)(dd)*dH+(hh))*dW*3+(ww)*3+(c)]:0.0f)
-                    float wt[8] = {(1-fx)*(1-fy)*(1-fz),fx*(1-fy)*(1-fz),(1-fx)*fy*(1-fz),fx*fy*(1-fz),
-                                   (1-fx)*(1-fy)*fz,fx*(1-fy)*fz,(1-fx)*fy*fz,fx*fy*fz};
-                    int dz_[8]={z0,z0,z0,z0,z0+1,z0+1,z0+1,z0+1};
-                    int dy_[8]={y0,y0,y0+1,y0+1,y0,y0,y0+1,y0+1};
-                    int dx_[8]={x0,x0+1,x0,x0+1,x0,x0+1,x0,x0+1};
-                    for (int c = 0; c < 3; c++) {
-                        float val = 0;
-                        for (int k = 0; k < 8; k++) val += wt[k] * W3(dz_[k],dy_[k],dx_[k],c);
-                        adam_dir[s*3+c] += val;
-                    }
-                    #undef W3
-                }
-            }
-
-            /* 9. Smooth result (warp smoothing) */
-            if (opts.smooth_warp_sigma > 0) {
-                float *scratch = (float *)malloc(nvox3 * sizeof(float));
-                float *kern = NULL; int klen = 0;
-                make_gaussian_kernel(opts.smooth_warp_sigma, 2.0f, &kern, &klen);
-                for (long s = 0; s < spatial; s++) {
-                    int w = s % dW, h = (int)((s / dW) % dH), d = (int)(s / ((long)dH * dW));
-                    int r = klen / 2;
-                    float s0=0,s1=0,s2=0;
-                    for (int k = 0; k < klen; k++) {
-                        int dd = d + k - r;
-                        if (dd >= 0 && dd < dD) {
-                            long si = ((long)dd*dH+h)*dW*3+w*3;
-                            s0+=adam_dir[si]*kern[k]; s1+=adam_dir[si+1]*kern[k]; s2+=adam_dir[si+2]*kern[k];
-                        }
-                    }
-                    long di=s*3; scratch[di]=s0; scratch[di+1]=s1; scratch[di+2]=s2;
-                }
-                for (long s = 0; s < spatial; s++) {
-                    int w = s % dW, h = (int)((s / dW) % dH), d = (int)(s / ((long)dH * dW));
-                    int r = klen / 2;
-                    float s0=0,s1=0,s2=0;
-                    for (int k = 0; k < klen; k++) {
-                        int hh = h + k - r;
-                        if (hh >= 0 && hh < dH) {
-                            long si=((long)d*dH+hh)*dW*3+w*3;
-                            s0+=scratch[si]*kern[k]; s1+=scratch[si+1]*kern[k]; s2+=scratch[si+2]*kern[k];
-                        }
-                    }
-                    long di=s*3; adam_dir[di]=s0; adam_dir[di+1]=s1; adam_dir[di+2]=s2;
-                }
-                for (long s = 0; s < spatial; s++) {
-                    int w = s % dW, h = (int)((s / dW) % dH), d = (int)(s / ((long)dH * dW));
-                    int r = klen / 2;
-                    float s0=0,s1=0,s2=0;
-                    for (int k = 0; k < klen; k++) {
-                        int ww = w + k - r;
-                        if (ww >= 0 && ww < dW) {
-                            long si=((long)d*dH+h)*dW*3+ww*3;
-                            s0+=adam_dir[si]*kern[k]; s1+=adam_dir[si+1]*kern[k]; s2+=adam_dir[si+2]*kern[k];
-                        }
-                    }
-                    long di=s*3; scratch[di]=s0; scratch[di+1]=s1; scratch[di+2]=s2;
-                }
-                memcpy(adam_dir, scratch, nvox3 * sizeof(float));
-                free(scratch); free(kern);
-            }
-
-            /* 10. warp = adam_dir */
-            memcpy(tensor_data_f32(&disp), adam_dir, nvox3 * sizeof(float));
+            cpu_blur_disp_dhw3(grad_dhw3, dD, dH, dW, opts.smooth_grad_sigma);
+            cpu_warp_adam_step(tensor_data_f32(&disp), grad_dhw3,
+                               tensor_data_f32(&adam_m), tensor_data_f32(&adam_v),
+                               adam_dir, dD, dH, dW, &adam_step_t,
+                               opts.lr, beta1, beta2, eps, opts.smooth_warp_sigma);
 
             if (it % 50 == 0 || it == iters - 1)
-                fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
+                if (cfireants_verbose >= 2) fprintf(stderr, "    iter %d/%d loss=%.6f\n", it, iters, loss);
 
             /* Cleanup iteration tensors (before convergence break) */
             tensor_free(&sampling_grid);
@@ -377,7 +220,7 @@ int greedy_register(const image_t *fixed, const image_t *moving,
             if (fabsf(loss - prev_loss) < opts.tolerance) {
                 converge_count++;
                 if (converge_count >= opts.max_tolerance_iters) {
-                    fprintf(stderr, "    Converged at iter %d\n", it);
+                    if (cfireants_verbose >= 2) fprintf(stderr, "    Converged at iter %d\n", it);
                     break;
                 }
             } else {
