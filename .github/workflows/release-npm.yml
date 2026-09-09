@@ -62,17 +62,14 @@ jobs:
           sha256sum "$archive" > "$archive.sha256"
           echo "NPM_TARBALL=$archive" >> "$GITHUB_ENV"
 
+      # The browser WebGPU smoke (npm run smokeWebgpu) is a local pre-tag check:
+      # GitHub runners have no GPU and SwiftShader failed two different ways.
       - name: Smoke-test packed CPU variants
         working-directory: js
         run: |
           package_dir=$(mktemp -d)
           tar -xzf "$NPM_TARBALL" -C "$package_dir"
           node scripts/smoke-package.mjs "$package_dir/package" ../validate/small
-          echo "PACKED_PACKAGE_DIR=$package_dir/package" >> "$GITHUB_ENV"
-
-      - name: Smoke-test packed browser WebGPU against CPU
-        working-directory: js
-        run: npm run smokeWebgpu -- "$PACKED_PACKAGE_DIR"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: github.event_name == 'release' && vars.CFIREANTS_NPM_REDISTRIBUTION_APPROVED == 'true'

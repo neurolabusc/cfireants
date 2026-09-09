@@ -203,9 +203,9 @@ dependency, and actually runs.
 Publishing a GitHub release whose tag starts with `v` runs
 `.github/workflows/release-npm.yml`, which verifies that the tag, C version,
 package manifest and lockfile agree, runs native CTest, builds all three wasm
-modules, smoke-tests both CPU variants from the packed tarball, and compares a
-short packaged browser WebGPU Rigid→Affine→SyN run with CPU. It produces a
-SHA-256 file. Public attachment is blocked until the repository variable
+modules, and smoke-tests both CPU variants from the packed tarball. It produces a
+SHA-256 file. The packaged browser WebGPU-vs-CPU check (`npm run smokeWebgpu`)
+needs a real GPU, so run it locally before tagging. Public attachment is blocked until the repository variable
 `CFIREANTS_NPM_REDISTRIBUTION_APPROVED=true` records that the redistribution
 review described in `js/README.md` is complete. Release assets are never
 overwritten under an existing version. `make macos-release` writes the
