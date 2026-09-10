@@ -13,6 +13,7 @@
  */
 
 #define CFIREANTS_VERSION "0.1.20260909"
+#define CFIREANTS_CITATION "Jena et al. (2026) Adaptive Riemannian optimization for multi-scale diffeomorphic matching. Nat Commun. PMID: 42265084"
 
 #include "cfireants/tensor.h"
 #include "cfireants/image.h"
@@ -291,6 +292,9 @@ static void print_usage(const char *prog) {
         "  --version                   Print version and exit\n"
         "  -h, --help                  Show this help\n"
         "\n"
+        "Citation:\n"
+        "  %s\n"
+        "\n"
         "Examples:\n"
         "  # Default full pipeline (Moments + Rigid MI + Affine MI + SyN CC)\n"
         "  %s -f mni.nii.gz -m subject.nii.gz -o wsubject.nii.gz\n"
@@ -304,7 +308,7 @@ static void print_usage(const char *prog) {
         "    --transform Affine[0.001] --metric MI[32] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \\\n"
         "    --transform SyN[0.1,0.5,1.0] --metric CC[5] --convergence [200x100x50,1e-6,10] --shrink-factors 4x2x1 \\\n"
         "    -o wsubject.nii.gz\n",
-        prog, prog, prog, prog);
+        prog, CFIREANTS_CITATION, prog, prog, prog);
 }
 
 /* Set default stages for a preset */
@@ -511,6 +515,7 @@ int main(int argc, char **argv) {
     int exit_code = 1;   /* every goto cleanup is a failure path */
     cli_config_t cfg;
     if (parse_args(argc, argv, &cfg) != 0) return 1;
+    fprintf(stderr, "Citation: %s\n", CFIREANTS_CITATION);
     cfireants_verbose = cfg.verbose;
     image_t fixed = {0}, moving = {0};
     tensor_t final_moved = {0};
